@@ -333,7 +333,18 @@ class TelegramBotBridge:
         # -------------------- EKSEKUSI SESUAI MODE AKTIF --------------------
         mode = self.chat_modes.get(chat_id, "chat")
 
-        # Deteksi pintar: kalau user di mode Ngobrol tapi jelas nulis URL + perintah buka web, tawarkan/jalankan sesuai maksud
+        # Auto-switch pintar: kalau masih di mode Ngobrol tapi user jelas minta buka web / kasih URL
+        import re as _re
+        has_url = bool(_re.search(r"(https?://[^\s]+|(?:[a-z0-9\-]+\.)+(?:com|id|co\.id|org|net|go\.id|ac\.id))", low))
+        starts_open = low.startswith(("buka web ", "buka situs ", "buka halaman ", "buka link ", "masuk ke web "))
+        if mode == "chat" and (starts_open or (has_url and any(w in low for w in ("buka", "cek", "kerjain", "rangkum", "masuk")))):
+            if any(w in low for w in ("kerjain", "rangkum", "simpan", "isi", "cari di")):
+                mode = "agent"
+                self.chat_modes[chat_id] = "agent"
+            else:
+                clean_q = _re.sub(r"^(buka\s+web|buka\s+situs|buka\s+halaman|buka\s+link|buka)\s+", "", text, flags=_re.I).strip()
+                text = clean_q or text
+                mode = "open_web"
         if mode == "open_web":
             wait_mid = await self.send_text(chat_id, f"🌐 Lagi ngebukain web '{text}'...")
             target_url = await self.orchestrator.brain.resolve_website_url(text)

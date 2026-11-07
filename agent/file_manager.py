@@ -70,13 +70,58 @@ class WorkspaceFileManager:
         target = self._safe_path(filename)
         if not target.exists():
             raise FileNotFoundError(f"File '{filename}' tidak ditemukan di workspace.")
+
+        ext = target.suffix.lower()
+        content = ""
         try:
-            content = target.read_text(encoding="utf-8")
-            if len(content) > max_chars:
-                return content[:max_chars] + f"\n\n... [Dipotong, total {len(content)} karakter]"
-            return content
+            if ext == ".pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(str(target))
+                pages = []
+                for idx, p in enumerate(reader.pages[:30], start=1):
+                    txt = (p.extract_text() or "").strip()
+                    if txt:
+                        pages.append(f"--- Halaman {idx} ---\n{txt}")
+                content = "\n\n".join(pages)
+            elif ext == ".docx":
+                import docx
+                doc = docx.Document(str(target))
+                chunks = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+                for tbl in doc.tables:
+                    for row in tbl.rows:
+                        cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                        if any(cells):
+                            chunks.append(" | ".join(cells))
+                content = "\n".join(chunks)
+            elif ext in (".xlsx", ".xlsm"):
+                import openpyxl
+                wb = openpyxl.load_workbook(str(target), data_only=True, read_only=True)
+                sheets_out = []
+                for sname in wb.sheetnames[:8]:
+                    ws = wb[sname]
+                    rows_txt = [f"=== Sheet: {sname} ==="]
+                    for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+                        if r_idx >= 200:
+                            rows_txt.append("... (baris selanjutnya dipotong)")
+                            break
+                        vals = ["" if v is None else str(v).strip() for v in row]
+                        if any(vals):
+                            rows_txt.append(" | ".join(vals))
+                    sheets_out.append("\n".join(rows_txt))
+                wb.close()
+                content = "\n\n".join(sheets_out)
+            else:
+                content = target.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return f"[File Biner: {target.name}, ukuran {target.stat().st_size} bytes]"
+        except Exception as exc:
+            return f"[Gagal mengekstrak teks {target.name}: {exc}]"
+
+        if not content.strip() and ext == ".pdf":
+            return ""
+        if len(content) > max_chars:
+            return content[:max_chars] + f"\n\n... [Dipotong, total {len(content)} karakter]"
+        return content
 
     def write_file(self, filename: str, content: str) -> Dict[str, Any]:
         target = self._safe_path(filename)

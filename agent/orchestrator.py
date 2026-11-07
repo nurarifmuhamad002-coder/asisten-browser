@@ -40,6 +40,7 @@ class AgentOrchestrator:
         self.current_plan: List[Dict[str, str]] = []
         self.history: List[Dict[str, Any]] = []
         self.memory_notes: Dict[str, str] = {}
+        self.persistent_notes: Dict[str, str] = {}
         self.chat_messages: List[Dict[str, Any]] = []
 
         self.pending_approval: Optional[Dict[str, Any]] = None
@@ -105,7 +106,7 @@ class AgentOrchestrator:
         self.current_goal = clean_goal
         self.current_plan = [{"step": "Memahami perintah & menyiapkan langkah...", "status": "in_progress"}]
         self.history = []
-        self.memory_notes = {}
+        self.memory_notes = dict(self.persistent_notes)
         self.pending_approval = None
         self.takeover_reason = ""
         self.manual_takeover = False

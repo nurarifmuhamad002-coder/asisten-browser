@@ -8,6 +8,14 @@ import httpx
 
 from agent.dom_inspector import format_dom_for_llm
 
+
+def _fast_http_client(timeout: float = 18.0) -> httpx.AsyncClient:
+    """Paksa IPv4 agar di container cloud tanpa Outbound IPv6 tidak pernah delay 10 detik."""
+    return httpx.AsyncClient(
+        transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
+        timeout=timeout,
+    )
+
 SYSTEM_PROMPT = """Kamu adalah NusaOperator, AI Cloud Browser Agent yang cerdas, teliti, dan mengutamakan keamanan pengguna.
 Tugasmu adalah memahami perintah user (dalam Bahasa Indonesia atau Inggris), menyusun rencana langkah kerja (multi-step plan), membaca tampilan website (melalui screenshot + daftar elemen interaktif [index]), mengelola file di workspace, dan mengeksekusi langkah satu per satu hingga tuntas.
 
@@ -151,7 +159,7 @@ class MultiLLMBrain:
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.6},
             }
-            async with httpx.AsyncClient(timeout=16.0) as client:
+            async with _fast_http_client(timeout=16.0) as client:
                 for model in candidates:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
                     try:
@@ -176,6 +184,68 @@ class MultiLLMBrain:
             if resp.status_code == 200:
                 return resp.json()["choices"][0]["message"]["content"].strip()
         return "Koneksi AI sedang sibuk, coba kirim lagi bro."
+
+    async def analyze_media(
+        self,
+        user_prompt: str,
+        filename: str,
+        raw_bytes: bytes,
+        mime_type: str,
+        extracted_text: str = "",
+    ) -> str:
+        """Membaca foto (soal, form, KTP/paspor, tabel) atau dokumen (PDF, Word, Excel) dari Telegram."""
+        if not self.config.has_api_key:
+            if extracted_text:
+                return f"📄 Isi teks dari {filename}:\n\n{extracted_text[:2500]}"
+            return "Pasang API Key Gemini dulu bro biar gua bisa baca foto & dokumen otomatis."
+
+        import base64 as _b64
+
+        sys_txt = (
+            "Kamu adalah Asisten AI pribadi berbahasa Indonesia santai (gua/lu/bro secukupnya). "
+            "Tugasmu membaca foto atau dokumen yang dikirim user dengan teliti. "
+            "Jika berisi soal/tugas: langsung kerjakan dan berikan jawaban jelas langkah demi langkah. "
+            "Jika berisi formulir/data identitas/jadwal/tabel: ekstrak semua data pentingnya dengan rapi agar siap dipakai mengisi web. "
+            "Hindari simbol Markdown rumit yang berlebihan supaya rapi dibaca di Telegram HP."
+        )
+
+        instruction = (user_prompt or "").strip()
+        if not instruction:
+            instruction = (
+                f"Tolong baca file '{filename}' ini secara lengkap. "
+                "Kalau ini soal/tugas, langsung jawab dengan jelas. "
+                "Kalau ini dokumen/data/identitas/jadwal, rangkum & ekstrak poin-poin datanya secara rapi."
+            )
+
+        parts: List[Dict[str, Any]] = []
+        if extracted_text and not mime_type.startswith("image/"):
+            parts.append({"text": f"INSTRUKSI USER: {instruction}\n\n=== ISI DOKUMEN ({filename}) ===\n{extracted_text[:18000]}"})
+        else:
+            parts.append({"text": f"INSTRUKSI USER ({filename}): {instruction}"})
+            if raw_bytes and len(raw_bytes) <= 15 * 1024 * 1024:
+                b64_data = _b64.b64encode(raw_bytes).decode("ascii")
+                parts.append({"inline_data": {"mime_type": mime_type, "data": b64_data}})
+
+        primary = self.config.model or "gemini-3.1-flash-lite"
+        candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
+        payload = {
+            "system_instruction": {"parts": [{"text": sys_txt}]},
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"temperature": 0.25},
+        }
+        async with _fast_http_client(timeout=24.0) as client:
+            for model in candidates:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
+                try:
+                    resp = await client.post(url, json=payload)
+                    if resp.status_code == 200:
+                        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception:
+                    continue
+
+        if extracted_text:
+            return f"📄 Isi {filename} berhasil dibaca:\n\n{extracted_text[:2000]}"
+        return f"Waduh, gagal menganalisis {filename} karena server AI lagi sibuk. Coba kirim ulang ya bro!"
 
     async def resolve_website_url(self, raw_query: str) -> str:
         """Mengubah nama layanan (misal 'login Konami ID' atau 'elearning UT') menjadi URL resmi."""
@@ -206,7 +276,7 @@ class MultiLLMBrain:
                 "contents": [{"role": "user", "parts": [{"text": q}]}],
                 "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
             }
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _fast_http_client(timeout=10.0) as client:
                 for model in candidates:
                     u = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
                     try:
@@ -301,7 +371,7 @@ class MultiLLMBrain:
             },
         }
         last_err = ""
-        async with httpx.AsyncClient(timeout=18.0) as client:
+        async with _fast_http_client(timeout=18.0) as client:
             for model in candidates:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
                 try:

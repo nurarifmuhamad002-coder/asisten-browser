@@ -335,6 +335,27 @@ class TelegramBotBridge:
                     f"📝 Sip bro! Sekarang tulis apa yang mau gua kerjain di web ini ({cur_u}):",
                     reply_markup=MAIN_MENU_KB,
                 )
+            elif data == "save_upload_md":
+                last_note = self.orchestrator.persistent_notes.get("hasil_baca_terakhir", "")
+                if not last_note:
+                    await self._answer_cb(cb_id, "Belum ada hasil baca foto/file.")
+                    return
+                saved = self.orchestrator.file_manager.write_file("hasil_baca_telegram.md", last_note)
+                fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
+                await self._answer_cb(cb_id, "Mengirim file...")
+                await self.send_document(chat_id, fpath.name, fpath.read_bytes(), "📄 Hasil baca berhasil disimpan!")
+            elif data == "use_upload_web":
+                self.chat_modes[chat_id] = "agent"
+                await self._answer_cb(cb_id, "Siap dipakai di browser!")
+                cur_u = self.orchestrator.browser.page.url if self.orchestrator.browser.page else ""
+                await self.send_text(
+                    chat_id,
+                    f"📝 Data dari foto/file barusan udah gua pegang!\n"
+                    f"Sekarang ketik mau diapain di browser (halaman aktif: {cur_u}), contoh:\n"
+                    "• isikan data tadi ke formulir di layar ini\n"
+                    "• buka [link web] lalu masukkan data tadi",
+                    reply_markup=MAIN_MENU_KB,
+                )
             elif data.startswith("dl_file:"):
                 fname = data.split(":", 1)[1]
                 await self._answer_cb(cb_id, f"Mengirim {fname}...")
@@ -345,14 +366,13 @@ class TelegramBotBridge:
                     await self.send_text(chat_id, f"Gagal mengambil file: {exc}")
             return
 
-        # -------------------- TEXT / MENU MESSAGES --------------------
+        # -------------------- PHOTO / DOCUMENT / TEXT MESSAGES --------------------
         msg = upd.get("message") or {}
         chat = msg.get("chat") or {}
         from_user = msg.get("from") or {}
         chat_id = chat.get("id")
         sender_id = from_user.get("id") or chat_id
-        text = (msg.get("text") or "").strip()
-        if not chat_id or not text:
+        if not chat_id:
             return
 
         # PRIVATE LOCK GUARD — Tolak siapa pun selain pemilik tunggal!
@@ -363,8 +383,17 @@ class TelegramBotBridge:
             )
             return
 
-        # Auto-lock langsung ke user pertama yang menekan /kunci atau kalau mau klaim cepat
         self.active_chat_ids.add(chat_id)
+
+        # UPGRADE #2: HANDLE FOTO / GAMBAR / PDF / WORD / EXCEL DARI TELEGRAM
+        if "photo" in msg or "document" in msg:
+            await self._handle_media_upload(chat_id, msg)
+            return
+
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return
+
         low = text.lower().strip()
 
         # 0. MENU KEAMANAN / KUNCI PRIBADI
@@ -497,6 +526,98 @@ class TelegramBotBridge:
         if mid:
             self._status_msg_ids[chat_id] = mid
         await self.orchestrator.start_goal(text)
+
+    async def _download_telegram_file(self, file_id: str) -> bytes:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r_meta = await client.get(
+                f"https://api.telegram.org/bot{self.token}/getFile",
+                params={"file_id": file_id},
+            )
+            meta = r_meta.json()
+            if not meta.get("ok"):
+                raise RuntimeError("Gagal mengambil info file dari Telegram.")
+            file_path = meta["result"]["file_path"]
+            r_raw = await client.get(f"https://api.telegram.org/file/bot{self.token}/{file_path}")
+            r_raw.raise_for_status()
+            return r_raw.content
+
+    async def _handle_media_upload(self, chat_id: int, msg: Dict[str, Any]) -> None:
+        from datetime import datetime as _dt
+
+        caption = (msg.get("caption") or "").strip()
+        file_id = ""
+        fname = ""
+        mime_type = "application/octet-stream"
+
+        if "photo" in msg and msg["photo"]:
+            best_photo = msg["photo"][-1]
+            file_id = best_photo.get("file_id", "")
+            fname = f"foto_{_dt.now().strftime('%H%M%S')}.jpg"
+            mime_type = "image/jpeg"
+        elif "document" in msg and msg["document"]:
+            doc = msg["document"]
+            file_id = doc.get("file_id", "")
+            fname = doc.get("file_name") or f"dokumen_{_dt.now().strftime('%H%M%S')}"
+            mime_type = doc.get("mime_type") or "application/octet-stream"
+
+        if not file_id:
+            return
+
+        wait_mid = await self.send_text(chat_id, f"📥 Lagi baca '{fname}' kiriman lu bro...")
+        try:
+            raw_bytes = await self._download_telegram_file(file_id)
+            saved = self.orchestrator.file_manager.save_bytes(fname, raw_bytes)
+            saved_name = saved["name"]
+
+            extracted_text = ""
+            if not mime_type.startswith("image/"):
+                extracted_text = self.orchestrator.file_manager.read_file(saved_name, max_chars=20000)
+                if extracted_text.startswith("[File Biner:") or extracted_text.startswith("[Gagal"):
+                    extracted_text = ""
+
+            analysis = await self.orchestrator.brain.analyze_media(
+                user_prompt=caption,
+                filename=saved_name,
+                raw_bytes=raw_bytes,
+                mime_type=mime_type,
+                extracted_text=extracted_text,
+            )
+
+            # Simpan ke ingatan permanen supaya bisa langsung dipakai di chat maupun di browser!
+            combined_note = f"File: {saved_name}\nHasil Baca:\n{analysis}"
+            if extracted_text:
+                combined_note += f"\n\nTeks Asli:\n{extracted_text[:4000]}"
+            self.orchestrator.persistent_notes["hasil_baca_terakhir"] = combined_note
+            await self.orchestrator._push_chat("user", f"[Kirim {saved_name}] {caption}".strip())
+            await self.orchestrator._push_chat("agent", analysis)
+
+            if wait_mid:
+                await self._edit_text(chat_id, wait_mid, f"✅ File '{saved_name}' berhasil dibaca & disimpan ke Workspace!")
+
+            cap_low = caption.lower()
+            wants_web_exec = any(
+                kw in cap_low
+                for kw in ("isiin ke web", "isi ke web", "masukin ke web", "isi form", "buka ", "kerjain di web")
+            )
+            if wants_web_exec:
+                mid = await self.send_text(chat_id, f"⏳ Lanjut ngerjain ke browser pakai data dari '{saved_name}'...")
+                if mid:
+                    self._status_msg_ids[chat_id] = mid
+                await self.orchestrator.start_goal(
+                    f"{caption} (Gunakan data hasil baca dari file '{saved_name}' yang sudah ada di catatan memori)."
+                )
+                return
+
+            kb = {
+                "inline_keyboard": [
+                    [{"text": "📝 Pakai Data Ini Buat Isi / Kerjain Web", "callback_data": "use_upload_web"}],
+                    [{"text": "💾 Jadikan File .md", "callback_data": "save_upload_md"}],
+                ]
+            }
+            await self.send_text(chat_id, analysis, reply_markup=kb)
+
+        except Exception as exc:
+            await self.send_text(chat_id, f"⚠️ Gagal memproses file '{fname}': {exc}", reply_markup=MAIN_MENU_KB)
 
     async def _send_screen_snapshot(self, chat_id: int) -> None:
         b64 = await self.orchestrator.browser.refresh_frame()

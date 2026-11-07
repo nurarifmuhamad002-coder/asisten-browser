@@ -63,9 +63,15 @@ telegram_bridge.attach_orchestrator(orchestrator)
 
 
 async def _boot_background() -> None:
-    await asyncio.sleep(0.4)
-    await browser_engine.start("https://id.wikipedia.org")
-    await telegram_bridge.start_if_env_set()
+    await asyncio.sleep(0.3)
+    try:
+        await telegram_bridge.start_if_env_set()
+    except Exception:
+        pass
+    try:
+        await browser_engine.start("https://id.wikipedia.org")
+    except Exception:
+        pass
 
 
 @asynccontextmanager

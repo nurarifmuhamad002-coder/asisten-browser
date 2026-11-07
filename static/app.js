@@ -123,6 +123,10 @@ function handleEvent(msg) {
       });
       break;
     }
+    case 'github_status': {
+      handleGithubStatusEvent(msg);
+      break;
+    }
     default:
       break;
   }
@@ -714,6 +718,81 @@ function formatSize(b) {
   if (n < 1024) return n + ' B';
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
   return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+/* ================= 1-TAP GITHUB PUBLISHER ================= */
+
+let currentGhCode = '';
+let currentGhVerifyUrl = 'https://github.com/login/device';
+
+function openGithubModal() {
+  document.getElementById('ghStepSetup').classList.remove('hidden');
+  document.getElementById('ghStepCode').classList.add('hidden');
+  document.getElementById('ghStepDone').classList.add('hidden');
+  document.getElementById('githubModal').classList.remove('hidden');
+}
+
+function closeGithubModal() {
+  document.getElementById('githubModal').classList.add('hidden');
+}
+
+async function startGithubDeviceFlow() {
+  const btn = document.getElementById('ghStartBtn');
+  const repo_name = document.getElementById('ghRepoName').value.trim() || 'asisten-browser';
+  const privateRepo = document.getElementById('ghRepoVisibility').value === 'private';
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Menyiapkan kode...';
+
+  try {
+    const res = await fetch('./api/github/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo_name, private: privateRepo }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('Gagal menghubungi GitHub: ' + (data.detail || 'Error'));
+      return;
+    }
+    currentGhCode = data.user_code || '';
+    currentGhVerifyUrl = data.verification_uri || 'https://github.com/login/device';
+    document.getElementById('ghUserCodeBox').textContent = currentGhCode;
+    document.getElementById('ghLiveProgress').textContent = '⏳ Menunggu lu klik Authorize di GitHub...';
+    document.getElementById('ghStepSetup').classList.add('hidden');
+    document.getElementById('ghStepCode').classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🚀 Buat Kode Sambung GitHub';
+  }
+}
+
+function copyCodeAndOpenGithub() {
+  if (currentGhCode && navigator.clipboard) {
+    navigator.clipboard.writeText(currentGhCode).catch(() => {});
+  }
+  window.open(currentGhVerifyUrl, '_blank', 'noopener');
+}
+
+function handleGithubStatusEvent(ev) {
+  if (ev.stage === 'pushing') {
+    document.getElementById('ghLiveProgress').style.color = '#34d399';
+    document.getElementById('ghLiveProgress').textContent = ev.message || 'Sedang upload file...';
+  } else if (ev.stage === 'done') {
+    document.getElementById('ghStepCode').classList.add('hidden');
+    document.getElementById('ghStepDone').classList.remove('hidden');
+    document.getElementById('ghDoneRepoUrl').textContent = ev.repo_url || '';
+    document.getElementById('ghOpenRepoBtn').href = ev.repo_url || '#';
+    document.getElementById('ghOpenCodespaceBtn').href = ev.codespace_url || '#';
+    renderChatBubble({
+      role: 'agent',
+      text: `🎉 **Beres bro!** Semua kode aplikasi lu udah masuk ke GitHub:\n**${ev.repo_url}**`,
+      time: nowTime(),
+    });
+  } else if (ev.stage === 'error') {
+    document.getElementById('ghLiveProgress').style.color = '#fca5a5';
+    document.getElementById('ghLiveProgress').textContent = ev.message || 'Gagal upload ke GitHub.';
+  }
 }
 
 connectWs();

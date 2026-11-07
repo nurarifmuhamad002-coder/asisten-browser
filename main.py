@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from agent.browser_engine import CloudBrowserEngine
 from agent.file_manager import WorkspaceFileManager
+from agent.github_publisher import GitHubPublisher
 from agent.llm_providers import LLMConfig
 from agent.orchestrator import AgentOrchestrator
 from agent.telegram_bridge import TelegramBotBridge
@@ -42,6 +43,7 @@ async def broadcast_event(payload: Dict[str, Any]) -> None:
 file_manager = WorkspaceFileManager(os.getenv("WORKSPACE_DIR", str(BASE_DIR / "workspace_files")))
 llm_config = LLMConfig()
 telegram_bridge = TelegramBotBridge()
+github_publisher = GitHubPublisher(repo_dir=str(BASE_DIR), broadcast_cb=broadcast_event)
 browser_engine = CloudBrowserEngine(
     file_manager=file_manager,
     broadcast_cb=broadcast_event,
@@ -124,6 +126,11 @@ class LLMSettingsPayload(BaseModel):
 class TelegramSettingsPayload(BaseModel):
     token: str = ""
     public_web_url: str = ""
+
+
+class GitHubPushPayload(BaseModel):
+    repo_name: str = "asisten-browser"
+    private: bool = False
 
 
 # ======================== UI PAGES ========================
@@ -294,6 +301,20 @@ async def update_telegram_settings(payload: TelegramSettingsPayload):
         return {"ok": True, "telegram": info}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/github/start")
+async def start_github_push(payload: GitHubPushPayload):
+    try:
+        status = await github_publisher.start_device_flow(payload.repo_name, payload.private)
+        return {"ok": True, **status}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/github/status")
+async def get_github_push_status():
+    return github_publisher.last_status
 
 
 # ======================== REAL-TIME WEBSOCKET ========================

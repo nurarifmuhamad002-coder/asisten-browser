@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Set
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from agent.browser_engine import CloudBrowserEngine
 from agent.file_manager import WorkspaceFileManager
 from agent.github_publisher import GitHubPublisher
+from agent.hf_deployer import HuggingFaceDeployer
 from agent.llm_providers import LLMConfig
 from agent.orchestrator import AgentOrchestrator
 from agent.telegram_bridge import TelegramBotBridge
@@ -44,6 +45,7 @@ file_manager = WorkspaceFileManager(os.getenv("WORKSPACE_DIR", str(BASE_DIR / "w
 llm_config = LLMConfig()
 telegram_bridge = TelegramBotBridge()
 github_publisher = GitHubPublisher(repo_dir=str(BASE_DIR), broadcast_cb=broadcast_event)
+hf_deployer = HuggingFaceDeployer(base_dir=str(BASE_DIR))
 browser_engine = CloudBrowserEngine(
     file_manager=file_manager,
     broadcast_cb=broadcast_event,
@@ -133,11 +135,23 @@ class GitHubPushPayload(BaseModel):
     private: bool = False
 
 
+class HfDeployPayload(BaseModel):
+    hf_token: str
+    telegram_token: str = ""
+    gemini_key: str = ""
+    space_name: str = "asisten-browser"
+
+
 # ======================== UI PAGES ========================
 
 @app.get("/", response_class=HTMLResponse)
 async def index_page():
     return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+
+@app.get("/setup", response_class=HTMLResponse)
+async def setup_wizard_page():
+    return (STATIC_DIR / "setup.html").read_text(encoding="utf-8")
 
 
 @app.get("/demo-portal", response_class=HTMLResponse)
@@ -315,6 +329,29 @@ async def start_github_push(payload: GitHubPushPayload):
 @app.get("/api/github/status")
 async def get_github_push_status():
     return github_publisher.last_status
+
+
+@app.post("/api/deploy/hf")
+async def deploy_to_huggingface(payload: HfDeployPayload):
+    try:
+        res = await hf_deployer.deploy_24_7(
+            hf_token=payload.hf_token,
+            telegram_token=payload.telegram_token,
+            gemini_key=payload.gemini_key,
+            space_name=payload.space_name,
+        )
+        return {"ok": True, **res}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook_endpoint(request: Request):
+    upd = await request.json()
+    await telegram_bridge.process_webhook_update(upd)
+    return {"ok": True}
 
 
 # ======================== REAL-TIME WEBSOCKET ========================

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, Set
 
@@ -11,18 +12,20 @@ if TYPE_CHECKING:
 
 class TelegramBotBridge:
     """
-    Jembatan opsional ke aplikasi Telegram asli di HP user.
-    Cukup masukkan Bot Token dari @BotFather, maka user bisa:
-    - Chat perintah langsung dari Telegram HP
-    - Menerima screenshot layar live (/layar)
-    - Klik tombol [✅ Setuju] / [❌ Tolak] langsung di chat Telegram untuk tindakan sensitif
-    - Menerima file laporan (.md / .csv) langsung sebagai dokumen di Telegram
+    Jembatan ke aplikasi Telegram asli di HP user.
+    - Di server cloud (Hugging Face Spaces / SPACE_HOST), otomatis mendaftarkan HTTPS Webhook
+      agar setiap chat dari HP langsung membangunkan & menggerakkan server 24 jam nonstop.
+    - Di lokal / sandbox, otomatis memakai Long-Polling (getUpdates).
     """
 
     def __init__(self) -> None:
         self.token: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.orchestrator: Optional["AgentOrchestrator"] = None
-        self.public_web_url: str = os.getenv("PUBLIC_WEB_URL", "").strip()
+        space_host = os.getenv("SPACE_HOST", "").strip()
+        default_pub = f"https://{space_host}" if space_host else ""
+        self.public_web_url: str = os.getenv("PUBLIC_WEB_URL", default_pub).strip()
+        self.use_webhook: bool = bool(space_host)
+
         self.active_chat_ids: Set[int] = set()
         self._poll_task: Optional[asyncio.Task] = None
         self._offset: int = 0
@@ -39,7 +42,8 @@ class TelegramBotBridge:
         return {
             "configured": self.is_configured,
             "bot_username": self.bot_username,
-            "running": bool(self._poll_task and not self._poll_task.done()),
+            "mode": "webhook" if self.use_webhook else "polling",
+            "running": bool(self.use_webhook or (self._poll_task and not self._poll_task.done())),
             "masked_token": (self.token[:6] + "••••" + self.token[-4:]) if len(self.token) > 12 else "",
         }
 
@@ -53,20 +57,28 @@ class TelegramBotBridge:
             self.bot_username = ""
             return self.public_dict()
 
-        # Validasi token ke API Telegram (getMe)
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(f"https://api.telegram.org/bot{clean}/getMe")
             data = resp.json()
             if not data.get("ok"):
                 raise ValueError("Token Bot Telegram tidak valid. Pastikan copy langsung dari @BotFather.")
             self.bot_username = data["result"].get("username", "")
 
-        self.token = clean
-        self._poll_task = asyncio.create_task(self._poll_loop())
+            self.token = clean
+            if self.use_webhook and self.public_web_url.startswith("https://"):
+                wh_url = self.public_web_url.rstrip("/") + "/api/telegram/webhook"
+                await client.post(
+                    f"https://api.telegram.org/bot{clean}/setWebhook",
+                    json={"url": wh_url},
+                )
+            else:
+                await client.post(f"https://api.telegram.org/bot{clean}/deleteWebhook")
+                self._poll_task = asyncio.create_task(self._poll_loop())
+
         return self.public_dict()
 
     async def start_if_env_set(self) -> None:
-        if self.token and not self._poll_task:
+        if self.token:
             try:
                 await self.configure(self.token, self.public_web_url)
             except Exception:
@@ -80,6 +92,9 @@ class TelegramBotBridge:
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+
+    async def process_webhook_update(self, upd: Dict[str, Any]) -> None:
+        asyncio.create_task(self._handle_update(upd))
 
     async def _poll_loop(self) -> None:
         base_url = f"https://api.telegram.org/bot{self.token}"
@@ -106,7 +121,6 @@ class TelegramBotBridge:
         if not self.orchestrator:
             return
 
-        # Handle Inline Button Callback (Approve / Reject / Resume)
         if "callback_query" in upd:
             cb = upd["callback_query"]
             cb_id = cb.get("id")
@@ -136,15 +150,17 @@ class TelegramBotBridge:
         self.active_chat_ids.add(chat_id)
 
         if text.startswith("/start"):
+            web_note = f"\n🌐 Ruang Web Live: {self.public_web_url}\n" if self.public_web_url else ""
             await self.send_text(
                 chat_id,
-                "Halo bro! 👋 Gua Asisten Browser lu.\n\n"
+                "Halo bro! 👋 Gua Asisten Browser lu yang siap jalan 24 jam.\n"
+                f"{web_note}\n"
                 "Tinggal ketik perintah biasa di sini, contoh:\n"
-                "• `Cari info kecerdasan buatan di Wikipedia lalu bikinin filenya`\n"
-                "• `Buka portal akun gua, isi form pengajuan lalu proses bayar`\n\n"
+                "• Cari info kecerdasan buatan di Wikipedia lalu bikinin filenya\n"
+                "• Buka portal akun gua, isi form pengajuan lalu proses bayar\n\n"
                 "Perintah cepat:\n"
-                "/layar — Lihat tangkapan layar browser sekarang\n"
-                "/lanjut — Lanjutkan agent setelah selesai login\n"
+                "/layar — Kirim foto layar browser sekarang\n"
+                "/lanjut — Lanjutkan kerja setelah lu selesai login\n"
                 "/stop — Hentikan pekerjaan saat ini",
             )
             return
@@ -156,18 +172,19 @@ class TelegramBotBridge:
 
         if text.startswith("/lanjut"):
             await self.orchestrator.resume_from_takeover()
-            await self.send_text(chat_id, "✅ Oke, gua lanjutin kerjanya!")
+            await self.send_text(chat_id, "✅ Oke sip, gua lanjutin kerjanya!")
             return
 
         if text.startswith("/layar"):
             b64 = await self.orchestrator.browser.refresh_frame()
             if b64:
-                await self.send_photo_b64(chat_id, b64, f"🖥️ Layar saat ini: {self.orchestrator.browser.page.url if self.orchestrator.browser.page else ''}")
+                cur_url = self.orchestrator.browser.page.url if self.orchestrator.browser.page else ""
+                await self.send_photo_b64(chat_id, b64, f"🖥️ Layar saat ini: {cur_url}")
             else:
                 await self.send_text(chat_id, "Browser sedang disiapkan...")
             return
 
-        await self.send_text(chat_id, f"👍 Siap bro, lagi gua kerjain: _{text}_")
+        await self.send_text(chat_id, f"👍 Siap bro, lagi gua kerjain: {text}")
         await self.orchestrator.start_goal(text)
 
     async def _answer_cb(self, cb_id: Optional[str], text: str) -> None:
@@ -200,7 +217,6 @@ class TelegramBotBridge:
         raw_bytes = base64.b64decode(photo_b64)
         data: Dict[str, Any] = {"chat_id": str(chat_id), "caption": caption[:950]}
         if reply_markup:
-            import json
             data["reply_markup"] = json.dumps(reply_markup)
         files = {"photo": ("screen.jpg", raw_bytes, "image/jpeg")}
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -214,12 +230,14 @@ class TelegramBotBridge:
         async with httpx.AsyncClient(timeout=25.0) as client:
             await client.post(f"https://api.telegram.org/bot{self.token}/sendDocument", data=data, files=files)
 
-    # ======================== NOTIFICATIONS FROM ORCHESTRATOR ========================
-
     async def notify_takeover(self, reason: str, frame_b64: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
-        link_note = f"\n🌐 Buka layar login: {self.public_web_url}" if self.public_web_url else "\n🌐 Buka layar web aplikasi buat ketik password dengan aman."
+        link_note = (
+            f"\n\n🔑 Tap link ini buat login aman di layar:\n{self.public_web_url}"
+            if self.public_web_url
+            else "\n\n🔑 Buka layar web aplikasi buat ketik password dengan aman."
+        )
         caption = f"🔐 Butuh Login Lu Bro\n{reason}{link_note}"
         markup = {
             "inline_keyboard": [[{"text": "✅ Udah Login — Lanjut Kerjain", "callback_data": "resume_login"}]]

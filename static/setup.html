@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Pasang Server 24 Jam + Bot Telegram</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #0b141a; color: #e9edef; min-height: 100dvh; padding: 16px 14px 40px; }
+    .wrap { max-width: 520px; margin: 0 auto; }
+    .top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+    .back-link {
+      text-decoration: none; color: #e9edef; background: #1f2c34; padding: 7px 13px;
+      border-radius: 99px; font-size: 13px; font-weight: 600; border: 1px solid #2c3b45;
+    }
+    h1 { font-size: 20px; margin-bottom: 6px; }
+    p.lead { font-size: 13.5px; color: #8696a0; line-height: 1.5; margin-bottom: 18px; }
+
+    .step-box {
+      background: #1f2c34; border: 1px solid #2c3b45; border-radius: 14px;
+      padding: 15px; margin-bottom: 13px;
+    }
+    .step-badge {
+      display: inline-block; background: rgba(0, 168, 132, 0.2); color: #34d399;
+      font-size: 11.5px; font-weight: 700; padding: 3px 9px; border-radius: 99px; margin-bottom: 7px;
+    }
+    .step-box h3 { font-size: 15px; margin-bottom: 5px; }
+    .step-box p { font-size: 12.5px; color: #94a3b8; line-height: 1.45; margin-bottom: 10px; }
+
+    .ext-btn {
+      display: inline-flex; align-items: center; gap: 6px; text-decoration: none;
+      background: #2a3942; color: #53bdeb; border: 1px solid #384c59;
+      padding: 8px 13px; border-radius: 9px; font-size: 13px; font-weight: 600; margin-bottom: 10px;
+    }
+    input {
+      width: 100%; background: #111b21; border: 1px solid #374854; color: #fff;
+      padding: 11px 12px; border-radius: 9px; font-size: 14px;
+    }
+    input:focus { outline: none; border-color: #00a884; }
+
+    .launch-btn {
+      width: 100%; border: none; border-radius: 12px; padding: 14px 16px;
+      background: #00a884; color: #fff; font-size: 15.5px; font-weight: 800;
+      cursor: pointer; margin-top: 6px; box-shadow: 0 4px 16px rgba(0, 168, 132, 0.35);
+    }
+    .launch-btn:disabled { opacity: 0.6; }
+
+    .error-box {
+      margin-top: 12px; padding: 12px; border-radius: 10px;
+      background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.45);
+      color: #fca5a5; font-size: 13px; line-height: 1.45;
+    }
+    .done-box {
+      margin-top: 16px; padding: 18px; border-radius: 14px;
+      background: #112621; border: 1.5px solid #00a884; text-align: center;
+    }
+    .done-link {
+      display: block; width: 100%; text-decoration: none; padding: 12px;
+      border-radius: 10px; font-weight: 700; font-size: 14.5px; margin-top: 9px;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <span style="font-weight:700;color:#00a884;">⚡ Setup Otomatis HP</span>
+      <a href="./" class="back-link">← Balik ke Chat</a>
+    </div>
+
+    <h1>Bikin Nyala 24 Jam + Sambung Telegram</h1>
+    <p class="lead">
+      Cukup isi kotak di bawah sekali aja. Mesin ini bakal otomatis bikinin server gratis 24 jam (RAM 16 GB) & nyambungin langsung ke Telegram HP lu!
+    </p>
+
+    <div id="setupFormArea">
+      <!-- LANGKAH 1 -->
+      <div class="step-box">
+        <span class="step-badge">LANGKAH 1 — WAJIB</span>
+        <h3>Token Server Hugging Face (Gratis 16 GB RAM)</h3>
+        <p>
+          Daftar/login gratis di Hugging Face, lalu tap tombol biru di bawah (otomatis milih tipe <b>Write</b>) -> scroll ke bawah tap <b>Create token</b> -> salin kodenya yang depannya <code>hf_...</code>
+        </p>
+        <a class="ext-btn" href="https://huggingface.co/settings/tokens/new?tokenType=write&tokenName=asisten-browser" target="_blank" rel="noopener">
+          🤗 Buka Pembuat Token Hugging Face ↗
+        </a>
+        <input id="hfToken" type="password" placeholder="Tempel kode hf_xxxx di sini..." />
+      </div>
+
+      <!-- LANGKAH 2 -->
+      <div class="step-box">
+        <span class="step-badge">LANGKAH 2 — BIAR BISA CHAT DI TELEGRAM</span>
+        <h3>Token Bot Telegram dari @BotFather</h3>
+        <p>
+          Tap tombol di bawah buat buka <b>@BotFather</b> di Telegram HP -> ketik <code>/newbot</code> -> kasih nama bebas -> salin kode panjang yang dikasih BotFather:
+        </p>
+        <a class="ext-btn" href="https://t.me/BotFather" target="_blank" rel="noopener">
+          ✈️ Buka @BotFather di Telegram ↗
+        </a>
+        <input id="tgToken" type="password" placeholder="Tempel token dari BotFather (opsional tapi disarankan)..." />
+      </div>
+
+      <!-- LANGKAH 3 -->
+      <div class="step-box">
+        <span class="step-badge">LANGKAH 3 — OPSIONAL (OTAK AI BEBAS)</span>
+        <h3>API Key Google Gemini Gratis</h3>
+        <p>
+          Isi ini kalau mau asisten lu bebas mikir & baca tampilan website apa aja di seluruh internet:
+        </p>
+        <a class="ext-btn" href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">
+          ✨ Ambil API Key Gratis Google AI ↗
+        </a>
+        <input id="geminiKey" type="password" placeholder="Tempel API Key AIzaSy... (boleh dikosongin dulu)" />
+      </div>
+
+      <button id="deployBtn" class="launch-btn" onclick="runAutoDeploy()">
+        🚀 Pasang Server 24 Jam Sekarang!
+      </button>
+
+      <div id="errBox" class="error-box hidden"></div>
+    </div>
+
+    <!-- HASIL BERHASIL -->
+    <div id="doneBox" class="done-box hidden">
+      <div style="font-size:38px;margin-bottom:6px;">🎉</div>
+      <h2 style="font-size:18px;color:#34d399;margin-bottom:8px;">Beres! Server 24 Jam Lu Lagi Dinyalain!</h2>
+      <p style="font-size:13px;color:#cbd5e1;line-height:1.5;margin-bottom:12px;">
+        Tunggu sekitar <b>2–3 menit pertama kali</b> buat Hugging Face ngerakit browser Chromium lu. Habis itu link & bot Telegram di bawah ini hidup 24 jam punya lu sendiri (nggak perlu buka Arena lagi!):
+      </p>
+
+      <a id="doneTgLink" href="#" target="_blank" rel="noopener" class="done-link" style="background:#0088cc;color:#fff;">
+        ✈️ Buka Bot Telegram Gua Sekarang
+      </a>
+      <a id="doneAppLink" href="#" target="_blank" rel="noopener" class="done-link" style="background:#00a884;color:#fff;">
+        🌐 Buka Link Web Tetap 24 Jam Gua
+      </a>
+      <a id="doneSpaceLink" href="#" target="_blank" rel="noopener" class="done-link" style="background:#2a3942;color:#e9edef;">
+        📊 Cek Status Mesin (Tunggu sampai tulisan "Running")
+      </a>
+    </div>
+  </div>
+
+  <script>
+    async function runAutoDeploy() {
+      const hf_token = document.getElementById('hfToken').value.trim();
+      const telegram_token = document.getElementById('tgToken').value.trim();
+      const gemini_key = document.getElementById('geminiKey').value.trim();
+      const errBox = document.getElementById('errBox');
+      const btn = document.getElementById('deployBtn');
+
+      errBox.classList.add('hidden');
+      if (!hf_token) {
+        errBox.textContent = 'Isi dulu Token Hugging Face (hf_...) di Langkah 1 ya bro!';
+        errBox.classList.remove('hidden');
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = '⏳ Lagi Bikin Server & Upload Kode (10 detik)...';
+
+      try {
+        const res = await fetch('./api/deploy/hf', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hf_token, telegram_token, gemini_key }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          errBox.textContent = '❌ ' + (data.detail || 'Gagal memasang server.');
+          errBox.classList.remove('hidden');
+          return;
+        }
+
+        document.getElementById('setupFormArea').classList.add('hidden');
+        document.getElementById('doneBox').classList.remove('hidden');
+
+        document.getElementById('doneAppLink').href = data.app_url;
+        document.getElementById('doneSpaceLink').href = data.space_url;
+
+        const tgBtn = document.getElementById('doneTgLink');
+        if (data.telegram_url) {
+          tgBtn.href = data.telegram_url;
+          tgBtn.textContent = '✈️ Chat ke @' + data.bot_username + ' di Telegram';
+        } else {
+          tgBtn.classList.add('hidden');
+        }
+      } catch (e) {
+        errBox.textContent = '❌ Koneksi terputus: ' + e;
+        errBox.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🚀 Pasang Server 24 Jam Sekarang!';
+      }
+    }
+  </script>
+</body>
+</html>

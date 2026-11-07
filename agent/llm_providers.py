@@ -32,8 +32,8 @@ DAFTAR ACTION YANG TERSEDIA (pilih TEPAT SATU action setiap langkah):
 - `{"name": "select", "index": 6, "option": "Label atau value"}` -> Pilih opsi pada `<select>` nomor [index].
 - `{"name": "scroll", "direction": "down"}` -> Scroll halaman ("down", "up", "top", "bottom").
 - `{"name": "go_back"}` -> Kembali ke halaman sebelumnya.
-- `{"name": "read_file", "filename": "profil_pengajuan.json"}` -> Baca isi file dari folder workspace.
-- `{"name": "write_file", "filename": "hasil_riset.md", "content": "..."}` -> Buat/timpa file di folder workspace.
+- `{"name": "read_file", "filename": "profil_pengajuan.json"}` -> Baca isi file dari folder workspace (mendukung `.pdf`, `.docx`, `.xlsx`, `.csv`, `.json`, `.md`, `.txt`).
+- `{"name": "write_file", "filename": "hasil_riset.docx", "content": "..."}` -> Buat/timpa file di folder workspace. MENDUKUNG OTOMATIS format Word (`.docx`), Excel (`.xlsx`), PDF (`.pdf`), `.md`, dan `.csv`! (Gunakan format `# Judul`, `## Subjudul`, dan tabel pipa `| Kolom 1 | Kolom 2 |` di dalam `content` agar otomatis dikonversi menjadi dokumen Word/Excel/PDF rapi).
 - `{"name": "append_file", "filename": "catatan.md", "content": "..."}` -> Tambahkan teks ke file di workspace.
 - `{"name": "request_human_login", "reason": "Silakan login ke akun kamu terlebih dahulu di layar browser."}` -> Jeda agent & serahkan kontrol layar ke user untuk login/2FA/CAPTCHA.
 - `{"name": "ask_approval", "index": 9, "reason": "Konfirmasi pembayaran sebesar Rp ..."}` -> Minta izin user sebelum mengeksekusi elemen sensitif [index].

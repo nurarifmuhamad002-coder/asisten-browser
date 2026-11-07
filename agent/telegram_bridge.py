@@ -68,6 +68,7 @@ class TelegramBotBridge:
 
         self.active_chat_ids: Set[int] = {self.owner_id} if self.owner_id else set()
         self.chat_modes: Dict[int, str] = {}  # "chat" | "agent" | "open_web"
+        self.last_output_text: Dict[int, str] = {}
         self._status_msg_ids: Dict[int, int] = {}
         self._seen_update_ids: Set[int] = set()
         self._poll_task: Optional[asyncio.Task] = None
@@ -356,6 +357,17 @@ class TelegramBotBridge:
                     "• buka [link web] lalu masukkan data tadi",
                     reply_markup=MAIN_MENU_KB,
                 )
+            elif data.startswith("exp:"):
+                fmt = data.split(":", 1)[1].lower()
+                src_txt = self.last_output_text.get(chat_id) or self.orchestrator.persistent_notes.get("hasil_baca_terakhir", "")
+                if not src_txt:
+                    await self._answer_cb(cb_id, "Belum ada isi teks untuk dijadikan file.")
+                    return
+                await self._answer_cb(cb_id, f"Menyiapkan file .{fmt.upper()}...")
+                from datetime import datetime as _dt
+                saved = self.orchestrator.file_manager.export_formatted(f"dokumen_{_dt.now().strftime('%H%M%S')}", src_txt, fmt)
+                fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
+                await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 Siap kumpul: {fpath.name}")
             elif data.startswith("dl_file:"):
                 fname = data.split(":", 1)[1]
                 await self._answer_cb(cb_id, f"Mengirim {fname}...")
@@ -518,7 +530,38 @@ class TelegramBotBridge:
             await self.orchestrator._push_chat("user", text)
             reply = await self.orchestrator.brain.quick_chat(text, self.orchestrator.chat_messages[:-1])
             await self.orchestrator._push_chat("agent", reply)
-            await self.send_text(chat_id, reply, reply_markup=MAIN_MENU_KB)
+            self.last_output_text[chat_id] = reply
+
+            # Jika user di mode Ngobrol minta langsung dibikinkan file Word / Excel / PDF
+            req_fmt = ""
+            if any(k in low for k in (".docx", "jadi word", "file word", "dokumen word", "format word")):
+                req_fmt = "docx"
+            elif any(k in low for k in (".xlsx", "jadi excel", "file excel", "tabel excel", "format excel")):
+                req_fmt = "xlsx"
+            elif any(k in low for k in (".pdf", "jadi pdf", "file pdf", "dokumen pdf", "format pdf")):
+                req_fmt = "pdf"
+
+            if req_fmt:
+                from datetime import datetime as _dt
+                saved = self.orchestrator.file_manager.export_formatted(f"tugas_{_dt.now().strftime('%H%M%S')}", reply, req_fmt)
+                fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
+                await self.send_text(chat_id, reply, reply_markup=MAIN_MENU_KB)
+                await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 File .{req_fmt.upper()} siap dipakai: {fpath.name}")
+                return
+
+            if len(reply) >= 90:
+                export_kb = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "📘 Word (.docx)", "callback_data": "exp:docx"},
+                            {"text": "📗 Excel (.xlsx)", "callback_data": "exp:xlsx"},
+                            {"text": "📕 PDF (.pdf)", "callback_data": "exp:pdf"},
+                        ]
+                    ]
+                }
+                await self.send_text(chat_id, reply, reply_markup=export_kb)
+            else:
+                await self.send_text(chat_id, reply, reply_markup=MAIN_MENU_KB)
             return
 
         # Mode "agent" (Kerjain Tugas Web)
@@ -588,6 +631,7 @@ class TelegramBotBridge:
             if extracted_text:
                 combined_note += f"\n\nTeks Asli:\n{extracted_text[:4000]}"
             self.orchestrator.persistent_notes["hasil_baca_terakhir"] = combined_note
+            self.last_output_text[chat_id] = analysis
             await self.orchestrator._push_chat("user", f"[Kirim {saved_name}] {caption}".strip())
             await self.orchestrator._push_chat("agent", analysis)
 
@@ -611,7 +655,11 @@ class TelegramBotBridge:
             kb = {
                 "inline_keyboard": [
                     [{"text": "📝 Pakai Data Ini Buat Isi / Kerjain Web", "callback_data": "use_upload_web"}],
-                    [{"text": "💾 Jadikan File .md", "callback_data": "save_upload_md"}],
+                    [
+                        {"text": "📘 Word", "callback_data": "exp:docx"},
+                        {"text": "📗 Excel", "callback_data": "exp:xlsx"},
+                        {"text": "📕 PDF", "callback_data": "exp:pdf"},
+                    ],
                 ]
             }
             await self.send_text(chat_id, analysis, reply_markup=kb)
@@ -774,9 +822,19 @@ class TelegramBotBridge:
         if not self.is_configured or not self.active_chat_ids:
             return
         clean = summary.replace("**", "")
+        export_kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "📘 Word (.docx)", "callback_data": "exp:docx"},
+                    {"text": "📗 Excel (.xlsx)", "callback_data": "exp:xlsx"},
+                    {"text": "📕 PDF (.pdf)", "callback_data": "exp:pdf"},
+                ]
+            ]
+        }
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
         for cid in targets:
-            await self.send_text(cid, f"✅ Beres!\n\n{clean}", reply_markup=MAIN_MENU_KB)
+            self.last_output_text[cid] = summary
+            await self.send_text(cid, f"✅ Beres!\n\n{clean}", reply_markup=export_kb)
 
     async def send_to_all(self, message: str) -> None:
         if not self.is_configured or not self.active_chat_ids:

@@ -1,15 +1,314 @@
+import csv
+import io
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+from xml.sax.saxutils import escape as xml_escape
+
+
+def _parse_markdown_blocks(raw_text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Memecah teks AI/Markdown menjadi judul + blok terstruktur (heading, paragraf, list, tabel)."""
+    lines = (raw_text or "").replace("\r\n", "\n").split("\n")
+    doc_title = "Dokumen Hasil Asisten AI"
+    blocks: List[Dict[str, Any]] = []
+    table_buf: List[List[str]] = []
+
+    def flush_table() -> None:
+        nonlocal table_buf
+        if table_buf:
+            # Buang baris pemisah |---|---|
+            cleaned = [
+                r for r in table_buf
+                if not all(re.match(r"^:?-{2,}:?$", c.strip()) for c in r if c.strip())
+            ]
+            if cleaned:
+                blocks.append({"type": "table", "rows": cleaned})
+            table_buf = []
+
+    for line in lines:
+        s = line.strip()
+        # Cek baris tabel pipa | A | B |
+        if s.startswith("|") and s.endswith("|") and s.count("|") >= 2:
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            table_buf.append(cells)
+            continue
+        else:
+            flush_table()
+
+        if not s:
+            continue
+
+        h_match = re.match(r"^(#{1,3})\s+(.+)$", s)
+        if h_match:
+            lvl = len(h_match.group(1))
+            txt = h_match.group(2).strip().replace("**", "")
+            if lvl == 1 and doc_title == "Dokumen Hasil Asisten AI":
+                doc_title = txt
+            blocks.append({"type": "heading", "level": lvl, "text": txt})
+            continue
+
+        b_match = re.match(r"^([-*•]|\d+\.)\s+(.+)$", s)
+        if b_match:
+            blocks.append({"type": "bullet", "marker": b_match.group(1), "text": b_match.group(2).strip()})
+            continue
+
+        blocks.append({"type": "paragraph", "text": s})
+
+    flush_table()
+    return doc_title, blocks
+
+
+def _build_docx_bytes(raw_text: str, fallback_title: str = "Dokumen Tugas") -> bytes:
+    import docx
+    from docx.shared import Pt, RGBColor
+
+    doc_title, blocks = _parse_markdown_blocks(raw_text)
+    if doc_title == "Dokumen Hasil Asisten AI" and fallback_title:
+        doc_title = fallback_title
+
+    doc = docx.Document()
+    style_normal = doc.styles["Normal"]
+    style_normal.font.name = "Calibri"
+    style_normal.font.size = Pt(11)
+
+    # Judul Utama jika belum ada H1 di blok pertama
+    if not (blocks and blocks[0].get("type") == "heading" and blocks[0].get("level") == 1):
+        h = doc.add_heading(doc_title, level=0)
+        for run in h.runs:
+            run.font.color.rgb = RGBColor(0x0B, 0x3D, 0x2E)
+
+    def add_rich_runs(p: Any, text: str) -> None:
+        parts = re.split(r"(\*\*[^*]+\*\*)", text)
+        for part in parts:
+            if part.startswith("**") and part.endswith("**") and len(part) > 4:
+                r = p.add_run(part[2:-2])
+                r.bold = True
+            else:
+                p.add_run(part)
+
+    for b in blocks:
+        btype = b["type"]
+        if btype == "heading":
+            doc.add_heading(b["text"], level=min(b["level"], 3))
+        elif btype == "bullet":
+            marker = b["marker"]
+            style_name = "List Number" if marker[0].isdigit() else "List Bullet"
+            p = doc.add_paragraph(style=style_name)
+            add_rich_runs(p, b["text"])
+        elif btype == "table":
+            rows = b["rows"]
+            max_cols = max(len(r) for r in rows)
+            tbl = doc.add_table(rows=len(rows), cols=max_cols)
+            tbl.style = "Table Grid"
+            for r_i, row in enumerate(rows):
+                for c_i in range(max_cols):
+                    val = row[c_i] if c_i < len(row) else ""
+                    cell = tbl.cell(r_i, c_i)
+                    cell.text = ""
+                    p = cell.paragraphs[0]
+                    run = p.add_run(val.replace("**", ""))
+                    if r_i == 0:
+                        run.bold = True
+        else:
+            p = doc.add_paragraph()
+            add_rich_runs(p, b["text"])
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _build_xlsx_bytes(raw_text: str, sheet_title: str = "Data") -> bytes:
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = re.sub(r"[\[\]\*:/\\?]", "", sheet_title)[:28] or "Data"
+
+    _, blocks = _parse_markdown_blocks(raw_text)
+    rows_to_write: List[List[str]] = []
+
+    # 1. Jika ada blok tabel Markdown, gabungkan semua tabel
+    tables = [b["rows"] for b in blocks if b["type"] == "table"]
+    if tables:
+        for t_idx, t_rows in enumerate(tables):
+            if t_idx > 0:
+                rows_to_write.append([])
+            rows_to_write.extend([[c.replace("**", "") for c in r] for r in t_rows])
+    else:
+        # 2. Cek apakah format CSV murni (banyak koma konsisten)
+        non_empty = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
+        if len(non_empty) >= 2 and all("," in ln for ln in non_empty[:3]):
+            reader = csv.reader(io.StringIO("\n".join(non_empty)))
+            rows_to_write = [list(r) for r in reader if any(r)]
+        else:
+            # 3. Konversi poin / Key: Value / paragraf menjadi tabel rapi 3 kolom
+            rows_to_write.append(["No", "Bagian / Topik", "Isi / Keterangan"])
+            cur_section = "Umum"
+            num = 1
+            for b in blocks:
+                if b["type"] == "heading":
+                    cur_section = b["text"]
+                else:
+                    txt = b.get("text", "").replace("**", "").strip()
+                    if ":" in txt and len(txt.split(":", 1)[0]) <= 40:
+                        k, v = txt.split(":", 1)
+                        rows_to_write.append([str(num), k.strip(), v.strip()])
+                    else:
+                        rows_to_write.append([str(num), cur_section, txt])
+                    num += 1
+
+    if not rows_to_write:
+        rows_to_write = [["Isi Dokumen"], [raw_text or ""]]
+
+    header_fill = PatternFill("solid", fgColor="00695C")
+    zebra_fill = PatternFill("solid", fgColor="F1F8F6")
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    body_font = Font(name="Calibri", size=11, color="111111")
+    thin = Side(border_style="thin", color="CFD8DC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    col_max: Dict[int, int] = {}
+    for r_idx, row in enumerate(rows_to_write, start=1):
+        ws.append(row)
+        for c_idx, val in enumerate(row, start=1):
+            s_val = str(val or "")
+            col_max[c_idx] = max(col_max.get(c_idx, 10), min(len(s_val) + 4, 58))
+            cell = ws.cell(row=r_idx, column=c_idx)
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            if r_idx == 1:
+                cell.fill = header_fill
+                cell.font = header_font
+            else:
+                if r_idx % 2 == 1:
+                    cell.fill = zebra_fill
+                cell.font = body_font
+
+    for c_idx, width in col_max.items():
+        ws.column_dimensions[get_column_letter(c_idx)].width = width
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _build_pdf_bytes(raw_text: str, fallback_title: str = "Dokumen Hasil AI") -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    doc_title, blocks = _parse_markdown_blocks(raw_text)
+    if doc_title == "Dokumen Hasil Asisten AI" and fallback_title:
+        doc_title = fallback_title
+
+    buf = io.BytesIO()
+    pdf = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=42,
+        rightMargin=42,
+        topMargin=44,
+        bottomMargin=44,
+        title=doc_title,
+    )
+    styles = getSampleStyleSheet()
+    st_title = ParagraphStyle(
+        "DocTitle",
+        parent=styles["Heading1"],
+        fontSize=17,
+        leading=22,
+        textColor=colors.HexColor("#004D40"),
+        spaceAfter=12,
+    )
+    st_h2 = ParagraphStyle(
+        "DocH2",
+        parent=styles["Heading2"],
+        fontSize=13,
+        leading=17,
+        textColor=colors.HexColor("#00695C"),
+        spaceBefore=10,
+        spaceAfter=6,
+    )
+    st_body = ParagraphStyle(
+        "DocBody",
+        parent=styles["BodyText"],
+        fontSize=10.5,
+        leading=15,
+        spaceAfter=6,
+    )
+    st_bullet = ParagraphStyle(
+        "DocBullet",
+        parent=st_body,
+        leftIndent=16,
+        spaceAfter=4,
+    )
+
+    def fmt_inline(text: str) -> str:
+        esc = xml_escape(text)
+        return re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", esc)
+
+    story: List[Any] = []
+    if not (blocks and blocks[0].get("type") == "heading" and blocks[0].get("level") == 1):
+        story.append(Paragraph(fmt_inline(doc_title), st_title))
+        story.append(Spacer(1, 4))
+
+    for b in blocks:
+        btype = b["type"]
+        if btype == "heading":
+            st = st_title if b["level"] == 1 else st_h2
+            story.append(Paragraph(fmt_inline(b["text"]), st))
+        elif btype == "bullet":
+            prefix = "• " if not b["marker"][0].isdigit() else f"{xml_escape(b['marker'])} "
+            story.append(Paragraph(prefix + fmt_inline(b["text"]), st_bullet))
+        elif btype == "table":
+            rows = b["rows"]
+            max_cols = max(len(r) for r in rows)
+            avail_w = A4[0] - 84
+            col_w = avail_w / max(max_cols, 1)
+            tbl_data = []
+            for r_i, r in enumerate(rows):
+                row_cells = []
+                for c_i in range(max_cols):
+                    txt = r[c_i] if c_i < len(r) else ""
+                    formatted = f"<b>{fmt_inline(txt.replace('**', ''))}</b>" if r_i == 0 else fmt_inline(txt)
+                    row_cells.append(Paragraph(formatted, st_body))
+                tbl_data.append(row_cells)
+            tbl = Table(tbl_data, colWidths=[col_w] * max_cols, repeatRows=1)
+            tbl.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E0F2F1")),
+                        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#B0BEC5")),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("PADDING", (0, 0), (-1, -1), 6),
+                    ]
+                )
+            )
+            story.append(Spacer(1, 4))
+            story.append(tbl)
+            story.append(Spacer(1, 8))
+        else:
+            story.append(Paragraph(fmt_inline(b["text"]), st_body))
+
+    if not story:
+        story.append(Paragraph(fmt_inline(raw_text or "(Kosong)"), st_body))
+
+    pdf.build(story)
+    return buf.getvalue()
 
 
 class WorkspaceFileManager:
     """
     Mengelola file di dalam folder sandbox `./workspace_files`.
-    Agent maupun user bisa membaca, membuat, mengubah, mengunduh, dan menghapus file di sini.
-    File hasil download dari browser juga otomatis masuk ke folder ini.
+    Mendukung baca & tulis otomatis format `.docx` (Word), `.xlsx` (Excel), `.pdf` (PDF),
+    `.md`, `.csv`, `.json`, dan `.txt`.
     """
 
     def __init__(self, base_dir: str = "/home/user/workspace_files"):
@@ -36,7 +335,7 @@ class WorkspaceFileManager:
                 "perusahaan": "PT Kreasi Digital Nusantara",
                 "paket_layanan": "Cloud GPU Pro - Bulanan",
                 "alamat_pengiriman": "Jl. Jenderal Sudirman Kav. 52, Jakarta Selatan",
-                "catatan": "Mohon aktifkan invoice pajak otomatis untuk bulan berjalan."
+                "catatan": "Mohon aktifkan invoice pajak otomatis untuk bulan berjalan.",
             }
             sample_json.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -45,9 +344,8 @@ class WorkspaceFileManager:
             readme_ws.write_text(
                 "# Workspace File Agent\n\n"
                 "Folder ini adalah ruang kerja bersama antara **lu** dan **NusaOperator Agent**:\n"
-                "- **Input Data**: Upload atau simpan file `.json` / `.csv` / `.txt` (seperti `profil_pengajuan.json`) untuk diisi otomatis ke formulir web.\n"
-                "- **Output Riset**: Agent bisa merangkum informasi dari berbagai website lalu menyimpannya ke file `.md` atau `.csv` di sini.\n"
-                "- **Download Otomatis**: Semua file yang di-download di dalam Cloud Browser otomatis tersimpan ke folder ini.\n",
+                "- **Input Data**: Kirim foto/PDF/Word/Excel lewat Telegram atau upload ke sini.\n"
+                "- **Output Dokumen Rapi**: Agent bisa langsung membuat file Word (`.docx`), Excel (`.xlsx`), PDF (`.pdf`), `.md`, atau `.csv`.\n",
                 encoding="utf-8",
             )
 
@@ -92,7 +390,7 @@ class WorkspaceFileManager:
                         cells = [c.text.strip().replace("\n", " ") for c in row.cells]
                         if any(cells):
                             chunks.append(" | ".join(cells))
-                content = "\n".join(chunks)
+                content = "\n\n".join(chunks)
             elif ext in (".xlsx", ".xlsm"):
                 import openpyxl
                 wb = openpyxl.load_workbook(str(target), data_only=True, read_only=True)
@@ -125,15 +423,36 @@ class WorkspaceFileManager:
 
     def write_file(self, filename: str, content: str) -> Dict[str, Any]:
         target = self._safe_path(filename)
-        target.write_text(content, encoding="utf-8")
+        ext = target.suffix.lower()
+        stem_title = target.stem.replace("_", " ").replace("-", " ").title()
+
+        if ext == ".docx":
+            target.write_bytes(_build_docx_bytes(content, fallback_title=stem_title))
+        elif ext == ".xlsx":
+            target.write_bytes(_build_xlsx_bytes(content, sheet_title=stem_title))
+        elif ext == ".pdf":
+            target.write_bytes(_build_pdf_bytes(content, fallback_title=stem_title))
+        else:
+            target.write_text(content, encoding="utf-8")
+
         return {
             "name": target.name,
             "size": target.stat().st_size,
             "path": str(target),
         }
 
+    def export_formatted(self, stem: str, content: str, fmt: str) -> Dict[str, Any]:
+        clean_stem = re.sub(r"[^a-zA-Z0-9_\-]", "_", (stem or "hasil_tugas").strip()).strip("_") or "hasil_tugas"
+        clean_fmt = fmt.lower().lstrip(".")
+        if clean_fmt not in ("docx", "xlsx", "pdf", "md"):
+            clean_fmt = "docx"
+        return self.write_file(f"{clean_stem}.{clean_fmt}", content)
+
     def append_file(self, filename: str, content: str) -> Dict[str, Any]:
         target = self._safe_path(filename)
+        if target.suffix.lower() in (".docx", ".xlsx", ".pdf"):
+            prev = self.read_file(target.name) if target.exists() else ""
+            return self.write_file(target.name, (prev + "\n\n" + content).strip())
         existing = target.read_text(encoding="utf-8") if target.exists() else ""
         sep = "\n" if existing and not existing.endswith("\n") else ""
         target.write_text(existing + sep + content, encoding="utf-8")

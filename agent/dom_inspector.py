@@ -39,6 +39,16 @@ INSPECT_DOM_JS = """
     ].join(',');
 
     const rawNodes = Array.from(document.querySelectorAll(selector));
+    // Tambahkan elemen kartu/menu SPA modern (React/Next/Vue) yang punya cursor: pointer
+    for (const cand of document.querySelectorAll('div, li, span, label, section')) {
+        if (rawNodes.length >= 120) break;
+        if (cand.children.length <= 6 && window.getComputedStyle(cand).cursor === 'pointer') {
+            const txt = (cand.innerText || '').trim();
+            if (txt.length >= 2 && txt.length <= 120) {
+                rawNodes.push(cand);
+            }
+        }
+    }
     const uniqueNodes = [];
     const seen = new Set();
 

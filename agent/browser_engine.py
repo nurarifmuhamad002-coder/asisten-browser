@@ -70,9 +70,6 @@ class CloudBrowserEngine:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--no-zygote",
-                "--single-process",
-                "--js-flags=--max-old-space-size=160",
                 "--disable-blink-features=AutomationControlled",
             ],
         )
@@ -244,8 +241,38 @@ class CloudBrowserEngine:
             }
         )
 
+    async def ensure_alive(self) -> None:
+        """Otomatis menghidupkan ulang Chromium jika tab/proses crash di tengah jalan."""
+        needs_restart = False
+        if not self._started or not self.context or not self.page:
+            needs_restart = True
+        else:
+            try:
+                if self.page.is_closed():
+                    if self.context.pages:
+                        self.page = self.context.pages[-1]
+                        await self._attach_page(self.page)
+                    else:
+                        self.page = await self.context.new_page()
+                        await self._attach_page(self.page)
+                await self.page.evaluate("1")
+            except Exception:
+                needs_restart = True
+
+        if needs_restart:
+            await self.stop()
+            for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                lock_file = self.profile_dir / lock_name
+                if lock_file.exists() or lock_file.is_symlink():
+                    try:
+                        lock_file.unlink()
+                    except Exception:
+                        pass
+            await self.start("https://id.wikipedia.org")
+
     async def refresh_frame(self) -> str:
         """Mengambil screenshot terbaru secara eksplisit dan mengirimkannya ke semua klien UI."""
+        await self.ensure_alive()
         if not self.page:
             return self.latest_frame_b64
         try:
@@ -253,7 +280,7 @@ class CloudBrowserEngine:
                 await inspect_page(self.page, show_badges=True)
             else:
                 await clear_som_badges(self.page)
-            raw = await self.page.screenshot(type="jpeg", quality=72)
+            raw = await self.page.screenshot(type="jpeg", quality=68, timeout=6000, animations="disabled")
             self.latest_frame_b64 = base64.b64encode(raw).decode("ascii")
             await self.broadcast(
                 {
@@ -275,12 +302,19 @@ class CloudBrowserEngine:
         """
         Membaca kondisi halaman secara menyeluruh (DOM + elemen interaktif + screenshot Vision).
         """
+        await self.ensure_alive()
         if not self.page:
             raise RuntimeError("Browser belum siap.")
-        dom_state = await inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges))
+        try:
+            dom_state = await inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges))
+        except Exception:
+            await self.stop()
+            await self.ensure_alive()
+            dom_state = await inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges))
+
         screenshot_b64 = ""
         try:
-            raw = await self.page.screenshot(type="jpeg", quality=70)
+            raw = await self.page.screenshot(type="jpeg", quality=65, timeout=6000, animations="disabled")
             screenshot_b64 = base64.b64encode(raw).decode("ascii")
             self.latest_frame_b64 = screenshot_b64
         except Exception:
@@ -307,11 +341,16 @@ class CloudBrowserEngine:
     # ======================== AGENT ACTIONS ========================
 
     async def navigate(self, url: str) -> str:
+        await self.ensure_alive()
         if not self.page:
             raise RuntimeError("Browser belum aktif.")
         target = self._normalize_url(url)
-        await self.page.goto(target, wait_until="domcontentloaded", timeout=25000)
-        await asyncio.sleep(0.45)
+        try:
+            await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
+        except Exception:
+            await self.ensure_alive()
+            await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(0.4)
         await self.refresh_frame()
         return f"Berhasil membuka {self._display_url(self.page.url)} ({await self._safe_title()})"
 

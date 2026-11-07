@@ -195,6 +195,7 @@ class AgentOrchestrator:
                     history=self.history,
                     workspace_files=ws_files,
                     memory_notes=self.memory_notes,
+                    recent_chat=self.chat_messages[:-1],
                 )
 
                 thought = decision.get("thought", "")
@@ -230,6 +231,8 @@ class AgentOrchestrator:
 
                 if thought:
                     await self._push_chat("step", thought, {"step": step_num, "action": act_name})
+                    if self.telegram:
+                        await self.telegram.notify_step(step_num, thought)
 
                 result_text = await self._execute_with_guardrails(step_num, action, dom_state)
                 self.history.append({"step": step_num, "action_name": act_name, "result": result_text})

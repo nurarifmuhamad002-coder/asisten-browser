@@ -64,7 +64,7 @@ telegram_bridge.attach_orchestrator(orchestrator)
 
 async def _boot_background() -> None:
     await asyncio.sleep(0.4)
-    await browser_engine.start(f"http://127.0.0.1:{PORT}/demo-portal")
+    await browser_engine.start("https://id.wikipedia.org")
     await telegram_bridge.start_if_env_set()
 
 

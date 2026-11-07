@@ -14,7 +14,8 @@ Tugasmu adalah memahami perintah user (dalam Bahasa Indonesia atau Inggris), men
 ATURAN KEAMANAN MUTLAK (HUMAN-IN-THE-LOOP):
 1. DILARANG KERAS menebak atau mengetik sendiri password, PIN, kode OTP/2FA, atau menyelesaikan CAPTCHA. Jika halaman membutuhkan login/autentikasi dan user belum masuk, WAJIB panggil action `"request_human_login"` agar user login sendiri secara aman di layar browser.
 2. Untuk tindakan sensitif (seperti: konfirmasi pembayaran/checkout, transfer uang, hapus akun/data penting, kirim email/publikasi, ubah pengaturan keamanan), pastikan form sudah siap lalu klik tombolnya atau panggil `"ask_approval"` — sistem guardrail juga akan meminta izin eksplisit ke user sebelum klik dieksekusi.
-3. Untuk pencarian web umum, gunakan `"navigate"` ke `https://html.duckduckgo.com/html/?q=kata+kunci` (hindari `google.com/search` agar tidak terkena CAPTCHA IP server cloud). Jika user hanya menyapa atau bertanya apakah kamu bisa melakukan sesuatu tanpa menyebutkan link/tugas spesifiknya, jawab ramah dengan gaya santai menggunakan `"done"`.
+3. Untuk pencarian web umum, gunakan `"navigate"` ke `https://html.duckduckgo.com/html/?q=kata+kunci` (hindari `google.com/search` agar tidak terkena CAPTCHA IP server cloud). Jika user hanya menyapa atau bertanya apakah kamu bisa melakukan sesuatu tanpa menyebutkan link/tugas spesifiknya, jawab ramah dengan gaya santai (*gua/lu/bro*) menggunakan `"done"`.
+4. PROAKTIF BUKA TAB/WEB BARU: Jika user meminta masuk/membuka layanan lain yang berbeda dari halaman yang sedang terbuka (contoh: "login Konami ID", "buka e-learning", "cek GitHub", "buka baru lagi"), LANGSUNG panggil `"navigate"` ke URL resmi layanan tersebut (misal Konami ID -> `https://my.konami.net`), JANGAN pernah bilang website lama tidak mendukung layanan tersebut! Perhatikan juga RIWAYAT OBROLAN SEBELUMNYA untuk memahami maksud lanjutan user.
 
 DAFTAR ACTION YANG TERSEDIA (pilih TEPAT SATU action setiap langkah):
 - `{"name": "navigate", "url": "https://..."}` -> Membuka URL website (gunakan "/demo-portal" untuk portal simulasi akun).
@@ -127,11 +128,12 @@ class MultiLLMBrain:
         history: List[Dict[str, Any]],
         workspace_files: List[Dict[str, Any]],
         memory_notes: Dict[str, str],
+        recent_chat: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if not self.config.has_api_key:
             return self.autopilot.decide(goal, dom_state, history, workspace_files, memory_notes)
 
-        user_context = self._build_user_prompt(goal, dom_state, history, workspace_files, memory_notes)
+        user_context = self._build_user_prompt(goal, dom_state, history, workspace_files, memory_notes, recent_chat)
         screenshot_b64 = dom_state.get("screenshot_b64", "")
 
         provider = self.config.provider
@@ -148,6 +150,7 @@ class MultiLLMBrain:
         history: List[Dict[str, Any]],
         workspace_files: List[Dict[str, Any]],
         memory_notes: Dict[str, str],
+        recent_chat: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         files_str = ", ".join(f"{f['name']} ({f['size']}B)" for f in workspace_files) or "(kosong)"
         hist_lines = []
@@ -155,13 +158,25 @@ class MultiLLMBrain:
             hist_lines.append(f"{idx}. Action={h.get('action_name')} | Hasil={h.get('result')}")
         hist_str = "\n".join(hist_lines) if hist_lines else "(Belum ada langkah sebelumnya)"
 
+        chat_str = ""
+        if recent_chat:
+            c_lines = []
+            for m in recent_chat[-8:]:
+                r = m.get("role", "")
+                if r in ("user", "agent", "takeover"):
+                    lbl = "USER" if r == "user" else "ASISTEN"
+                    c_lines.append(f"- {lbl}: {(m.get('text') or '')[:260]}")
+            if c_lines:
+                chat_str = "=== RIWAYAT OBROLAN SEBELUMNYA ===\n" + "\n".join(c_lines) + "\n\n"
+
         mem_str = ""
         if memory_notes:
             mem_items = [f"- {k}: {v[:900]}" for k, v in memory_notes.items()]
             mem_str = "\n=== CATATAN / ISI FILE YANG SUDAH DIBACA ===\n" + "\n".join(mem_items) + "\n"
 
         return (
-            f"PERINTAH USER: {goal}\n\n"
+            f"{chat_str}"
+            f"PERINTAH USER SAAT INI: {goal}\n\n"
             f"FILE DI WORKSPACE: {files_str}\n"
             f"{mem_str}\n"
             f"=== RIWAYAT LANGKAH SEBELUMNYA ===\n{hist_str}\n\n"
@@ -170,6 +185,7 @@ class MultiLLMBrain:
         )
 
     async def _call_gemini(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
+        import asyncio as _aio
         primary = self.config.model or "gemini-3.1-flash-lite"
         candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
         parts: List[Dict[str, Any]] = [{"text": prompt_text}]
@@ -185,14 +201,18 @@ class MultiLLMBrain:
             },
         }
         last_err = ""
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(timeout=18.0) as client:
             for model in candidates:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
-                resp = await client.post(url, json=payload)
+                try:
+                    resp = await client.post(url, json=payload)
+                except Exception as exc:
+                    last_err = f"Koneksi AI lambat ({type(exc).__name__}) pada {model}"
+                    continue
                 if resp.status_code in (404, 429, 503):
                     last_err = f"Gemini API ({resp.status_code}) pada {model}"
                     if resp.status_code == 429:
-                        await asyncio.sleep(2.0)
+                        await _aio.sleep(1.5)
                     continue
                 if resp.status_code >= 400:
                     raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
@@ -201,7 +221,7 @@ class MultiLLMBrain:
                 data = resp.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 return _extract_json(text)
-        raise RuntimeError(last_err or "Kuota Gemini sedang penuh sesaat, coba kirim ulang 10 detik lagi.")
+        raise RuntimeError(last_err or "Server AI sedang padat sesaat, coba kirim ulang 5 detik lagi.")
 
     async def _call_openai_compatible(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         base = self.config.base_url

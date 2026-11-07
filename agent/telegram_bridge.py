@@ -37,6 +37,7 @@ class TelegramBotBridge:
         )
 
         self.active_chat_ids: Set[int] = set()
+        self._status_msg_ids: Dict[int, int] = {}
         self._seen_update_ids: Set[int] = set()
         self._poll_task: Optional[asyncio.Task] = None
         self._offset: int = 0
@@ -184,17 +185,19 @@ class TelegramBotBridge:
             )
             return
 
-        if text.startswith("/stop"):
+        low = text.lower().strip()
+
+        if low in ("/stop", "stop", "berhenti", "batal"):
             await self.orchestrator.stop_goal()
-            await self.send_text(chat_id, "⏹️ Pekerjaan dihentikan.")
+            await self.send_text(chat_id, "⏹️ Oke bro, pekerjaan barusan dihentikan.")
             return
 
-        if text.startswith("/lanjut"):
+        if low in ("/lanjut", "lanjut", "udah login", "sudah login"):
             await self.orchestrator.resume_from_takeover()
             await self.send_text(chat_id, "✅ Oke sip, gua lanjutin kerjanya!")
             return
 
-        if text.startswith("/layar") or text.startswith("/ss"):
+        if low in ("/layar", "/ss", "layar", "ss", "cek layar"):
             b64 = await self.orchestrator.browser.refresh_frame()
             if b64:
                 cur_url = self.orchestrator.browser.page.url if self.orchestrator.browser.page else ""
@@ -203,7 +206,9 @@ class TelegramBotBridge:
                 await self.send_text(chat_id, "Browser sedang disiapkan...")
             return
 
-        await self.send_text(chat_id, f"👍 Siap bro, lagi gua kerjain: {text}")
+        mid = await self.send_text(chat_id, f"⏳ Lagi gua proses bro: {text}")
+        if mid:
+            self._status_msg_ids[chat_id] = mid
         await self.orchestrator.start_goal(text)
 
     async def _answer_cb(self, cb_id: Optional[str], text: str) -> None:
@@ -215,14 +220,40 @@ class TelegramBotBridge:
                 json={"callback_query_id": cb_id, "text": text},
             )
 
-    async def send_text(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
+    async def send_text(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Optional[int]:
         if not self.token:
-            return
-        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+            return None
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text[:3900]}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json=payload)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json=payload)
+                d = r.json()
+                if d.get("ok"):
+                    return d["result"].get("message_id")
+        except Exception:
+            pass
+        return None
+
+    async def notify_step(self, step_num: int, thought: str) -> None:
+        if not self.is_configured or not self.active_chat_ids:
+            return
+        short_thought = (thought or "").strip()
+        if len(short_thought) > 220:
+            short_thought = short_thought[:220] + "..."
+        new_txt = f"⏳ Langkah {step_num}:\n{short_thought}"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            for cid in list(self.active_chat_ids):
+                mid = self._status_msg_ids.get(cid)
+                if mid:
+                    try:
+                        await client.post(
+                            f"https://api.telegram.org/bot{self.token}/editMessageText",
+                            json={"chat_id": cid, "message_id": mid, "text": new_txt},
+                        )
+                    except Exception:
+                        pass
 
     async def send_photo_b64(
         self,

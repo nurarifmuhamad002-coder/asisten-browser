@@ -14,6 +14,7 @@ Tugasmu adalah memahami perintah user (dalam Bahasa Indonesia atau Inggris), men
 ATURAN KEAMANAN MUTLAK (HUMAN-IN-THE-LOOP):
 1. DILARANG KERAS menebak atau mengetik sendiri password, PIN, kode OTP/2FA, atau menyelesaikan CAPTCHA. Jika halaman membutuhkan login/autentikasi dan user belum masuk, WAJIB panggil action `"request_human_login"` agar user login sendiri secara aman di layar browser.
 2. Untuk tindakan sensitif (seperti: konfirmasi pembayaran/checkout, transfer uang, hapus akun/data penting, kirim email/publikasi, ubah pengaturan keamanan), pastikan form sudah siap lalu klik tombolnya atau panggil `"ask_approval"` — sistem guardrail juga akan meminta izin eksplisit ke user sebelum klik dieksekusi.
+3. Untuk pencarian web umum, gunakan `"navigate"` ke `https://html.duckduckgo.com/html/?q=kata+kunci` (hindari `google.com/search` agar tidak terkena CAPTCHA IP server cloud). Jika user hanya menyapa atau bertanya apakah kamu bisa melakukan sesuatu tanpa menyebutkan link/tugas spesifiknya, jawab ramah dengan gaya santai menggunakan `"done"`.
 
 DAFTAR ACTION YANG TERSEDIA (pilih TEPAT SATU action setiap langkah):
 - `{"name": "navigate", "url": "https://..."}` -> Membuka URL website (gunakan "/demo-portal" untuk portal simulasi akun).
@@ -59,7 +60,7 @@ def _extract_json(raw_text: str) -> Dict[str, Any]:
 class LLMConfig:
     def __init__(self) -> None:
         self.provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()
-        self.model: str = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+        self.model: str = os.getenv("LLM_MODEL", "gemini-3-flash-preview")
         self.api_key: str = (
             os.getenv("LLM_API_KEY")
             or os.getenv("GEMINI_API_KEY")
@@ -87,10 +88,10 @@ class LLMConfig:
     @staticmethod
     def _default_model(provider: str) -> str:
         defaults = {
-            "gemini": "gemini-2.5-flash",
+            "gemini": "gemini-3-flash-preview",
             "openai": "gpt-4o",
             "anthropic": "claude-sonnet-4-20250514",
-            "openrouter": "google/gemini-2.5-flash",
+            "openrouter": "google/gemini-3-flash-preview",
         }
         return defaults.get(provider, "gpt-4o")
 
@@ -169,8 +170,8 @@ class MultiLLMBrain:
         )
 
     async def _call_gemini(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
-        model = self.config.model or "gemini-2.5-flash"
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
+        primary = self.config.model or "gemini-3-flash-preview"
+        candidates = [primary] + [m for m in ("gemini-3-flash-preview", "gemini-3.1-flash-lite") if m != primary]
         parts: List[Dict[str, Any]] = [{"text": prompt_text}]
         if screenshot_b64:
             parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
@@ -183,13 +184,22 @@ class MultiLLMBrain:
                 "responseMimeType": "application/json",
             },
         }
+        last_err = ""
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return _extract_json(text)
+            for model in candidates:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 404:
+                    last_err = f"Gemini API error ({resp.status_code}): {resp.text[:300]}"
+                    continue
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
+                if model != self.config.model:
+                    self.config.model = model
+                data = resp.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                return _extract_json(text)
+        raise RuntimeError(last_err or "Gemini API error")
 
     async def _call_openai_compatible(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         base = self.config.base_url

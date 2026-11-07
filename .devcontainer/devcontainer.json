@@ -1,0 +1,13 @@
+{
+  "name": "Asisten Browser AI",
+  "image": "mcr.microsoft.com/playwright/python:v1.50.0-noble",
+  "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
+  "postStartCommand": "nohup python3 main.py > /tmp/asisten_server.log 2>&1 &",
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {
+      "label": "Asisten Browser Chat",
+      "onAutoForward": "openBrowser"
+    }
+  }
+}

@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NusaCloud — Portal Akun & Layanan</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #f1f5f9; color: #0f172a; min-height: 100vh; }
+    .topbar {
+      background: #0f172a; color: #f8fafc; padding: 14px 28px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: 1px solid #1e293b;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; }
+    .brand-badge { background: #0ea5e9; color: #082f49; font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 700; }
+    .user-pill { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #cbd5e1; }
+    .btn-logout {
+      background: #1e293b; color: #f8fafc; border: 1px solid #334155;
+      padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+    }
+    .btn-logout:hover { background: #334155; }
+
+    /* Login Card */
+    .login-wrap {
+      max-width: 430px; margin: 56px auto; background: #ffffff;
+      border-radius: 14px; padding: 30px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+      border: 1px solid #e2e8f0;
+    }
+    .login-wrap h1 { font-size: 21px; margin-bottom: 6px; }
+    .login-wrap p.sub { font-size: 13px; color: #64748b; margin-bottom: 20px; line-height: 1.5; }
+    .field { margin-bottom: 15px; }
+    .field label { display: block; font-size: 13px; font-weight: 600; color: #334155; margin-bottom: 5px; }
+    .field input, .field select, .field textarea {
+      width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px;
+      font-size: 14px; color: #0f172a; background: #fff;
+    }
+    .field input:focus, .field select:focus, .field textarea:focus {
+      outline: none; border-color: #0284c7; box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.15);
+    }
+    .btn-primary {
+      width: 100%; padding: 11px 16px; background: #0284c7; color: #fff;
+      border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    .btn-primary:hover { background: #0369a1; }
+    .btn-quick {
+      width: 100%; margin-top: 10px; padding: 9px 14px; background: #f0f9ff;
+      color: #0369a1; border: 1px dashed #7dd3fc; border-radius: 8px;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    .btn-quick:hover { background: #e0f2fe; }
+    .hint-box {
+      margin-top: 16px; padding: 11px 13px; background: #fffbeb; border: 1px solid #fde68a;
+      border-radius: 8px; font-size: 12px; color: #92400e; line-height: 1.45;
+    }
+
+    /* Dashboard */
+    .container { max-width: 1020px; margin: 24px auto; padding: 0 24px 40px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid #cbd5e1; padding-bottom: 10px; }
+    .tab-btn {
+      padding: 9px 16px; border-radius: 8px; border: 1px solid transparent;
+      background: transparent; color: #475569; font-weight: 600; font-size: 14px; cursor: pointer;
+    }
+    .tab-btn.active { background: #0f172a; color: #ffffff; }
+    .tab-btn:hover:not(.active) { background: #e2e8f0; }
+
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+    .stat-card {
+      background: #fff; padding: 18px 20px; border-radius: 12px;
+      border: 1px solid #e2e8f0; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
+    }
+    .stat-label { font-size: 12px; color: #64748b; font-weight: 600; text-transform: uppercase; }
+    .stat-val { font-size: 22px; font-weight: 700; margin-top: 6px; color: #0f172a; }
+
+    .panel {
+      background: #fff; border-radius: 12px; border: 1px solid #e2e8f0;
+      padding: 24px; box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+    }
+    .panel h2 { font-size: 18px; margin-bottom: 6px; }
+    .panel p.desc { font-size: 13px; color: #64748b; margin-bottom: 18px; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .full-col { grid-column: 1 / -1; }
+
+    .checkout-bar {
+      margin-top: 18px; padding: 16px 18px; background: #f8fafc;
+      border: 1px solid #cbd5e1; border-radius: 10px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .btn-pay {
+      padding: 12px 22px; background: #059669; color: #fff; border: none;
+      border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer;
+    }
+    .btn-pay:hover { background: #047857; }
+    .btn-danger {
+      padding: 11px 18px; background: #dc2626; color: #fff; border: none;
+      border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer;
+    }
+    .btn-secondary {
+      padding: 9px 15px; background: #f1f5f9; color: #0f172a; border: 1px solid #cbd5e1;
+      border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13.5px; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #e2e8f0; }
+    th { color: #475569; font-weight: 600; background: #f8fafc; }
+    .receipt-box {
+      background: #ecfdf5; border: 1.5px solid #34d399; border-radius: 12px;
+      padding: 22px; color: #064e3b;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span>☁️ NusaCloud Portal</span>
+      <span class="brand-badge">SANDBOX AKUN USER</span>
+    </div>
+    <div id="navUserArea" class="user-pill hidden">
+      <span id="navUserEmail">rizky@contoh-usaha.id</span>
+      <button class="btn-logout" onclick="doLogout()">Logout Akun</button>
+    </div>
+  </header>
+
+  <!-- VIEW 1: LOGIN SCREEN -->
+  <main id="loginView" class="login-wrap">
+    <h1>Masuk ke Akun NusaCloud</h1>
+    <p class="sub">Halaman simulasi akun pribadi/bisnis. Agent otomatis berhenti di sini agar <b>login tetap 100% di tangan lu</b>.</p>
+
+    <form onsubmit="handleLogin(event)">
+      <div class="field">
+        <label for="loginEmail">Email Akun</label>
+        <input id="loginEmail" name="email" type="email" placeholder="nama@perusahaan.id" required />
+      </div>
+      <div class="field">
+        <label for="loginPassword">Password</label>
+        <input id="loginPassword" name="password" type="password" placeholder="Masukkan password akun" required />
+      </div>
+      <button type="submit" class="btn-primary">Masuk ke Dashboard</button>
+      <button type="button" class="btn-quick" onclick="quickDemoLogin()">⚡ Isi Cepat & Masuk (Akun Demo)</button>
+    </form>
+
+    <div class="hint-box">
+      💡 <b>Cara Test Human-in-the-Loop:</b> Saat mode kontrol manual aktif, lu bisa klik & ketik bebas di kolom di atas, atau klik tombol <i>Isi Cepat & Masuk</i>, lalu tekan <b>Lanjutkan Agent</b> di panel kiri.
+    </div>
+  </main>
+
+  <!-- VIEW 2: LOGGED-IN DASHBOARD -->
+  <main id="appView" class="container hidden">
+    <div class="tabs">
+      <button id="tabBtnOverview" role="tab" class="tab-btn active" onclick="switchTab('overview')">📊 Ringkasan & File Tagihan</button>
+      <button id="tabBtnOrder" role="tab" class="tab-btn" onclick="switchTab('order')">📝 Formulir Pengajuan Layanan</button>
+      <button id="tabBtnSecurity" role="tab" class="tab-btn" onclick="switchTab('security')">🛡️ Pengaturan Keamanan</button>
+    </div>
+
+    <!-- TAB: OVERVIEW -->
+    <section id="tabOverview">
+      <div class="grid-3">
+        <div class="stat-card">
+          <div class="stat-label">Saldo Kredit Akun</div>
+          <div class="stat-val">Rp 12.500.000</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Instance Cloud Aktif</div>
+          <div class="stat-val">3 Server Aktif</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Status Keamanan</div>
+          <div class="stat-val" style="color:#059669;">Terverifikasi</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <div>
+            <h2>Riwayat Tagihan & Pemakaian</h2>
+            <p class="desc" style="margin-bottom:0;">Unduh laporan CSV untuk melihat bagaimana Cloud Browser menyimpan file ke Workspace.</p>
+          </div>
+          <button class="btn-secondary" onclick="downloadInvoiceCsv()">⬇️ Download Laporan (.CSV)</button>
+        </div>
+        <table>
+          <thead>
+            <tr><th>No. Invoice</th><th>Tanggal</th><th>Layanan</th><th>Nominal</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>INV-2026-101</td><td>01 Nov 2026</td><td>Cloud Compute SGP-1</td><td>Rp 850.000</td><td>Lunas</td></tr>
+            <tr><td>INV-2026-094</td><td>01 Okt 2026</td><td>Managed Postgres DB</td><td>Rp 620.000</td><td>Lunas</td></tr>
+            <tr><td>INV-2026-088</td><td>01 Sep 2026</td><td>Object Storage 2TB</td><td>Rp 310.000</td><td>Lunas</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- TAB: ORDER FORM & SENSITIVE CHECKOUT -->
+    <section id="tabOrder" class="hidden">
+      <div id="orderFormCard" class="panel">
+        <h2>Formulir Pengajuan Layanan & Pembayaran</h2>
+        <p class="desc">Agent dapat mengisi seluruh kolom ini otomatis dari file <code>profil_pengajuan.json</code>, namun wajib meminta izinmu sebelum tombol Bayar diklik.</p>
+
+        <form onsubmit="submitSensitiveOrder(event)">
+          <div class="form-grid">
+            <div class="field">
+              <label for="fNama">Nama Lengkap Penanggung Jawab</label>
+              <input id="fNama" name="nama_lengkap" type="text" placeholder="Contoh: Rizky Pratama" required />
+            </div>
+            <div class="field">
+              <label for="fPerusahaan">Nama Perusahaan / Tim</label>
+              <input id="fPerusahaan" name="perusahaan" type="text" placeholder="Contoh: PT Kreasi Digital" required />
+            </div>
+            <div class="field">
+              <label for="fTelepon">Nomor Telepon / WhatsApp</label>
+              <input id="fTelepon" name="telepon" type="text" placeholder="0812-xxxx-xxxx" required />
+            </div>
+            <div class="field">
+              <label for="fPaket">Pilih Paket Layanan</label>
+              <select id="fPaket" name="paket_layanan">
+                <option value="Cloud Starter - Bulanan">Cloud Starter - Rp 350.000/bln</option>
+                <option value="Cloud GPU Pro - Bulanan">Cloud GPU Pro - Bulanan (Rp 1.450.000)</option>
+                <option value="Enterprise Cluster - Tahunan">Enterprise Cluster - Rp 9.800.000/thn</option>
+              </select>
+            </div>
+            <div class="field full-col">
+              <label for="fAlamat">Alamat Penagihan / Pengiriman</label>
+              <input id="fAlamat" name="alamat" type="text" placeholder="Alamat lengkap kantor" required />
+            </div>
+            <div class="field full-col">
+              <label for="fCatatan">Catatan Tambahan</label>
+              <textarea id="fCatatan" name="catatan" rows="2" placeholder="Instruksi khusus penagihan..."></textarea>
+            </div>
+          </div>
+
+          <div class="checkout-bar">
+            <div>
+              <div style="font-size:12px;color:#64748b;">Total Debet Saldo Akun (Tindakan Sensitif)</div>
+              <div style="font-size:20px;font-weight:800;color:#0f172a;">Rp 1.450.000</div>
+            </div>
+            <button type="submit" id="btnConfirmPay" data-sensitive="true" class="btn-pay">
+              Konfirmasi & Bayar Pesanan
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <div id="orderReceiptCard" class="receipt-box hidden">
+        <h2 style="margin-bottom:8px;">✅ TRANSAKSI BERHASIL DIPROSES</h2>
+        <p style="margin-bottom:14px;font-size:14px;">Pesanan layanan cloud telah aktif setelah mendapat persetujuan pemilik akun.</p>
+        <div id="receiptDetails" style="font-family:monospace;font-size:13px;line-height:1.7;background:#fff;padding:14px;border-radius:8px;border:1px solid #a7f3d0;"></div>
+        <button type="button" class="btn-secondary" style="margin-top:14px;" onclick="resetOrderForm()">Buat Pengajuan Baru</button>
+      </div>
+    </section>
+
+    <!-- TAB: SECURITY & DESTRUCTIVE ACTION -->
+    <section id="tabSecurity" class="hidden">
+      <div class="panel">
+        <h2>Pengaturan Keamanan & Zona Sensitif</h2>
+        <p class="desc">Seluruh tombol pada halaman ini dilindungi oleh Guardrail Persetujuan User.</p>
+        <div style="padding:16px;border:1px solid #fecaca;background:#fef2f2;border-radius:10px;display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <div style="font-weight:700;color:#991b1b;">Zona Berbahaya: Hapus Akun & Server</div>
+            <div style="font-size:13px;color:#b91c1c;margin-top:3px;">Tindakan ini bersifat permanen dan tidak boleh dijalankan AI tanpa persetujuan eksplisitmu.</div>
+          </div>
+          <button type="button" data-sensitive="true" class="btn-danger" onclick="handleDeleteAccount()">
+            Hapus Akun Permanen
+          </button>
+        </div>
+        <div id="securityNotice" class="hint-box hidden" style="margin-top:16px;"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    function renderAuthState() {
+      const user = localStorage.getItem('nusacloud_user');
+      const loginView = document.getElementById('loginView');
+      const appView = document.getElementById('appView');
+      const navUserArea = document.getElementById('navUserArea');
+      if (user) {
+        loginView.classList.add('hidden');
+        appView.classList.remove('hidden');
+        navUserArea.classList.remove('hidden');
+        document.getElementById('navUserEmail').textContent = user;
+      } else {
+        loginView.classList.remove('hidden');
+        appView.classList.add('hidden');
+        navUserArea.classList.add('hidden');
+      }
+    }
+
+    function handleLogin(e) {
+      e.preventDefault();
+      const email = document.getElementById('loginEmail').value.trim() || 'rizky.pratama@contoh-usaha.id';
+      localStorage.setItem('nusacloud_user', email);
+      renderAuthState();
+    }
+
+    function quickDemoLogin() {
+      document.getElementById('loginEmail').value = 'rizky.pratama@contoh-usaha.id';
+      document.getElementById('loginPassword').value = 'demo-aman-12345';
+      setTimeout(() => {
+        localStorage.setItem('nusacloud_user', 'rizky.pratama@contoh-usaha.id');
+        renderAuthState();
+      }, 180);
+    }
+
+    function doLogout() {
+      localStorage.removeItem('nusacloud_user');
+      renderAuthState();
+    }
+
+    function switchTab(tab) {
+      document.getElementById('tabOverview').classList.toggle('hidden', tab !== 'overview');
+      document.getElementById('tabOrder').classList.toggle('hidden', tab !== 'order');
+      document.getElementById('tabSecurity').classList.toggle('hidden', tab !== 'security');
+      document.getElementById('tabBtnOverview').classList.toggle('active', tab === 'overview');
+      document.getElementById('tabBtnOrder').classList.toggle('active', tab === 'order');
+      document.getElementById('tabBtnSecurity').classList.toggle('active', tab === 'security');
+    }
+
+    function submitSensitiveOrder(e) {
+      e.preventDefault();
+      const nama = document.getElementById('fNama').value;
+      const pt = document.getElementById('fPerusahaan').value;
+      const telp = document.getElementById('fTelepon').value;
+      const paket = document.getElementById('fPaket').value;
+      const alamat = document.getElementById('fAlamat').value;
+      const catatan = document.getElementById('fCatatan').value;
+
+      document.getElementById('receiptDetails').innerText =
+        `Nomor Invoice  : INV-NUSA-2026-8841\n` +
+        `Pemohon        : ${nama} (${pt})\n` +
+        `Kontak         : ${telp}\n` +
+        `Paket Aktif    : ${paket}\n` +
+        `Alamat Tagihan : ${alamat}\n` +
+        `Catatan        : ${catatan || '-'}\n` +
+        `Total Dibayar  : Rp 1.450.000 (LUNAS)`;
+
+      document.getElementById('orderFormCard').classList.add('hidden');
+      document.getElementById('orderReceiptCard').classList.remove('hidden');
+    }
+
+    function resetOrderForm() {
+      document.getElementById('orderFormCard').classList.remove('hidden');
+      document.getElementById('orderReceiptCard').classList.add('hidden');
+    }
+
+    function handleDeleteAccount() {
+      const box = document.getElementById('securityNotice');
+      box.classList.remove('hidden');
+      box.innerHTML = '⚠️ <b>Simulasi Selesai:</b> Permintaan penghapusan akun dicatat setelah mendapat konfirmasi langsung dari pemilik akun.';
+    }
+
+    function downloadInvoiceCsv() {
+      const csv = [
+        'invoice_id,tanggal,layanan,nominal_idr,status',
+        'INV-2026-101,2026-11-01,Cloud Compute SGP-1,850000,Lunas',
+        'INV-2026-094,2026-10-01,Managed Postgres DB,620000,Lunas',
+        'INV-2026-088,2026-09-01,Object Storage 2TB,310000,Lunas'
+      ].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'riwayat_tagihan_nusacloud.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    renderAuthState();
+  </script>
+</body>
+</html>

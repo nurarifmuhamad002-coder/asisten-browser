@@ -1,0 +1,12 @@
+# Ignore Linux home dot-directories & caches
+.*
+!.gitignore
+!.env.example
+!.devcontainer/
+!.devcontainer/**
+
+# Python & runtime artifacts
+__pycache__/
+*.py[cod]
+*.zip
+/tmp/

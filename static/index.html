@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Asisten Browser</title>
+  <link rel="stylesheet" href="./static/styles.css" />
+</head>
+<body>
+  <div class="chat-app">
+    <!-- ================= HEADER ALA WA / TELEGRAM ================= -->
+    <header class="chat-header">
+      <div class="header-left">
+        <div class="bot-avatar">
+          🤖
+          <span id="onlineDot" class="online-dot"></span>
+        </div>
+        <div class="bot-meta">
+          <div class="bot-name">Asisten Browser</div>
+          <div id="liveStatusText" class="bot-status">Online · Siap disuruh apa aja</div>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button class="peek-btn" onclick="openBrowserSheet('peek')">
+          🖥️ Layar
+        </button>
+        <button class="menu-btn" onclick="openMenuSheet()" title="Pengaturan & File">
+          ⋮
+        </button>
+      </div>
+    </header>
+
+    <!-- ================= RUANG CHAT UTAMA ================= -->
+    <main id="chatFeed" class="chat-feed">
+      <!-- Bubble Sambutan Tetap -->
+      <div class="bubble bubble-in">
+        Halo bro! 👋 Tinggal chat aja mau nyuruh gua ngapain.<br/><br/>
+        Browser jalan otomatis di belakang layar, dan <b>layar cuma bakal nongol kalau butuh lu login atau minta izin bayar/sensitif</b>.<br/>
+        <div class="quick-chips">
+          <button class="chip-btn" onclick="tapPreset('portal_checkout')">
+            🔐 Beliin layanan di akun gua (Tes Login & Izin Bayar)
+          </button>
+          <button class="chip-btn" onclick="tapPreset('wikipedia')">
+            🔍 Cariin info Kecerdasan Buatan di Wikipedia
+          </button>
+          <button class="chip-btn" onclick="tapPreset('hackernews')">
+            📰 Rangkumin berita teknologi hari ini ke file
+          </button>
+          <button class="chip-btn" onclick="tapPreset('books_csv')">
+            📊 Ambil daftar katalog buku jadi file CSV
+          </button>
+        </div>
+      </div>
+
+      <!-- Pesan Dinamis Masuk ke Sini -->
+      <div id="dynamicMessages" style="display:flex;flex-direction:column;gap:10px;"></div>
+    </main>
+
+    <!-- ================= KARTU MINI PAS LAGI KERJA DI BELAKANG LAYAR ================= -->
+    <div id="liveMiniBar" class="live-mini-bar hidden" onclick="openBrowserSheet('peek')">
+      <img id="miniThumbImg" class="mini-thumb" alt="Layar Live" />
+      <div class="mini-info">
+        <div id="miniStepTitle" class="mini-title">Sedang bekerja di browser...</div>
+        <div class="mini-sub">Tap di sini kalau mau ngintip layar penuh</div>
+      </div>
+      <span style="color:#38bdf8;font-size:12px;font-weight:700;">Lihat ›</span>
+    </div>
+
+    <!-- ================= KOTAK KETIK BAWAH ALA WA ================= -->
+    <footer class="chat-composer">
+      <div class="input-pill">
+        <button class="attach-btn" onclick="openFilesSheet()" title="File & Upload">📎</button>
+        <textarea
+          id="chatInput"
+          rows="1"
+          placeholder="Ketik perintah..."
+          oninput="autoGrowInput(this)"
+          onkeydown="handleInputKey(event)"
+        ></textarea>
+      </div>
+      <button id="sendBtn" class="send-circle" onclick="sendChatCommand()">➤</button>
+      <button id="stopBtn" class="send-circle stop hidden" onclick="stopCommand()" title="Hentikan">⏹</button>
+    </footer>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- LEMBAR LAYAR BROWSER (CUMA MUNCUL OTOMATIS PAS BUTUH LOGIN / DI-INTIP!) -->
+  <!-- ========================================================================= -->
+  <div id="browserSheet" class="browser-sheet hidden">
+    <div class="sheet-header">
+      <div id="sheetTitle" class="sheet-title">🔐 Silakan Login Sendiri</div>
+      <div class="sheet-tools">
+        <button id="zoomBtn" class="small-pill" onclick="toggleZoom()">🔍 Perbesar</button>
+        <button class="small-pill" onclick="closeBrowserSheet()">Tutup ✕</button>
+      </div>
+    </div>
+
+    <!-- Bar Ketik Gampang buat Keyboard HP -->
+    <div class="sheet-type-bar">
+      <button class="small-pill" onclick="scrollBrowser(-340)">▲</button>
+      <button class="small-pill" onclick="scrollBrowser(340)">▼</button>
+      <input
+        id="mobileKeyInput"
+        type="text"
+        autocomplete="off"
+        placeholder="Tap kolom di layar, lalu ketik di sini..."
+        onkeydown="if(event.key==='Enter'){event.preventDefault();sendMobileText();}"
+      />
+      <button class="small-pill active" onclick="sendMobileText()">Ketik</button>
+      <button class="small-pill" onclick="sendBrowserKey('Backspace')">⌫</button>
+      <button class="small-pill" onclick="sendBrowserKey('Enter')">↵</button>
+    </div>
+
+    <div class="sheet-stage">
+      <div id="canvasWrap" class="canvas-wrap">
+        <canvas id="browserCanvas" width="1280" height="800" tabindex="0"></canvas>
+      </div>
+    </div>
+
+    <!-- Footer Tombol Hijau Gede pas Mode Login -->
+    <div id="sheetTakeoverFooter" class="sheet-footer">
+      <button class="big-btn btn-green" onclick="finishLoginAndResume()">
+        ✅ Udah Beres Login — Lanjut Kerjain!
+      </button>
+    </div>
+  </div>
+
+  <!-- ================= MENU PENGATURAN (TITIK TIGA ⋮) ================= -->
+  <div id="menuModal" class="modal-bg hidden" onclick="if(event.target===this)closeMenuSheet()">
+    <div class="modal-sheet">
+      <div class="modal-top">
+        <h3>⚙️ Pengaturan Simpel</h3>
+        <button class="small-pill" onclick="closeMenuSheet()">Tutup ✕</button>
+      </div>
+
+      <!-- 1. Sambung ke Aplikasi Telegram Asli -->
+      <div class="modal-section">
+        <h4>✈️ Sambungin ke Aplikasi Telegram HP (Opsional)</h4>
+        <p>
+          Pengen chat langsung dari aplikasi Telegram asli di HP lu? Bikin bot di <b>@BotFather</b> (ketik <code>/newbot</code>), lalu tempel tokennya di sini:
+        </p>
+        <input id="tgTokenInput" class="field-inp" type="password" placeholder="Contoh: 7123456:AAFxyz..." />
+        <div id="tgStatusInfo" style="font-size:12px;color:#34d399;margin-top:6px;"></div>
+        <button class="big-btn btn-green" style="margin-top:9px;padding:9px;" onclick="saveTelegramToken()">
+          Sambungkan Bot Telegram
+        </button>
+      </div>
+
+      <!-- 2. Otak AI Vision Penuh -->
+      <div class="modal-section">
+        <h4>🧠 Pasang Otak AI Bebas (Opsional)</h4>
+        <p>
+          Tanpa diisi pun udah langsung jalan pakai Autopilot bawaan. Isi API Key (misal Gemini gratis dari <i>aistudio.google.com</i>) kalau mau buka website bebas apa aja:
+        </p>
+        <label class="field-lbl">Pilih AI</label>
+        <select id="cfgProvider" class="field-inp" onchange="onProviderPick()">
+          <option value="gemini">Google Gemini (Gratis & Cepat)</option>
+          <option value="openai">OpenAI (GPT-4o)</option>
+          <option value="anthropic">Anthropic Claude</option>
+          <option value="openrouter">OpenRouter</option>
+        </select>
+        <label class="field-lbl">Model</label>
+        <input id="cfgModel" class="field-inp" type="text" value="gemini-2.5-flash" />
+        <label class="field-lbl">API Key <span id="llmKeyStatus" style="color:#34d399;"></span></label>
+        <input id="cfgApiKey" class="field-inp" type="password" placeholder="Tempel API Key..." />
+        <button class="big-btn btn-dark" style="margin-top:10px;padding:9px;" onclick="saveLlmConfig()">
+          Simpan API Key AI
+        </button>
+      </div>
+
+      <!-- 3. Reset Ulang -->
+      <button class="big-btn btn-red" onclick="resetAllSession()">
+        🧹 Bersihkan Chat & Logout Semua Akun Browser
+      </button>
+    </div>
+  </div>
+
+  <!-- ================= LEMBAR FILE & UPLOAD (KLIP 📎) ================= -->
+  <div id="filesModal" class="modal-bg hidden" onclick="if(event.target===this)closeFilesSheet()">
+    <div class="modal-sheet">
+      <div class="modal-top">
+        <h3>📁 File & Dokumen</h3>
+        <button class="small-pill" onclick="closeFilesSheet()">Tutup ✕</button>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <label class="big-btn btn-green" style="padding:9px;cursor:pointer;">
+          ⬆️ Upload File dari HP
+          <input type="file" style="display:none;" onchange="uploadFromPhone(event)" />
+        </label>
+      </div>
+      <div id="filesSheetList" style="display:flex;flex-direction:column;gap:8px;"></div>
+    </div>
+  </div>
+
+  <!-- ================= PEMBACA ISI FILE ================= -->
+  <div id="readerModal" class="modal-bg hidden" onclick="if(event.target===this)closeReaderModal()">
+    <div class="modal-sheet">
+      <div class="modal-top">
+        <h3 id="readerTitle">📄 Isi File</h3>
+        <button class="small-pill" onclick="closeReaderModal()">Tutup ✕</button>
+      </div>
+      <textarea id="readerContent" class="field-inp" style="min-height:260px;font-family:monospace;font-size:12.5px;line-height:1.45;"></textarea>
+      <div style="display:flex;gap:8px;margin-top:10px;">
+        <a id="readerDownloadBtn" href="#" download class="big-btn btn-dark" style="text-decoration:none;">⬇️ Simpan ke HP</a>
+        <button class="big-btn btn-green" onclick="saveEditedFile()">💾 Simpan Perubahan</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="./static/app.js"></script>
+</body>
+</html>

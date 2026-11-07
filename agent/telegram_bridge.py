@@ -2,6 +2,8 @@ import asyncio
 import base64
 import json
 import os
+import re
+import secrets
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import httpx
@@ -14,7 +16,7 @@ MAIN_MENU_KB: Dict[str, Any] = {
     "keyboard": [
         [{"text": "💬 Ngobrol AI"}, {"text": "📝 Kerjain Tugas Web"}],
         [{"text": "🌐 Buka Web"}, {"text": "📸 Cek Layar"}],
-        [{"text": "📂 Daftar File"}, {"text": "⏹️ Stop / Menu"}],
+        [{"text": "📂 Daftar File"}, {"text": "🔒 Keamanan"}, {"text": "⏹️ Stop / Menu"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -26,16 +28,18 @@ BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "tugas", "description": "Mode Kerjain Tugas Otomatis di Web"},
     {"command": "buka", "description": "Buka Website & Login Aman"},
     {"command": "layar", "description": "Kirim Foto Layar Browser Sekarang"},
+    {"command": "kunci", "description": "Kunci Bot & Web Khusus HP Lu"},
     {"command": "stop", "description": "Hentikan Proses Saat Ini"},
 ]
 
 
 class TelegramBotBridge:
     """
-    Jembatan interaktif ke Telegram di HP user dengan Menu Tombol Langsung:
+    Jembatan interaktif ke Telegram di HP user dengan Menu Tombol Langsung + Private Owner Lock:
     1. 💬 Ngobrol AI — Tanya jawab & bantuan tugas instan (<1 detik) tanpa buka browser
     2. 📝 Kerjain Tugas Web — AI mengoperasikan browser multi-langkah + buat file
     3. 🌐 Buka Web — Buka website apa saja + tombol layar live untuk login aman
+    4. 🔒 Keamanan (Private Lock) — Kunci bot & layar web live khusus pemilik tunggal
     """
 
     def __init__(self) -> None:
@@ -56,7 +60,13 @@ class TelegramBotBridge:
             render_url or railway_dom or space_host or os.getenv("PUBLIC_WEB_URL", "").strip().startswith("https://")
         )
 
-        self.active_chat_ids: Set[int] = set()
+        # Private Owner Lock
+        raw_owner = os.getenv("TELEGRAM_OWNER_ID", "").strip()
+        self.owner_id: Optional[int] = int(raw_owner) if raw_owner.isdigit() else None
+        self.owner_label: str = f"ID {self.owner_id}" if self.owner_id else ""
+        self.web_access_key: str = os.getenv("WEB_ACCESS_PIN", "").strip() or str(100000 + secrets.randbelow(900000))
+
+        self.active_chat_ids: Set[int] = {self.owner_id} if self.owner_id else set()
         self.chat_modes: Dict[int, str] = {}  # "chat" | "agent" | "open_web"
         self._status_msg_ids: Dict[int, int] = {}
         self._seen_update_ids: Set[int] = set()
@@ -71,6 +81,18 @@ class TelegramBotBridge:
     def is_configured(self) -> bool:
         return bool(self.token)
 
+    @property
+    def is_locked(self) -> bool:
+        return self.owner_id is not None
+
+    def protected_web_url(self) -> str:
+        if not self.public_web_url:
+            return ""
+        if self.is_locked:
+            sep = "&" if "?" in self.public_web_url else "?"
+            return f"{self.public_web_url}{sep}k={self.web_access_key}"
+        return self.public_web_url
+
     def public_dict(self) -> Dict[str, Any]:
         return {
             "configured": self.is_configured,
@@ -78,13 +100,18 @@ class TelegramBotBridge:
             "mode": "webhook" if self.use_webhook else "polling",
             "running": bool(self.use_webhook or (self._poll_task and not self._poll_task.done())),
             "masked_token": (self.token[:6] + "••••" + self.token[-4:]) if len(self.token) > 12 else "",
+            "locked": self.is_locked,
+            "owner_id": self.owner_id,
         }
 
-    async def configure(self, token: str, public_web_url: str = "") -> Dict[str, Any]:
+    async def configure(self, token: str, public_web_url: str = "", owner_id: Optional[int] = None) -> Dict[str, Any]:
         await self.stop()
         clean = (token or "").strip()
         if public_web_url:
             self.public_web_url = public_web_url.strip().rstrip("/")
+        if owner_id is not None and owner_id > 0:
+            self.owner_id = owner_id
+            self.active_chat_ids = {owner_id}
         if not clean:
             self.token = ""
             self.bot_username = ""
@@ -160,13 +187,61 @@ class TelegramBotBridge:
 
     def _live_browser_inline_kb(self, include_task_btn: bool = True) -> Dict[str, Any]:
         rows: List[List[Dict[str, Any]]] = []
-        if self.public_web_url.startswith("https://"):
-            rows.append([{"text": "🖥️ Buka & Kontrol Layar Live", "url": self.public_web_url}])
+        live_u = self.protected_web_url()
+        if live_u.startswith("https://"):
+            rows.append([{"text": "🖥️ Buka & Kontrol Layar Live", "url": live_u}])
         action_row: List[Dict[str, Any]] = [{"text": "🔄 Foto Ulang Layar", "callback_data": "snap_screen"}]
         if include_task_btn:
             action_row.insert(0, {"text": "📝 Kerjain di Web Ini", "callback_data": "mode_agent"})
         rows.append(action_row)
         return {"inline_keyboard": rows}
+
+    def _lock_owner(self, user_id: int, user_obj: Dict[str, Any]) -> None:
+        uname = user_obj.get("username")
+        fname = user_obj.get("first_name") or "Pemilik"
+        self.owner_id = user_id
+        self.owner_label = f"{fname} (@{uname})" if uname else f"{fname} (ID: {user_id})"
+        # Bersihkan chat_id lain agar notifikasi hanya masuk ke pemilik tunggal
+        self.active_chat_ids = {user_id}
+
+    async def _send_security_panel(self, chat_id: int, user_id: int) -> None:
+        if self.is_locked:
+            live_u = self.protected_web_url()
+            kb: Dict[str, Any] = {
+                "inline_keyboard": [
+                    [{"text": "🔄 Ganti PIN Akses Web Baru", "callback_data": "regen_pin"}],
+                    [{"text": "🔓 Buka Kunci Sementara", "callback_data": "unlock_owner"}],
+                ]
+            }
+            if live_u.startswith("https://"):
+                kb["inline_keyboard"].insert(0, [{"text": "🖥️ Buka Layar Live (Khusus Pemilik)", "url": live_u}])
+
+            await self.send_text(
+                chat_id,
+                "🔒 STATUS KEAMANAN: TERKUNCI RAPAT\n\n"
+                f"• Pemilik Tunggal: {self.owner_label or self.owner_id}\n"
+                f"• Telegram ID Lu: {self.owner_id}\n"
+                f"• PIN Web Cadangan: {self.web_access_key}\n\n"
+                "Perlindungan aktif:\n"
+                "1. Orang lain yang chat bot Telegram ini langsung ditolak otomatis.\n"
+                "2. Link web layar browser juga dikunci — orang luar gak bisa ngintip layar lu.\n\n"
+                f"💡 Biar permanen selamanya walau server restart, simpan juga di Variables Railway:\n"
+                f"TELEGRAM_OWNER_ID = {self.owner_id}",
+                reply_markup=kb,
+            )
+        else:
+            kb = {
+                "inline_keyboard": [
+                    [{"text": "🔒 Kunci Bot & Layar Khusus HP Gua Sekarang", "callback_data": "lock_owner"}]
+                ]
+            }
+            await self.send_text(
+                chat_id,
+                "⚠️ STATUS KEAMANAN: BELUM DIKUNCI\n\n"
+                f"Telegram ID lu terdeteksi: {user_id}\n"
+                "Tap tombol di bawah ini buat ngunci bot & layar browser biar cuma HP lu satu-satunya yang bisa ngakses:",
+                reply_markup=kb,
+            )
 
     async def _send_main_menu(self, chat_id: int, prefix: str = "") -> None:
         cur_mode = self.chat_modes.get(chat_id, "chat")
@@ -175,18 +250,18 @@ class TelegramBotBridge:
             "agent": "📝 Kerjain Tugas Web",
             "open_web": "🌐 Buka Web",
         }
-        web_line = f"🌐 Layar Live: {self.public_web_url}\n" if self.public_web_url else ""
+        sec_status = f"🔒 Terkunci Khusus HP Lu (ID: {self.owner_id})" if self.is_locked else "⚠️ Belum Dikunci (Tap '🔒 Keamanan')"
         body = (
             f"{prefix}"
             "🤖 Menu Utama Asisten Lu:\n"
-            f"Mode aktif sekarang: {mode_labels.get(cur_mode, '💬 Ngobrol AI')}\n"
-            f"{web_line}\n"
+            f"• Mode aktif: {mode_labels.get(cur_mode, '💬 Ngobrol AI')}\n"
+            f"• Keamanan: {sec_status}\n\n"
             "Tinggal tap tombol menu di bawah layar HP lu:\n"
             "• 💬 Ngobrol AI — Tanya jawab & bantu tugas kilat\n"
             "• 📝 Kerjain Tugas Web — Suruh AI jalanin web & bikin file\n"
             "• 🌐 Buka Web — Bukain web tujuan & login aman\n"
             "• 📸 Cek Layar — Intip foto layar browser sekarang\n"
-            "• 📂 Daftar File — Ambil file tugas yang udah dibuat"
+            "• 🔒 Keamanan — Kunci bot & layar web khusus HP lu"
         )
         await self.send_text(chat_id, body, reply_markup=MAIN_MENU_KB)
 
@@ -207,9 +282,36 @@ class TelegramBotBridge:
             cb = upd["callback_query"]
             cb_id = cb.get("id")
             data = cb.get("data", "")
+            from_user = cb.get("from") or {}
+            sender_id = from_user.get("id")
             chat_id = cb.get("message", {}).get("chat", {}).get("id")
-            if not chat_id:
+            if not chat_id or not sender_id:
                 return
+
+            # PRIVATE LOCK GUARD
+            if self.is_locked and sender_id != self.owner_id:
+                await self._answer_cb(cb_id, "🚫 Akses Ditolak! Bot ini dikunci pemiliknya.")
+                return
+
+            if data == "lock_owner":
+                self._lock_owner(sender_id, from_user)
+                await self._answer_cb(cb_id, "🔒 Berhasil dikunci khusus ke HP lu!")
+                await self._send_security_panel(chat_id, sender_id)
+                return
+
+            if data == "unlock_owner":
+                self.owner_id = None
+                self.owner_label = ""
+                await self._answer_cb(cb_id, "🔓 Kunci dibuka sementara.")
+                await self._send_security_panel(chat_id, sender_id)
+                return
+
+            if data == "regen_pin":
+                self.web_access_key = str(100000 + secrets.randbelow(900000))
+                await self._answer_cb(cb_id, f"PIN baru dibuat: {self.web_access_key}")
+                await self._send_security_panel(chat_id, sender_id)
+                return
+
             self.active_chat_ids.add(chat_id)
 
             if data == "approve":
@@ -246,13 +348,31 @@ class TelegramBotBridge:
         # -------------------- TEXT / MENU MESSAGES --------------------
         msg = upd.get("message") or {}
         chat = msg.get("chat") or {}
+        from_user = msg.get("from") or {}
         chat_id = chat.get("id")
+        sender_id = from_user.get("id") or chat_id
         text = (msg.get("text") or "").strip()
         if not chat_id or not text:
             return
 
+        # PRIVATE LOCK GUARD — Tolak siapa pun selain pemilik tunggal!
+        if self.is_locked and sender_id != self.owner_id:
+            await self.send_text(
+                chat_id,
+                "🚫 Akses Ditolak.\nBot & Cloud Browser ini milik pribadi dan sudah dikunci oleh pemiliknya.",
+            )
+            return
+
+        # Auto-lock langsung ke user pertama yang menekan /kunci atau kalau mau klaim cepat
         self.active_chat_ids.add(chat_id)
         low = text.lower().strip()
+
+        # 0. MENU KEAMANAN / KUNCI PRIBADI
+        if text == "🔒 Keamanan" or low in ("/kunci", "kunci", "/id", "/lock"):
+            if low in ("/kunci", "kunci", "/lock") and not self.is_locked:
+                self._lock_owner(sender_id, from_user)
+            await self._send_security_panel(chat_id, sender_id)
+            return
 
         # 1. START / MENU / STOP
         if low in ("/start", "/menu", "menu"):
@@ -325,7 +445,7 @@ class TelegramBotBridge:
             await self.send_text(
                 chat_id,
                 "🌐 Mau buka web apa bro?\n\n"
-                "Langsung ketik alamat linknya (misal: allindonesia.imigrasi.go.id) ATAU nama layanannya (misal: Google Classroom / Wikipedia):",
+                "Langsung ketik alamat linknya (misal: allindonesia.imigrasi.go.id) ATAU nama layanannya (misal: Elharamain Wisata / Google Classroom):",
                 reply_markup=MAIN_MENU_KB,
             )
             return
@@ -334,23 +454,22 @@ class TelegramBotBridge:
         mode = self.chat_modes.get(chat_id, "chat")
 
         # Auto-switch pintar: kalau masih di mode Ngobrol tapi user jelas minta buka web / kasih URL
-        import re as _re
-        has_url = bool(_re.search(r"(https?://[^\s]+|(?:[a-z0-9\-]+\.)+(?:com|id|co\.id|org|net|go\.id|ac\.id))", low))
+        has_url = bool(re.search(r"(https?://[^\s]+|(?:[a-z0-9\-]+\.)+(?:com|id|co\.id|org|net|go\.id|ac\.id|sa))", low))
         starts_open = low.startswith(("buka web ", "buka situs ", "buka halaman ", "buka link ", "masuk ke web "))
         if mode == "chat" and (starts_open or (has_url and any(w in low for w in ("buka", "cek", "kerjain", "rangkum", "masuk")))):
             if any(w in low for w in ("kerjain", "rangkum", "simpan", "isi", "cari di")):
                 mode = "agent"
                 self.chat_modes[chat_id] = "agent"
             else:
-                clean_q = _re.sub(r"^(buka\s+web|buka\s+situs|buka\s+halaman|buka\s+link|buka)\s+", "", text, flags=_re.I).strip()
+                clean_q = re.sub(r"^(buka\s+web|buka\s+situs|buka\s+halaman|buka\s+link|buka)\s+", "", text, flags=re.I).strip()
                 text = clean_q or text
                 mode = "open_web"
+
         if mode == "open_web":
             wait_mid = await self.send_text(chat_id, f"🌐 Lagi ngebukain web '{text}'...")
             target_url = await self.orchestrator.brain.resolve_website_url(text)
             nav_msg = await self.orchestrator.browser.navigate(target_url)
             b64 = await self.orchestrator.browser.refresh_frame()
-            # Setelah web terbuka, pindah ke mode agent atau tetap siap menerima instruksi
             self.chat_modes[chat_id] = "agent"
             if wait_mid:
                 await self._edit_text(chat_id, wait_mid, f"🌐 {nav_msg}")
@@ -452,7 +571,8 @@ class TelegramBotBridge:
         if len(short_thought) > 220:
             short_thought = short_thought[:220] + "..."
         new_txt = f"⏳ Langkah {step_num}:\n{short_thought}"
-        for cid in list(self.active_chat_ids):
+        targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+        for cid in targets:
             mid = self._status_msg_ids.get(cid)
             if mid:
                 await self._edit_text(cid, mid, new_txt)
@@ -487,11 +607,13 @@ class TelegramBotBridge:
             return
         caption = f"🔐 Butuh Login Lu Bro\n{reason}"
         rows: List[List[Dict[str, Any]]] = []
-        if self.public_web_url.startswith("https://"):
-            rows.append([{"text": "🔑 Buka Layar & Ketik Password Aman", "url": self.public_web_url}])
+        live_u = self.protected_web_url()
+        if live_u.startswith("https://"):
+            rows.append([{"text": "🔑 Buka Layar & Ketik Password Aman", "url": live_u}])
         rows.append([{"text": "✅ Udah Login — Lanjut Kerjain", "callback_data": "resume_login"}])
         markup = {"inline_keyboard": rows}
-        for cid in list(self.active_chat_ids):
+        targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+        for cid in targets:
             if frame_b64:
                 await self.send_photo_b64(cid, frame_b64, caption, markup)
             else:
@@ -513,7 +635,8 @@ class TelegramBotBridge:
                 ]
             ]
         }
-        for cid in list(self.active_chat_ids):
+        targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+        for cid in targets:
             if frame_b64:
                 await self.send_photo_b64(cid, frame_b64, caption, markup)
             else:
@@ -522,18 +645,21 @@ class TelegramBotBridge:
     async def notify_file(self, filename: str, file_bytes: bytes) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
-        for cid in list(self.active_chat_ids):
+        targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+        for cid in targets:
             await self.send_document(cid, filename, file_bytes, f"📄 File selesai dibuat: {filename}")
 
     async def notify_done(self, summary: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
         clean = summary.replace("**", "")
-        for cid in list(self.active_chat_ids):
+        targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+        for cid in targets:
             await self.send_text(cid, f"✅ Beres!\n\n{clean}", reply_markup=MAIN_MENU_KB)
 
     async def send_to_all(self, message: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
-        for cid in list(self.active_chat_ids):
+        targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+        for cid in targets:
             await self.send_text(cid, message, reply_markup=MAIN_MENU_KB)

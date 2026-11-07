@@ -8,7 +8,7 @@ from typing import Any, Dict, Set
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -128,6 +128,86 @@ class LLMSettingsPayload(BaseModel):
 class TelegramSettingsPayload(BaseModel):
     token: str = ""
     public_web_url: str = ""
+    owner_id: int | None = None
+
+
+LOCKED_PAGE_HTML = """<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🔒 Layar Browser Pribadi Terkunci</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b141a;color:#e9edef;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:20px;box-sizing:border-box}
+  .card{max-width:380px;width:100%;background:#111b21;border:1px solid #222e35;border-radius:18px;padding:28px 22px;text-align:center;box-shadow:0 12px 32px rgba(0,0,0,.45)}
+  .icon{font-size:44px;margin-bottom:10px}
+  h1{font-size:19px;margin:0 0 8px}
+  p{font-size:14px;color:#8696a0;line-height:1.5;margin:0 0 18px}
+  input{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;border:1px solid #2a3942;background:#202c33;color:#fff;font-size:16px;text-align:center;letter-spacing:3px;margin-bottom:12px;outline:none}
+  button{width:100%;padding:12px;border:none;border-radius:10px;background:#00a884;color:#081c15;font-weight:700;font-size:15px;cursor:pointer}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🔒</div>
+    <h1>Layar Browser Dikunci Pemilik</h1>
+    <p>Buka lewat tombol <b>Layar Live</b> di Bot Telegram pribadi lu, atau masukkan 6 digit PIN Keamanan dari menu <b>🔒 Keamanan</b> di Telegram:</p>
+    <form method="GET" action="/">
+      <input type="password" inputmode="numeric" name="k" placeholder="PIN 6 Digit" required>
+      <button type="submit">Buka Layar Browser</button>
+    </form>
+  </div>
+</body>
+</html>"""
+
+
+def _is_web_authorized(req_or_ws: Any) -> bool:
+    if not telegram_bridge.is_locked:
+        return True
+    expected = telegram_bridge.web_access_key
+    q_key = (req_or_ws.query_params.get("k") or "").strip()
+    c_key = (req_or_ws.cookies.get("nusa_auth") or "").strip()
+    return bool(expected and (q_key == expected or c_key == expected))
+
+
+@app.middleware("http")
+async def private_owner_lock_middleware(request: Request, call_next):
+    path = request.url.path
+    # Endpoint publik yang tetap dibuka untuk webhook Telegram, static CSS/JS, portal lokal, & healthcheck
+    public_paths = ("/api/health", "/api/telegram/webhook", "/demo-portal")
+    if path.startswith("/static") or path in public_paths:
+        return await call_next(request)
+
+    # Izinkan konfigurasi awal sebelum bot dikunci
+    if not telegram_bridge.is_locked:
+        return await call_next(request)
+
+    if not _is_web_authorized(request):
+        if path.startswith("/api/"):
+            return JSONResponse({"error": "Terkunci khusus pemilik."}, status_code=403)
+        return HTMLResponse(LOCKED_PAGE_HTML, status_code=401)
+
+    response = await call_next(request)
+    q_key = (request.query_params.get("k") or "").strip()
+    if q_key and q_key == telegram_bridge.web_access_key:
+        response.set_cookie(
+            key="nusa_auth",
+            value=telegram_bridge.web_access_key,
+            max_age=30 * 86400,
+            httponly=True,
+            samesite="lax",
+        )
+    return response
+
+
+@app.get("/api/health")
+async def health_check():
+    return {
+        "ok": True,
+        "telegram_configured": telegram_bridge.is_configured,
+        "llm_configured": llm_config.has_api_key,
+        "locked": telegram_bridge.is_locked,
+    }
 
 
 class GitHubPushPayload(BaseModel):
@@ -311,7 +391,7 @@ async def update_llm_settings(payload: LLMSettingsPayload):
 @app.post("/api/settings/telegram")
 async def update_telegram_settings(payload: TelegramSettingsPayload):
     try:
-        info = await telegram_bridge.configure(payload.token, payload.public_web_url)
+        info = await telegram_bridge.configure(payload.token, payload.public_web_url, payload.owner_id)
         return {"ok": True, "telegram": info}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -358,6 +438,9 @@ async def telegram_webhook_endpoint(request: Request):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    if not _is_web_authorized(websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     ws_clients.add(websocket)
 

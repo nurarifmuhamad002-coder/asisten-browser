@@ -58,6 +58,21 @@ class GitHubPublisher:
             "repo_name": clean_repo,
             "private": private,
         }
+        try:
+            import json as _json
+            (self.repo_dir / ".gh_device_state.json").write_text(
+                _json.dumps(
+                    {
+                        "device_code": device_code,
+                        "user_code": user_code,
+                        "repo_name": clean_repo,
+                        "private": private,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
         self._task = asyncio.create_task(
             self._poll_and_push(
@@ -149,6 +164,12 @@ class GitHubPublisher:
 
                 # 3. Commit file terbaru & push aman tanpa menyimpan token di .git/config
                 await asyncio.to_thread(self._git_commit_and_push, owner, repo_name, access_token)
+                try:
+                    st_file = self.repo_dir / ".gh_device_state.json"
+                    if st_file.exists():
+                        st_file.unlink()
+                except Exception:
+                    pass
 
                 result = {
                     "stage": "done",

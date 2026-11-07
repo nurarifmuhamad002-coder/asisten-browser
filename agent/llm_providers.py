@@ -121,6 +121,106 @@ class MultiLLMBrain:
         self.config = config
         self.autopilot = SmartAutopilotPlanner()
 
+    async def quick_chat(self, message: str, recent_chat: Optional[List[Dict[str, Any]]] = None) -> str:
+        """Mode Ngobrol AI cepat (<1 detik) tanpa beban browser."""
+        if not self.config.has_api_key:
+            return (
+                "Halo bro! Gua siap ngobrol, tapi pastiin API Key Gemini udah dipasang ya biar gua bisa mikir & jawab pertanyaan lu bebas."
+            )
+
+        hist_lines = []
+        for m in (recent_chat or [])[-10:]:
+            r = m.get("role", "")
+            if r in ("user", "agent"):
+                lbl = "USER" if r == "user" else "ASISTEN"
+                hist_lines.append(f"{lbl}: {(m.get('text') or '')[:400]}")
+        hist_block = ("\n".join(hist_lines) + "\n\n") if hist_lines else ""
+
+        chat_sys = (
+            "Kamu adalah Asisten AI pribadi yang pinter, santai, dan akrab berbahasa Indonesia sehari-hari (pake gaya santai gua/lu/bro secukupnya). "
+            "Bantu user ngobrol, diskusi, ngerjain soal/tugas, merangkum materi, atau nulis teks dengan jelas, rapi, dan cepet. "
+            "Jangan pakai format Markdown rumit yang berlebihan agar enak dibaca di layar HP Telegram."
+        )
+        prompt = f"{hist_block}USER: {message}"
+
+        if self.config.provider == "gemini":
+            primary = self.config.model or "gemini-3.1-flash-lite"
+            candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
+            payload = {
+                "system_instruction": {"parts": [{"text": chat_sys}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.6},
+            }
+            async with httpx.AsyncClient(timeout=16.0) as client:
+                for model in candidates:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
+                    try:
+                        resp = await client.post(url, json=payload)
+                        if resp.status_code == 200:
+                            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    except Exception:
+                        continue
+            return "Waduh koneksi AI lagi agak padat bro, coba kirim ulang barusan ya!"
+
+        # Fallback OpenAI/OpenRouter
+        base = self.config.base_url or ("https://openrouter.ai/api/v1" if self.config.provider == "openrouter" else "https://api.openai.com/v1")
+        async with httpx.AsyncClient(timeout=16.0) as client:
+            resp = await client.post(
+                base.rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {self.config.api_key}"},
+                json={
+                    "model": self.config.model or "gpt-4o",
+                    "messages": [{"role": "system", "content": chat_sys}, {"role": "user", "content": prompt}],
+                },
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+        return "Koneksi AI sedang sibuk, coba kirim lagi bro."
+
+    async def resolve_website_url(self, raw_query: str) -> str:
+        """Mengubah nama layanan (misal 'login Konami ID' atau 'elearning UT') menjadi URL resmi."""
+        q = (raw_query or "").strip()
+        if q.startswith(("http://", "https://", "/demo-portal")):
+            return q
+        # Cek apakah sudah berbentuk domain (contoh: allindonesia.imigrasi.go.id)
+        if "." in q and " " not in q:
+            return f"https://{q}"
+
+        if self.config.has_api_key and self.config.provider == "gemini":
+            primary = self.config.model or "gemini-3.1-flash-lite"
+            candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
+            payload = {
+                "system_instruction": {
+                    "parts": [
+                        {
+                            "text": (
+                                "Ubah permintaan website dari user menjadi SATU URL resmi HTTPS yang paling tepat. "
+                                "Contoh: 'Konami ID' -> 'https://my.konami.net', 'All Indonesia' -> 'https://allindonesia.imigrasi.go.id', "
+                                "'Google Classroom' -> 'https://classroom.google.com'. "
+                                "Jika tidak yakin URL pastinya, kembalikan URL pencarian DuckDuckGo HTML: 'https://html.duckduckgo.com/html/?q=...'. "
+                                "Balas HANYA JSON: {\"url\": \"https://...\"}"
+                            )
+                        }
+                    ]
+                },
+                "contents": [{"role": "user", "parts": [{"text": q}]}],
+                "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
+            }
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for model in candidates:
+                    u = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
+                    try:
+                        r = await client.post(u, json=payload)
+                        if r.status_code == 200:
+                            parsed = _extract_json(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+                            if parsed.get("url"):
+                                return str(parsed["url"]).strip()
+                    except Exception:
+                        continue
+
+        from urllib.parse import quote_plus
+        return f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
+
     async def decide_next_step(
         self,
         goal: str,

@@ -63,8 +63,8 @@ class CloudBrowserEngine:
             locale="id-ID",
             timezone_id="Asia/Jakarta",
             user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
             ),
             args=[
                 "--no-sandbox",
@@ -72,6 +72,9 @@ class CloudBrowserEngine:
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
             ],
+        )
+        await self.context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
 
         self.context.on("page", lambda new_page: asyncio.create_task(self._on_new_page(new_page)))
@@ -345,14 +348,31 @@ class CloudBrowserEngine:
         if not self.page:
             raise RuntimeError("Browser belum aktif.")
         target = self._normalize_url(url)
+        status_code = None
         try:
-            await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
-        except Exception:
+            resp = await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
+            status_code = resp.status if resp else None
+        except Exception as exc:
+            err_s = str(exc)
+            if "ERR_HTTP2" in err_s or "ERR_CONNECTION" in err_s or "ERR_NAME_NOT_RESOLVED" in err_s:
+                return f"Gagal membuka {target}: Situs menolak koneksi dari server cloud atau alamat web salah ({err_s[:90]})."
             await self.ensure_alive()
-            await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
-        await asyncio.sleep(0.4)
+            resp = await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
+            status_code = resp.status if resp else None
+
+        await asyncio.sleep(0.45)
+        if self.page.url.startswith("chrome-error://"):
+            try:
+                await self.page.go_back(timeout=4000)
+            except Exception:
+                pass
+            return f"Situs {target} memblokir akses dari server cloud (anti-bot/firewall)."
+
         await self.refresh_frame()
-        return f"Berhasil membuka {self._display_url(self.page.url)} ({await self._safe_title()})"
+        title = await self._safe_title()
+        if status_code == 403:
+            return f"Membuka {self._display_url(self.page.url)} ({title}) — Catatan: Situs ini menampilkan 403/Anti-Bot terhadap IP server cloud."
+        return f"Berhasil membuka {self._display_url(self.page.url)} ({title})"
 
     async def click_element(self, index: int, elements: List[Dict[str, Any]]) -> str:
         if not self.page:

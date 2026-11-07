@@ -69,6 +69,10 @@ class CloudBrowserEngine:
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--single-process",
+                "--js-flags=--max-old-space-size=160",
                 "--disable-blink-features=AutomationControlled",
             ],
         )

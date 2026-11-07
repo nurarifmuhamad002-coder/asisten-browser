@@ -21,12 +21,23 @@ class TelegramBotBridge:
     def __init__(self) -> None:
         self.token: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.orchestrator: Optional["AgentOrchestrator"] = None
+
+        render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+        railway_dom = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
         space_host = os.getenv("SPACE_HOST", "").strip()
-        default_pub = f"https://{space_host}" if space_host else ""
-        self.public_web_url: str = os.getenv("PUBLIC_WEB_URL", default_pub).strip()
-        self.use_webhook: bool = bool(space_host)
+
+        auto_url = (
+            render_url
+            or (f"https://{railway_dom}" if railway_dom else "")
+            or (f"https://{space_host}" if space_host else "")
+        )
+        self.public_web_url: str = (os.getenv("PUBLIC_WEB_URL", "").strip() or auto_url).rstrip("/")
+        self.use_webhook: bool = bool(
+            render_url or railway_dom or space_host or os.getenv("PUBLIC_WEB_URL", "").strip().startswith("https://")
+        )
 
         self.active_chat_ids: Set[int] = set()
+        self._seen_update_ids: Set[int] = set()
         self._poll_task: Optional[asyncio.Task] = None
         self._offset: int = 0
         self.bot_username: str = ""
@@ -120,6 +131,14 @@ class TelegramBotBridge:
     async def _handle_update(self, upd: Dict[str, Any]) -> None:
         if not self.orchestrator:
             return
+
+        uid = upd.get("update_id")
+        if uid is not None:
+            if uid in self._seen_update_ids:
+                return
+            self._seen_update_ids.add(uid)
+            if len(self._seen_update_ids) > 500:
+                self._seen_update_ids.clear()
 
         if "callback_query" in upd:
             cb = upd["callback_query"]

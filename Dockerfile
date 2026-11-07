@@ -9,7 +9,9 @@ ENV BROWSER_PROFILE_DIR=/tmp/nusa_operator_profile
 ENV WORKSPACE_DIR=/app/workspace_files
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python3 -m playwright install chromium \
+    && chmod -R 755 /ms-playwright
 
 COPY . .
 RUN mkdir -p /app/workspace_files /tmp/nusa_operator_profile \

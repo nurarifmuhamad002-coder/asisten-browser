@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: asisten-browser
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/status
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false

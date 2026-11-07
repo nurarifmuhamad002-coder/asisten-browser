@@ -239,7 +239,10 @@ class AgentOrchestrator:
             self.state = "IDLE"
             self.live_status = "Online · Siap disuruh apa aja"
             await self._sync_state()
-            await self._push_chat("agent", "Udah jalan maksimal 18 langkah bro. Kalau masih mau dilanjutin tinggal balas aja!")
+            max_msg = "Udah jalan maksimal 18 langkah bro. Kalau masih mau dilanjutin tinggal balas aja!"
+            await self._push_chat("agent", max_msg)
+            if self.telegram:
+                await self.telegram.notify_done(max_msg)
 
         except asyncio.CancelledError:
             self.state = "IDLE"
@@ -249,7 +252,10 @@ class AgentOrchestrator:
             self.state = "IDLE"
             self.live_status = "Online · Siap disuruh apa aja"
             await self._sync_state()
-            await self._push_chat("agent", f"Waduh, ada kendala teknis pas langkah tadi: {exc}")
+            err_msg = f"Waduh, ada kendala teknis pas langkah tadi: {exc}"
+            await self._push_chat("agent", err_msg)
+            if self.telegram:
+                await self.telegram.send_to_all(f"⚠️ {err_msg}")
 
     async def _wait_for_human_takeover(self, reason: str) -> None:
         self.state = "WAITING_HUMAN_TAKEOVER"

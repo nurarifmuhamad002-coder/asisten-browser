@@ -60,7 +60,7 @@ def _extract_json(raw_text: str) -> Dict[str, Any]:
 class LLMConfig:
     def __init__(self) -> None:
         self.provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()
-        self.model: str = os.getenv("LLM_MODEL", "gemini-3-flash-preview")
+        self.model: str = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
         self.api_key: str = (
             os.getenv("LLM_API_KEY")
             or os.getenv("GEMINI_API_KEY")
@@ -88,10 +88,10 @@ class LLMConfig:
     @staticmethod
     def _default_model(provider: str) -> str:
         defaults = {
-            "gemini": "gemini-3-flash-preview",
+            "gemini": "gemini-3.1-flash-lite",
             "openai": "gpt-4o",
             "anthropic": "claude-sonnet-4-20250514",
-            "openrouter": "google/gemini-3-flash-preview",
+            "openrouter": "google/gemini-3.1-flash-lite",
         }
         return defaults.get(provider, "gpt-4o")
 
@@ -170,8 +170,8 @@ class MultiLLMBrain:
         )
 
     async def _call_gemini(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
-        primary = self.config.model or "gemini-3-flash-preview"
-        candidates = [primary] + [m for m in ("gemini-3-flash-preview", "gemini-3.1-flash-lite") if m != primary]
+        primary = self.config.model or "gemini-3.1-flash-lite"
+        candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
         parts: List[Dict[str, Any]] = [{"text": prompt_text}]
         if screenshot_b64:
             parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
@@ -189,8 +189,10 @@ class MultiLLMBrain:
             for model in candidates:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
                 resp = await client.post(url, json=payload)
-                if resp.status_code == 404:
-                    last_err = f"Gemini API error ({resp.status_code}): {resp.text[:300]}"
+                if resp.status_code in (404, 429, 503):
+                    last_err = f"Gemini API ({resp.status_code}) pada {model}"
+                    if resp.status_code == 429:
+                        await asyncio.sleep(2.0)
                     continue
                 if resp.status_code >= 400:
                     raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
@@ -199,7 +201,7 @@ class MultiLLMBrain:
                 data = resp.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 return _extract_json(text)
-        raise RuntimeError(last_err or "Gemini API error")
+        raise RuntimeError(last_err or "Kuota Gemini sedang penuh sesaat, coba kirim ulang 10 detik lagi.")
 
     async def _call_openai_compatible(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         base = self.config.base_url

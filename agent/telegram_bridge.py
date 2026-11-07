@@ -194,7 +194,7 @@ class TelegramBotBridge:
             await self.send_text(chat_id, "✅ Oke sip, gua lanjutin kerjanya!")
             return
 
-        if text.startswith("/layar"):
+        if text.startswith("/layar") or text.startswith("/ss"):
             b64 = await self.orchestrator.browser.refresh_frame()
             if b64:
                 cur_url = self.orchestrator.browser.page.url if self.orchestrator.browser.page else ""
@@ -301,3 +301,9 @@ class TelegramBotBridge:
         clean = summary.replace("**", "")
         for cid in list(self.active_chat_ids):
             await self.send_text(cid, f"✅ Beres!\n\n{clean}")
+
+    async def send_to_all(self, message: str) -> None:
+        if not self.is_configured or not self.active_chat_ids:
+            return
+        for cid in list(self.active_chat_ids):
+            await self.send_text(cid, message)

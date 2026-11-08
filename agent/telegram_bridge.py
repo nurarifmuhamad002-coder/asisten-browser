@@ -380,6 +380,11 @@ class TelegramBotBridge:
                     await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 File: {fpath.name}")
                 except Exception as exc:
                     await self.send_text(chat_id, f"Gagal mengambil file: {exc}")
+            elif data.startswith("rm_file:"):
+                fname = data.split(":", 1)[1]
+                self.orchestrator.file_manager.delete_file(fname)
+                await self._answer_cb(cb_id, f"🗑️ {fname} dihapus!")
+                await self.send_text(chat_id, f"🗑️ File '{fname}' berhasil dihapus dari Workspace.", reply_markup=MAIN_MENU_KB)
             return
 
         # -------------------- PHOTO / DOCUMENT / TEXT MESSAGES --------------------
@@ -472,19 +477,22 @@ class TelegramBotBridge:
             await self._send_screen_snapshot(chat_id)
             return
 
-        # 4. DAFTAR FILE TUGAS
+        # 4. DAFTAR & KELOLA FILE TUGAS
         if text == "📂 Daftar File" or low in ("/file", "/files", "daftar file"):
             flist = self.orchestrator.file_manager.list_files()
             if not flist:
                 await self.send_text(chat_id, "📂 Belum ada file di folder tugas bro.", reply_markup=MAIN_MENU_KB)
                 return
             kb_rows = [
-                [{"text": f"📥 {f['name']} ({f['size']} B)", "callback_data": f"dl_file:{f['name'][:48]}"}]
+                [
+                    {"text": f"📥 {f['name'][:26]} ({f['size']} B)", "callback_data": f"dl_file:{f['name'][:48]}"},
+                    {"text": "🗑️ Hapus", "callback_data": f"rm_file:{f['name'][:48]}"},
+                ]
                 for f in flist[:10]
             ]
             await self.send_text(
                 chat_id,
-                "📂 Daftar File di Workspace (tap buat download ke Telegram):",
+                "📂 Kelola File di Workspace (tap 📥 buat download atau 🗑️ buat hapus):",
                 reply_markup={"inline_keyboard": kb_rows},
             )
             return
@@ -805,13 +813,19 @@ class TelegramBotBridge:
             pass
         return None
 
-    async def notify_step(self, step_num: int, thought: str) -> None:
+    async def notify_step(self, step_num: int, thought: str, plan: Optional[List[Dict[str, Any]]] = None) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
         short_thought = (thought or "").strip()
-        if len(short_thought) > 220:
-            short_thought = short_thought[:220] + "..."
-        new_txt = f"⏳ Langkah {step_num}:\n{short_thought}"
+        if len(short_thought) > 200:
+            short_thought = short_thought[:200] + "..."
+        plan_lines: List[str] = []
+        for idx, p in enumerate((plan or [])[:6], 1):
+            st = (p.get("status") or "").lower()
+            icon = "✅" if st == "completed" else ("🔄" if st == "in_progress" else "⬜")
+            plan_lines.append(f"{icon} {idx}. {(p.get('step') or '')[:65]}")
+        plan_block = ("🧭 Rencana Tahap Kerja:\n" + "\n".join(plan_lines) + "\n\n") if plan_lines else ""
+        new_txt = f"{plan_block}⏳ Langkah {step_num}:\n{short_thought}"
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
         for cid in targets:
             mid = self._status_msg_ids.get(cid)

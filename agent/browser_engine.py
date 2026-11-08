@@ -156,11 +156,7 @@ class CloudBrowserEngine:
                 ):
                     await route.abort()
                     return
-                # Saat robot jalan sendiri di background, lewati gambar banner raksasa (tetap izinkan CAPTCHA/QR/login/logo)
-                if rtype == "image" and self._viewer_count == 0:
-                    if not any(keep in rurl for keep in ("captcha", "turnstile", "qr", "auth", "login", "verify", "logo")):
-                        await route.abort()
-                        return
+                # Biarkan gambar normal tampil agar AI Vision & foto layar Telegram tetap tajam (iklan/video sudah diblokir di atas)
                 await route.continue_()
             except Exception:
                 pass
@@ -367,7 +363,7 @@ class CloudBrowserEngine:
             if "." in url and " " not in url:
                 return f"https://{url}"
             from urllib.parse import quote_plus
-            return f"https://html.duckduckgo.com/html/?q={quote_plus(url)}"
+            return f"https://search.yahoo.com/search?p={quote_plus(url)}"
         return url
 
     def _display_url(self, url: str) -> str:
@@ -658,7 +654,15 @@ class CloudBrowserEngine:
                 await self.page.keyboard.press("Backspace")
             await self.page.keyboard.insert_text(text)
         else:
-            return f"Kolom input [{index}] tidak ditemukan."
+            # Fallback pintar: cari kotak pencarian / input teks pertama di halaman
+            auto_inp = self.page.locator('input[type="search"], input[name*="search" i], input[name="q"], input[name="p"], input[type="text"], textarea').first
+            if await auto_inp.count() > 0:
+                try:
+                    await auto_inp.fill(text, timeout=3000)
+                except Exception:
+                    await self.page.keyboard.insert_text(text)
+            else:
+                return f"Kolom input [{index}] tidak ditemukan — klik dulu ikon/tombol cari atau formnya."
 
         if press_enter:
             await asyncio.sleep(0.08)

@@ -233,7 +233,7 @@ class AgentOrchestrator:
                 if thought:
                     await self._push_chat("step", thought, {"step": step_num, "action": act_name})
                     if self.telegram:
-                        await self.telegram.notify_step(step_num, thought)
+                        await self.telegram.notify_step(step_num, thought, self.current_plan)
 
                 try:
                     result_text = await self._execute_with_guardrails(step_num, action, dom_state)

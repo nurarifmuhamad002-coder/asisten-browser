@@ -397,8 +397,8 @@ class TelegramBotBridge:
 
         self.active_chat_ids.add(chat_id)
 
-        # UPGRADE #2: HANDLE FOTO / GAMBAR / PDF / WORD / EXCEL DARI TELEGRAM
-        if "photo" in msg or "document" in msg:
+        # UPGRADE #2 + VOICE NOTE: HANDLE FOTO / GAMBAR / PDF / WORD / EXCEL / SUARA DARI TELEGRAM
+        if "photo" in msg or "document" in msg or "voice" in msg or "audio" in msg:
             await self._handle_media_upload(chat_id, msg)
             return
 
@@ -407,6 +407,36 @@ class TelegramBotBridge:
             return
 
         low = text.lower().strip()
+
+        # PENGATURAN AI LANGSUNG DARI TELEGRAM (/setting & /apikey)
+        if low in ("/setting", "/settings", "setting"):
+            llm_info = self.orchestrator.llm_config.public_dict()
+            await self.send_text(
+                chat_id,
+                "⚙️ PENGATURAN ASISTEN LU SEKARANG:\n\n"
+                f"• Otak AI: {llm_info.get('mode')}\n"
+                f"• Kunci AI: {llm_info.get('masked_key') or '(belum ada)'}\n"
+                f"• Keamanan: {'🔒 Terkunci' if self.is_locked else '🔓 Terbuka'}\n\n"
+                "Cara ganti API Key Gemini baru kapan aja langsung lewat chat:\n"
+                "/apikey KODE_API_KEY_BARU\n\n"
+                "Cara reset/segarin ulang browser kalau nyangkut:\n"
+                "/reset",
+                reply_markup=MAIN_MENU_KB,
+            )
+            return
+
+        if low.startswith("/apikey "):
+            new_k = text.split(None, 1)[1].strip()
+            self.orchestrator.llm_config.update("gemini", "gemini-3.1-flash-lite", new_k, "")
+            await self.send_text(chat_id, "✅ Mantap! API Key Gemini baru udah langsung aktif!", reply_markup=MAIN_MENU_KB)
+            return
+
+        if low in ("/reset", "reset browser"):
+            await self.orchestrator.stop_goal(silent=True)
+            await self.orchestrator.browser.stop()
+            await self.orchestrator.browser.ensure_alive()
+            await self.send_text(chat_id, "🔄 Browser server berhasil di-refresh bersih!", reply_markup=MAIN_MENU_KB)
+            return
 
         # 0. MENU KEAMANAN / KUNCI PRIBADI
         if text == "🔒 Keamanan" or low in ("/kunci", "kunci", "/id", "/lock"):
@@ -597,6 +627,16 @@ class TelegramBotBridge:
             file_id = best_photo.get("file_id", "")
             fname = f"foto_{_dt.now().strftime('%H%M%S')}.jpg"
             mime_type = "image/jpeg"
+        elif "voice" in msg and msg["voice"]:
+            vc = msg["voice"]
+            file_id = vc.get("file_id", "")
+            fname = f"suara_{_dt.now().strftime('%H%M%S')}.ogg"
+            mime_type = vc.get("mime_type") or "audio/ogg"
+        elif "audio" in msg and msg["audio"]:
+            au = msg["audio"]
+            file_id = au.get("file_id", "")
+            fname = au.get("file_name") or f"audio_{_dt.now().strftime('%H%M%S')}.mp3"
+            mime_type = au.get("mime_type") or "audio/mpeg"
         elif "document" in msg and msg["document"]:
             doc = msg["document"]
             file_id = doc.get("file_id", "")

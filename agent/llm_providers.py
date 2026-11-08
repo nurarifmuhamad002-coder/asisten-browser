@@ -9,12 +9,84 @@ import httpx
 from agent.dom_inspector import format_dom_for_llm
 
 
-def _fast_http_client(timeout: float = 18.0) -> httpx.AsyncClient:
+def _fast_http_client(timeout: float = 25.0) -> httpx.AsyncClient:
     """Paksa IPv4 agar di container cloud tanpa Outbound IPv6 tidak pernah delay 10 detik."""
     return httpx.AsyncClient(
         transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
         timeout=timeout,
     )
+
+
+async def _fetch_live_web_context(query: str) -> str:
+    """Mengambil harga saham/kripto/kurs real-time (Yahoo Finance API) & cuplikan berita terbaru dalam <0.5 detik."""
+    q_low = (query or "").lower()
+    needs_finance = any(
+        w in q_low
+        for w in ("harga", "saham", "etf", "stock", "price", "btc", "bitcoin", "eth", "kripto", "crypto", "kurs", "usd", "idr", "emas", "ihsg")
+    ) or bool(re.search(r"\b[A-Z]{3,5}\b", query or ""))
+    needs_live = needs_finance or any(
+        w in q_low
+        for w in ("sekarang", "hari ini", "terbaru", "berita", "jadwal", "skor", "cuaca", "2026", "update", "cek ")
+    )
+    if not needs_live:
+        return ""
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+    }
+    chunks: List[str] = []
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
+            headers=headers,
+            timeout=6.0,
+            follow_redirects=True,
+        ) as client:
+            if needs_finance:
+                # Cari simbol ticker resmi lewat Yahoo Finance Search atau huruf kapital (misal QQQM, NVDA, BBCA)
+                tickers: List[str] = re.findall(r"\b([A-Z]{2,6}(?:\.[A-Z]{2})?)\b", query or "")
+                stop_caps = {"BRO", "GUA", "LIAT", "CEK", "DONG", "APA", "INI", "ITU", "DAN", "YANG", "WEB", "PDF"}
+                tickers = [t for t in tickers if t not in stop_caps]
+                if not tickers:
+                    clean_fin = re.sub(r"\b(bro|liat|lihat|cek|berapa|harga|sekarang|dong|hari|ini|tolong)\b", " ", q_low).strip()
+                    if clean_fin:
+                        rs = await client.get("https://query2.finance.yahoo.com/v1/finance/search", params={"q": clean_fin, "quotesCount": 3})
+                        if rs.status_code == 200:
+                            for q_item in rs.json().get("quotes", [])[:2]:
+                                if q_item.get("symbol"):
+                                    tickers.append(q_item["symbol"])
+
+                for sym in tickers[:2]:
+                    ry = await client.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d")
+                    if ry.status_code == 200:
+                        res_list = ry.json().get("chart", {}).get("result") or []
+                        if res_list:
+                            meta = res_list[0].get("meta", {})
+                            price = meta.get("regularMarketPrice")
+                            prev = meta.get("chartPreviousClose")
+                            cur = meta.get("currency", "")
+                            name = meta.get("longName") or meta.get("shortName") or sym
+                            diff_str = ""
+                            if price is not None and prev:
+                                pct = ((price - prev) / prev) * 100
+                                diff_str = f" ({pct:+.2f}% dari penutupan sebelumnya {prev} {cur})"
+                            chunks.append(f"[DATA PASAR REAL-TIME YAHOO FINANCE] {name} ({sym}): {price} {cur}{diff_str}")
+
+            # Ambil cuplikan web live singkat
+            from bs4 import BeautifulSoup
+            rw = await client.get("https://search.yahoo.com/search", params={"p": query})
+            if rw.status_code == 200:
+                soup = BeautifulSoup(rw.text, "html.parser")
+                for div in soup.select("div.algo, div.dd")[:5]:
+                    txt = div.get_text(" ", strip=True)
+                    if len(txt) > 35:
+                        chunks.append(f"- {txt[:260]}")
+    except Exception:
+        pass
+
+    if not chunks:
+        return ""
+    return "=== DATA INTERNET REAL-TIME DETIK INI ===\n" + "\n".join(chunks[:6]) + "\n\n"
 
 SYSTEM_PROMPT = """Kamu adalah NusaOperator, AI Cloud Browser Agent yang cerdas, teliti, dan mengutamakan keamanan pengguna.
 Tugasmu adalah memahami perintah user (dalam Bahasa Indonesia atau Inggris), menyusun rencana langkah kerja (multi-step plan), membaca tampilan website (melalui screenshot + daftar elemen interaktif [index]), mengelola file di workspace, dan mengeksekusi langkah satu per satu hingga tuntas.
@@ -144,22 +216,24 @@ class MultiLLMBrain:
                 hist_lines.append(f"{lbl}: {(m.get('text') or '')[:400]}")
         hist_block = ("\n".join(hist_lines) + "\n\n") if hist_lines else ""
 
+        live_ctx = await _fetch_live_web_context(message)
         chat_sys = (
             "Kamu adalah Asisten AI pribadi yang pinter, santai, dan akrab berbahasa Indonesia sehari-hari (pake gaya santai gua/lu/bro secukupnya). "
-            "Bantu user ngobrol, diskusi, ngerjain soal/tugas, merangkum materi, atau nulis teks dengan jelas, rapi, dan cepet. "
+            "Jika tersedia bagian 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka/fakta terbaru tersebut untuk menjawab akurat. "
+            "Bantu user ngobrol, cek harga saham/kripto/berita, diskusi, ngerjain soal/tugas, atau nulis teks dengan jelas, rapi, dan cepet. "
             "Jangan pakai format Markdown rumit yang berlebihan agar enak dibaca di layar HP Telegram."
         )
-        prompt = f"{hist_block}USER: {message}"
+        prompt = f"{hist_block}{live_ctx}USER: {message}"
 
         if self.config.provider == "gemini":
             primary = self.config.model or "gemini-3.1-flash-lite"
-            candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
+            candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview") if m != primary]
             payload = {
                 "system_instruction": {"parts": [{"text": chat_sys}]},
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.6},
+                "generationConfig": {"temperature": 0.5},
             }
-            async with _fast_http_client(timeout=16.0) as client:
+            async with _fast_http_client(timeout=22.0) as client:
                 for model in candidates:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
                     try:
@@ -218,9 +292,13 @@ class MultiLLMBrain:
             )
 
         parts: List[Dict[str, Any]] = []
-        if extracted_text and not mime_type.startswith("image/"):
+        if extracted_text and not mime_type.startswith(("image/", "audio/")):
             parts.append({"text": f"INSTRUKSI USER: {instruction}\n\n=== ISI DOKUMEN ({filename}) ===\n{extracted_text[:18000]}"})
         else:
+            if mime_type.startswith("audio/"):
+                instruction = (
+                    "Dengarkan pesan suara (Voice Note) user ini baik-baik, lalu langsung jawab/kerjakan apa yang diminta user dengan santai dan jelas!"
+                )
             parts.append({"text": f"INSTRUKSI USER ({filename}): {instruction}"})
             if raw_bytes and len(raw_bytes) <= 15 * 1024 * 1024:
                 b64_data = _b64.b64encode(raw_bytes).decode("ascii")
@@ -304,6 +382,10 @@ class MultiLLMBrain:
             return self.autopilot.decide(goal, dom_state, history, workspace_files, memory_notes)
 
         user_context = self._build_user_prompt(goal, dom_state, history, workspace_files, memory_notes, recent_chat)
+        if not history:
+            live_ctx = await _fetch_live_web_context(goal)
+            if live_ctx:
+                user_context = live_ctx + user_context
         screenshot_b64 = dom_state.get("screenshot_b64", "")
 
         provider = self.config.provider
@@ -357,40 +439,43 @@ class MultiLLMBrain:
     async def _call_gemini(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         import asyncio as _aio
         primary = self.config.model or "gemini-3.1-flash-lite"
-        candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
-        parts: List[Dict[str, Any]] = [{"text": prompt_text}]
-        if screenshot_b64:
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
+        candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview") if m != primary]
 
-        payload = {
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json",
-            },
-        }
         last_err = ""
-        async with _fast_http_client(timeout=18.0) as client:
-            for model in candidates:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
-                try:
-                    resp = await client.post(url, json=payload)
-                except Exception as exc:
-                    last_err = f"Koneksi AI lambat ({type(exc).__name__}) pada {model}"
-                    continue
-                if resp.status_code in (404, 429, 503):
-                    last_err = f"Gemini API ({resp.status_code}) pada {model}"
-                    if resp.status_code == 429:
-                        await _aio.sleep(1.5)
-                    continue
-                if resp.status_code >= 400:
-                    raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
-                if model != self.config.model:
-                    self.config.model = model
-                data = resp.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                return _extract_json(text)
+        # Tahap 1: Dengan gambar screenshot Vision; Tahap 2 (fallback anti-ReadTimeout): Mode teks DOM super ringan
+        passes = [True, False] if screenshot_b64 else [False]
+        async with _fast_http_client(timeout=28.0) as client:
+            for include_img in passes:
+                parts: List[Dict[str, Any]] = [{"text": prompt_text}]
+                if include_img and screenshot_b64:
+                    parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
+                payload = {
+                    "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                    "contents": [{"role": "user", "parts": parts}],
+                    "generationConfig": {
+                        "temperature": 0.2,
+                        "responseMimeType": "application/json",
+                    },
+                }
+                for model in candidates:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
+                    try:
+                        resp = await client.post(url, json=payload)
+                    except Exception as exc:
+                        last_err = f"Koneksi AI sibuk ({type(exc).__name__}) pada {model}"
+                        continue
+                    if resp.status_code in (404, 429, 503):
+                        last_err = f"Gemini API ({resp.status_code}) pada {model}"
+                        if resp.status_code == 429:
+                            await _aio.sleep(1.5)
+                        continue
+                    if resp.status_code >= 400:
+                        raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
+                    if model != self.config.model:
+                        self.config.model = model
+                    data = resp.json()
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return _extract_json(text)
         raise RuntimeError(last_err or "Server AI sedang padat sesaat, coba kirim ulang 5 detik lagi.")
 
     async def _call_openai_compatible(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:

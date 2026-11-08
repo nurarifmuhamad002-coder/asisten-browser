@@ -317,7 +317,7 @@ class CloudBrowserEngine:
 
         screenshot_b64 = ""
         try:
-            raw = await self.page.screenshot(type="jpeg", quality=65, timeout=6000, animations="disabled")
+            raw = await self.page.screenshot(type="jpeg", quality=46, timeout=6000, animations="disabled")
             screenshot_b64 = base64.b64encode(raw).decode("ascii")
             self.latest_frame_b64 = screenshot_b64
         except Exception:

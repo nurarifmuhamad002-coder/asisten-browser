@@ -246,7 +246,7 @@ class AgentOrchestrator:
                     result_text = f"Kendala ringan pada aksi {act_name} ({err_label[:80]}), halaman sudah disegarkan."
                 self.history.append({"step": step_num, "action_name": act_name, "result": result_text})
 
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(0.08)
 
             self.state = "IDLE"
             self.live_status = "Online · Siap disuruh apa aja"

@@ -16,7 +16,7 @@ from agent.browser_engine import CloudBrowserEngine
 from agent.file_manager import WorkspaceFileManager
 from agent.github_publisher import GitHubPublisher
 from agent.hf_deployer import HuggingFaceDeployer
-from agent.llm_providers import LLMConfig
+from agent.llm_providers import LLMConfig, get_shared_http
 from agent.orchestrator import AgentOrchestrator
 from agent.telegram_bridge import TelegramBotBridge
 
@@ -63,7 +63,7 @@ telegram_bridge.attach_orchestrator(orchestrator)
 
 
 async def _boot_background() -> None:
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.1)
     try:
         await telegram_bridge.start_if_env_set()
     except Exception:
@@ -79,6 +79,10 @@ async def lifespan(app: FastAPI):
     await telegram_bridge.stop()
     await orchestrator.stop_goal(silent=True)
     await browser_engine.stop()
+    try:
+        await get_shared_http().aclose()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="NusaOperator — Simple Chat Browser Assistant", lifespan=lifespan)
@@ -446,6 +450,7 @@ async def websocket_endpoint(websocket: WebSocket):
         return
     await websocket.accept()
     ws_clients.add(websocket)
+    await browser_engine.set_viewer_count(len(ws_clients))
 
     if not browser_engine.latest_frame_b64 and browser_engine.page:
         await browser_engine.refresh_frame()
@@ -485,9 +490,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 await browser_engine.human_type(str(data.get("text", "")))
     except WebSocketDisconnect:
         ws_clients.discard(websocket)
+        await browser_engine.set_viewer_count(len(ws_clients))
     except Exception:
         ws_clients.discard(websocket)
+        await browser_engine.set_viewer_count(len(ws_clients))
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        loop="uvloop",
+        http="httptools",
+        access_log=False,
+        log_level="warning",
+    )

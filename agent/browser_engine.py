@@ -21,8 +21,8 @@ class CloudBrowserEngine:
     - Tangkap otomatis file download browser ke folder workspace_files
     """
 
-    VIEWPORT_WIDTH = 1280
-    VIEWPORT_HEIGHT = 800
+    VIEWPORT_WIDTH = 960
+    VIEWPORT_HEIGHT = 640
 
     def __init__(
         self,
@@ -46,6 +46,8 @@ class CloudBrowserEngine:
         self.show_som_badges: bool = False
         self._lock = asyncio.Lock()
         self._started = False
+        self._viewer_count: int = 0
+        self._screencast_on: bool = False
         self._last_active: float = 0.0
         self._idle_task: Optional[asyncio.Task] = None
 
@@ -221,18 +223,51 @@ class CloudBrowserEngine:
                 "Page.screencastFrame",
                 lambda event: asyncio.create_task(self._on_screencast_frame(event)),
             )
+            self._screencast_on = False
+            if self._viewer_count > 0:
+                await self._start_screencast()
+        except Exception:
+            self._cdp = None
+
+    async def _start_screencast(self) -> None:
+        if not self._cdp or self._screencast_on:
+            return
+        try:
             await self._cdp.send(
                 "Page.startScreencast",
                 {
                     "format": "jpeg",
-                    "quality": 52,
+                    "quality": 50,
                     "maxWidth": self.VIEWPORT_WIDTH,
                     "maxHeight": self.VIEWPORT_HEIGHT,
                     "everyNthFrame": 6,
                 },
             )
+            self._screencast_on = True
         except Exception:
-            self._cdp = None
+            pass
+
+    async def _stop_screencast(self) -> None:
+        if not self._cdp or not self._screencast_on:
+            return
+        try:
+            await self._cdp.send("Page.stopScreencast")
+        except Exception:
+            pass
+        self._screencast_on = False
+
+    async def set_viewer_count(self, count: int) -> None:
+        """Hanya nyalakan video streaming CDP saat user membuka layar web live — hemat 70% CPU!"""
+        self._viewer_count = max(0, count)
+        if self._viewer_count > 0:
+            self._touch()
+            await self._start_screencast()
+        else:
+            await self._stop_screencast()
+
+    async def _refresh_if_watched(self) -> None:
+        if self._viewer_count > 0:
+            await self.refresh_frame()
 
     async def _on_navigated(self, frame: Any) -> None:
         if self.page and frame == self.page.main_frame:
@@ -451,7 +486,7 @@ class CloudBrowserEngine:
             resp = await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
             status_code = resp.status if resp else None
 
-        await asyncio.sleep(0.45)
+        await asyncio.sleep(0.18)
         if self.page.url.startswith("chrome-error://"):
             try:
                 await self.page.go_back(timeout=4000)
@@ -459,7 +494,7 @@ class CloudBrowserEngine:
                 pass
             return f"Situs {target} memblokir akses dari server cloud (anti-bot/firewall)."
 
-        await self.refresh_frame()
+        await self._refresh_if_watched()
         title = await self._safe_title()
         if status_code == 403:
             return f"Membuka {self._display_url(self.page.url)} ({title}) — Catatan: Situs ini menampilkan 403/Anti-Bot terhadap IP server cloud."
@@ -471,12 +506,12 @@ class CloudBrowserEngine:
         target_el = next((e for e in elements if e["index"] == index), None)
         selector = f'[data-nusa-idx="{index}"]'
 
-        if target_el:
+        if target_el and self._viewer_count > 0:
             cx = target_el["rect"]["centerX"]
             cy = target_el["rect"]["centerY"]
             lbl = target_el.get("text") or target_el.get("label") or target_el.get("placeholder") or f"#{index}"
             await self.emit_cursor(cx, cy, f"Klik [{index}] {lbl[:28]}", "click")
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.1)
 
         locator = self.page.locator(selector).first
         try:
@@ -502,8 +537,8 @@ class CloudBrowserEngine:
             else:
                 raise
 
-        await asyncio.sleep(0.55)
-        await self.refresh_frame()
+        await asyncio.sleep(0.2)
+        await self._refresh_if_watched()
         desc = (target_el.get("text") or target_el.get("label") or f"elemen [{index}]") if target_el else f"elemen [{index}]"
         return f"Berhasil klik [{index}] '{desc[:50]}'"
 
@@ -549,13 +584,13 @@ class CloudBrowserEngine:
             return f"Kolom input [{index}] tidak ditemukan."
 
         if press_enter:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.08)
             await self.page.keyboard.press("Enter")
-            await asyncio.sleep(0.65)
-        else:
             await asyncio.sleep(0.3)
+        else:
+            await asyncio.sleep(0.1)
 
-        await self.refresh_frame()
+        await self._refresh_if_watched()
         return f"Mengetik '{text}' pada kolom [{index}]" + (" lalu tekan Enter." if press_enter else ".")
 
     async def select_dropdown(self, index: int, option_value_or_text: str, elements: List[Dict[str, Any]]) -> str:
@@ -612,8 +647,8 @@ class CloudBrowserEngine:
             await self.page.mouse.wheel(0, -abs(amount))
         else:
             await self.page.mouse.wheel(0, abs(amount))
-        await asyncio.sleep(0.35)
-        await self.refresh_frame()
+        await asyncio.sleep(0.15)
+        await self._refresh_if_watched()
         return f"Scroll halaman ke arah '{direction}'."
 
     async def go_back(self) -> str:

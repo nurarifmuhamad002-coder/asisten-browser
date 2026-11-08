@@ -1,100 +1,168 @@
+import asyncio
+import html as _html
 import json
 import os
 import re
+import time as _time
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from agent.dom_inspector import format_dom_for_llm
 
+# Pool koneksi HTTP/1.1 Keep-Alive permanen (IPv4 murni) — memangkas waktu jabat-tangan TLS 400–900ms di setiap pesan!
+_SHARED_HTTP_POOL: Optional[httpx.AsyncClient] = None
+_LIVE_CACHE: Dict[str, Tuple[float, str]] = {}
 
-def _fast_http_client(timeout: float = 25.0) -> httpx.AsyncClient:
-    """Paksa IPv4 agar di container cloud tanpa Outbound IPv6 tidak pernah delay 10 detik."""
-    return httpx.AsyncClient(
-        transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
-        timeout=timeout,
-    )
+_COMMON_TICKER_MAP = {
+    "btc": "BTC-USD",
+    "bitcoin": "BTC-USD",
+    "eth": "ETH-USD",
+    "ethereum": "ETH-USD",
+    "sol": "SOL-USD",
+    "solana": "SOL-USD",
+    "xrp": "XRP-USD",
+    "doge": "DOGE-USD",
+    "emas": "GC=F",
+    "gold": "GC=F",
+    "ihsg": "^JKSE",
+    "kurs": "USDIDR=X",
+    "rupiah": "USDIDR=X",
+    "usdidr": "USDIDR=X",
+}
+
+_IDX_BLUECHIPS = {"bbca", "bbri", "bmri", "bbni", "tlkm", "asii", "goto", "adro", "antm", "brpt", "unvr", "icbp", "amrt", "mdka", "pgas", "ptba", "inkp", "klbf"}
+
+
+def get_shared_http() -> httpx.AsyncClient:
+    global _SHARED_HTTP_POOL
+    if _SHARED_HTTP_POOL is None or _SHARED_HTTP_POOL.is_closed:
+        _SHARED_HTTP_POOL = httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(
+                local_address="0.0.0.0",
+                retries=1,
+            ),
+            limits=httpx.Limits(max_keepalive_connections=25, max_connections=50, keepalive_expiry=45.0),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            },
+            timeout=16.0,
+            follow_redirects=True,
+        )
+    return _SHARED_HTTP_POOL
+
+
+@asynccontextmanager
+async def _fast_http_client(timeout: float = 25.0):
+    """Memakai ulang koneksi Keep-Alive yang sudah hangat tanpa menutup socket setiap selesai request."""
+    yield get_shared_http()
+
+
+async def _fetch_single_quote(client: httpx.AsyncClient, sym: str) -> str:
+    try:
+        ry = await client.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d", timeout=3.5)
+        if ry.status_code == 200:
+            res_list = ry.json().get("chart", {}).get("result") or []
+            if res_list:
+                meta = res_list[0].get("meta", {})
+                price = meta.get("regularMarketPrice")
+                prev = meta.get("chartPreviousClose")
+                d_high = meta.get("regularMarketDayHigh")
+                d_low = meta.get("regularMarketDayLow")
+                cur = meta.get("currency", "")
+                name = meta.get("longName") or meta.get("shortName") or sym
+                diff_str = ""
+                if price is not None and prev:
+                    pct = ((price - prev) / prev) * 100
+                    diff_str = f" ({pct:+.2f}% dari penutupan sebelumnya {prev} {cur})"
+                hl_str = f" | High: {d_high} {cur}, Low: {d_low} {cur}" if d_high and d_low else ""
+                return f"[DATA PASAR REAL-TIME YAHOO FINANCE] {name} ({sym}): {price} {cur}{diff_str}{hl_str}"
+    except Exception:
+        pass
+    return ""
 
 
 async def _fetch_live_web_context(query: str) -> str:
-    """Mengambil harga saham/kripto/kurs real-time (Yahoo Finance API) & cuplikan berita terbaru dalam <0.5 detik."""
-    q_low = (query or "").lower()
+    """Mengambil harga saham/kripto/kurs real-time (<0.18 detik paralel + cache 45 detik) & berita terbaru."""
+    q_low = (query or "").lower().strip()
+    now_ts = _time.monotonic()
+    cached = _LIVE_CACHE.get(q_low)
+    if cached and (now_ts - cached[0] < 45.0):
+        return cached[1]
+
     needs_finance = any(
         w in q_low
         for w in ("harga", "saham", "etf", "stock", "price", "btc", "bitcoin", "eth", "kripto", "crypto", "kurs", "usd", "idr", "emas", "ihsg")
     ) or bool(re.search(r"\b[A-Z]{3,5}\b", query or ""))
-    needs_live = needs_finance or any(
+    needs_news = any(
         w in q_low
-        for w in ("sekarang", "hari ini", "terbaru", "berita", "jadwal", "skor", "cuaca", "2026", "update", "cek ")
+        for w in ("sekarang", "hari ini", "terbaru", "berita", "jadwal", "skor", "cuaca", "2026", "update", "kenapa", "knpa")
     )
-    if not needs_live:
+    if not needs_finance and not needs_news:
         return ""
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-    }
+    client = get_shared_http()
     chunks: List[str] = []
     try:
-        async with httpx.AsyncClient(
-            transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
-            headers=headers,
-            timeout=6.0,
-            follow_redirects=True,
-        ) as client:
-            if needs_finance:
-                # Cari simbol ticker resmi lewat Yahoo Finance Search atau huruf kapital (misal QQQM, VOO, NVDA, BBCA)
-                tickers: List[str] = re.findall(r"\b([A-Z]{2,6}(?:\.[A-Z]{2})?)\b", query or "")
-                stop_caps = {"BRO", "GUA", "LIAT", "BUKA", "CEK", "DONG", "APA", "INI", "ITU", "DAN", "YANG", "WEB", "PDF", "SAHAM"}
-                tickers = [t for t in tickers if t not in stop_caps]
-                if not tickers:
-                    clean_fin = re.sub(
-                        r"\b(bro|gua|lu|buka|bukain|liat|lihat|cek|berapa|harga|saham|etf|koin|kripto|crypto|kurs|emiten|indeks|sekarang|skrg|dong|hari|ini|tolong|tuh|nih|ya)\b",
-                        " ",
-                        q_low,
-                    )
-                    clean_fin = re.sub(r"\s+", " ", clean_fin).strip()
-                    if clean_fin:
-                        rs = await client.get("https://query2.finance.yahoo.com/v1/finance/search", params={"q": clean_fin, "quotesCount": 3})
-                        if rs.status_code == 200:
-                            for q_item in rs.json().get("quotes", [])[:2]:
-                                if q_item.get("symbol"):
-                                    tickers.append(q_item["symbol"])
+        if needs_finance:
+            tickers: List[str] = []
+            for word in re.findall(r"[a-zA-Z0-9\.]+", q_low):
+                if word in _COMMON_TICKER_MAP:
+                    tickers.append(_COMMON_TICKER_MAP[word])
+                elif word in _IDX_BLUECHIPS:
+                    tickers.append(f"{word.upper()}.JK")
 
-                for sym in tickers[:2]:
-                    ry = await client.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d")
-                    if ry.status_code == 200:
-                        res_list = ry.json().get("chart", {}).get("result") or []
-                        if res_list:
-                            meta = res_list[0].get("meta", {})
-                            price = meta.get("regularMarketPrice")
-                            prev = meta.get("chartPreviousClose")
-                            d_high = meta.get("regularMarketDayHigh")
-                            d_low = meta.get("regularMarketDayLow")
-                            cur = meta.get("currency", "")
-                            name = meta.get("longName") or meta.get("shortName") or sym
-                            diff_str = ""
-                            if price is not None and prev:
-                                pct = ((price - prev) / prev) * 100
-                                diff_str = f" ({pct:+.2f}% dari penutupan sebelumnya {prev} {cur})"
-                            hl_str = f" | High hari ini: {d_high} {cur}, Low hari ini: {d_low} {cur}" if d_high and d_low else ""
-                            chunks.append(f"[DATA PASAR REAL-TIME YAHOO FINANCE] {name} ({sym}): {price} {cur}{diff_str}{hl_str}")
+            stop_words = {
+                "bro", "gua", "lu", "buka", "bukain", "liat", "lihat", "cek", "berapa", "harga", "saham",
+                "etf", "koin", "kripto", "crypto", "kurs", "emiten", "indeks", "sekarang", "skrg", "dong",
+                "hari", "ini", "itu", "tolong", "tuh", "nih", "ya", "apa", "dan", "yang", "web", "pdf", "kenapa", "knpa",
+            }
+            for tok in re.findall(r"\b([a-zA-Z]{2,5}(?:\.[a-zA-Z]{2})?)\b", query or ""):
+                tl = tok.lower()
+                if tl not in stop_words and tl not in _COMMON_TICKER_MAP and tl not in _IDX_BLUECHIPS:
+                    tickers.append(tok.upper())
 
-            # Ambil cuplikan web live singkat
-            from bs4 import BeautifulSoup
-            rw = await client.get("https://search.yahoo.com/search", params={"p": query})
+            # Dedup preserving order
+            seen_t = set()
+            uniq_tickers = [t for t in tickers if not (t in seen_t or seen_t.add(t))][:3]
+
+            if uniq_tickers:
+                results = await asyncio.gather(*[_fetch_single_quote(client, s) for s in uniq_tickers])
+                chunks.extend([r for r in results if r])
+
+            if not chunks:
+                clean_fin = " ".join(w for w in re.findall(r"[a-z0-9]+", q_low) if w not in stop_words).strip()
+                if clean_fin:
+                    rs = await client.get("https://query2.finance.yahoo.com/v1/finance/search", params={"q": clean_fin, "quotesCount": 2}, timeout=3.0)
+                    if rs.status_code == 200:
+                        found_syms = [q_item["symbol"] for q_item in rs.json().get("quotes", [])[:2] if q_item.get("symbol")]
+                        if found_syms:
+                            results = await asyncio.gather(*[_fetch_single_quote(client, s) for s in found_syms])
+                            chunks.extend([r for r in results if r])
+
+        # Hanya tarik HTML search jika belum dapat harga finansial ATAU user memang tanya alasan/berita
+        if not chunks or any(w in q_low for w in ("berita", "kenapa", "knpa", "jadwal", "skor", "cuaca", "terbaru")):
+            rw = await client.get("https://search.yahoo.com/search", params={"p": query}, timeout=3.5)
             if rw.status_code == 200:
-                soup = BeautifulSoup(rw.text, "html.parser")
-                for div in soup.select("div.algo, div.dd")[:5]:
-                    txt = div.get_text(" ", strip=True)
-                    if len(txt) > 35:
-                        chunks.append(f"- {txt[:260]}")
+                for m in re.finditer(r'<div[^>]*class="[^"]*compText[^"]*"[^>]*>(.*?)</div>', rw.text, re.S):
+                    clean_s = _html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
+                    clean_s = re.sub(r"\s+", " ", clean_s).strip()
+                    if len(clean_s) > 35:
+                        chunks.append(f"- {clean_s[:240]}")
+                        if len(chunks) >= 5:
+                            break
     except Exception:
         pass
 
     if not chunks:
         return ""
-    return "=== DATA INTERNET REAL-TIME DETIK INI ===\n" + "\n".join(chunks[:6]) + "\n\n"
+    out = "=== DATA INTERNET REAL-TIME DETIK INI ===\n" + "\n".join(chunks[:5]) + "\n\n"
+    if len(_LIVE_CACHE) > 120:
+        _LIVE_CACHE.clear()
+    _LIVE_CACHE[q_low] = (now_ts, out)
+    return out
 
 SYSTEM_PROMPT = """Kamu adalah NusaOperator, AI Cloud Browser Agent yang cerdas, teliti, dan mengutamakan keamanan pengguna.
 Tugasmu adalah memahami perintah user (dalam Bahasa Indonesia atau Inggris), menyusun rencana langkah kerja (multi-step plan), membaca tampilan website (melalui screenshot + daftar elemen interaktif [index]), mengelola file di workspace, dan mengeksekusi langkah satu per satu hingga tuntas.
@@ -149,7 +217,7 @@ def _extract_json(raw_text: str) -> Dict[str, Any]:
 class LLMConfig:
     def __init__(self) -> None:
         self.provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()
-        self.model: str = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
+        self.model: str = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite-preview")
         self.api_key: str = (
             os.getenv("LLM_API_KEY")
             or os.getenv("GEMINI_API_KEY")
@@ -177,7 +245,7 @@ class LLMConfig:
     @staticmethod
     def _default_model(provider: str) -> str:
         defaults = {
-            "gemini": "gemini-3.1-flash-lite",
+            "gemini": "gemini-3.1-flash-lite-preview",
             "openai": "gpt-4o",
             "anthropic": "claude-sonnet-4-20250514",
             "openrouter": "google/gemini-3.1-flash-lite",
@@ -234,22 +302,53 @@ class MultiLLMBrain:
         prompt = f"{hist_block}{live_ctx}USER: {message}"
 
         if self.config.provider == "gemini":
-            primary = self.config.model or "gemini-3.1-flash-lite"
-            candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview") if m != primary]
+            # Urutan model tercepat dari hasil benchmark nyata (~1.1s vs 5.5s!) + Hedged Racing anti-ngelag
+            fast_order = ["gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
+            if self.config.model and self.config.model not in fast_order:
+                fast_order.insert(0, self.config.model)
             payload = {
                 "system_instruction": {"parts": [{"text": chat_sys}]},
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.5},
+                "generationConfig": {"temperature": 0.45, "maxOutputTokens": 650},
             }
-            async with _fast_http_client(timeout=22.0) as client:
-                for model in candidates:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
-                    try:
-                        resp = await client.post(url, json=payload)
-                        if resp.status_code == 200:
-                            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    except Exception:
-                        continue
+            client = get_shared_http()
+
+            async def _try_one(m_name: str) -> Optional[str]:
+                u = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}"
+                try:
+                    r = await client.post(u, json=payload, timeout=10.0)
+                    if r.status_code == 200:
+                        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception:
+                    pass
+                return None
+
+            # Jalankan model tercepat (#1); jika lewat 3.0 detik belum balik (antrian server Google), langsung balapkan #2 paralel!
+            t_primary = asyncio.create_task(_try_one(fast_order[0]))
+            done, _ = await asyncio.wait({t_primary}, timeout=3.0)
+            if done:
+                ans = t_primary.result()
+                if ans:
+                    return ans
+
+            t_backup = asyncio.create_task(_try_one(fast_order[1]))
+            pending = {t for t in (t_primary, t_backup) if not t.done()}
+            while pending:
+                done_set, pending = await asyncio.wait(pending, timeout=9.0, return_when=asyncio.FIRST_COMPLETED)
+                if not done_set:
+                    break
+                for d_task in done_set:
+                    ans = d_task.result()
+                    if ans:
+                        for p in pending:
+                            p.cancel()
+                        return ans
+
+            for p in pending:
+                p.cancel()
+            ans3 = await _try_one(fast_order[2])
+            if ans3:
+                return ans3
             return "Waduh koneksi AI lagi agak padat bro, coba kirim ulang barusan ya!"
 
         # Fallback OpenAI/OpenRouter
@@ -446,8 +545,9 @@ class MultiLLMBrain:
 
     async def _call_gemini(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         import asyncio as _aio
-        primary = self.config.model or "gemini-3.1-flash-lite"
-        candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview") if m != primary]
+        candidates = ["gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
+        if self.config.model and self.config.model not in candidates:
+            candidates.insert(0, self.config.model)
 
         last_err = ""
         # Tahap 1: Dengan gambar screenshot Vision; Tahap 2 (fallback anti-ReadTimeout): Mode teks DOM super ringan

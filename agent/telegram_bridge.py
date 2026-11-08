@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import httpx
 
+from agent.llm_providers import get_shared_http
+
 if TYPE_CHECKING:
     from agent.orchestrator import AgentOrchestrator
 
@@ -118,31 +120,33 @@ class TelegramBotBridge:
             self.bot_username = ""
             return self.public_dict()
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(f"https://api.telegram.org/bot{clean}/getMe")
-            data = resp.json()
-            if not data.get("ok"):
-                raise ValueError("Token Bot Telegram tidak valid. Pastikan copy langsung dari @BotFather.")
-            self.bot_username = data["result"].get("username", "")
+        client = get_shared_http()
+        resp = await client.get(f"https://api.telegram.org/bot{clean}/getMe", timeout=12.0)
+        data = resp.json()
+        if not data.get("ok"):
+            raise ValueError("Token Bot Telegram tidak valid. Pastikan copy langsung dari @BotFather.")
+        self.bot_username = data["result"].get("username", "")
 
-            self.token = clean
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{clean}/setMyCommands",
-                    json={"commands": BOT_COMMANDS},
-                )
-            except Exception:
-                pass
+        self.token = clean
+        try:
+            await client.post(
+                f"https://api.telegram.org/bot{clean}/setMyCommands",
+                json={"commands": BOT_COMMANDS},
+                timeout=10.0,
+            )
+        except Exception:
+            pass
 
-            if self.use_webhook and self.public_web_url.startswith("https://"):
-                wh_url = self.public_web_url.rstrip("/") + "/api/telegram/webhook"
-                await client.post(
-                    f"https://api.telegram.org/bot{clean}/setWebhook",
-                    json={"url": wh_url},
-                )
-            else:
-                await client.post(f"https://api.telegram.org/bot{clean}/deleteWebhook")
-                self._poll_task = asyncio.create_task(self._poll_loop())
+        if self.use_webhook and self.public_web_url.startswith("https://"):
+            wh_url = self.public_web_url.rstrip("/") + "/api/telegram/webhook"
+            await client.post(
+                f"https://api.telegram.org/bot{clean}/setWebhook",
+                json={"url": wh_url, "drop_pending_updates": False},
+                timeout=12.0,
+            )
+        else:
+            await client.post(f"https://api.telegram.org/bot{clean}/deleteWebhook", timeout=10.0)
+            self._poll_task = asyncio.create_task(self._poll_loop())
 
         return self.public_dict()
 
@@ -576,7 +580,8 @@ class TelegramBotBridge:
             self.chat_modes[chat_id] = "chat"
 
         if mode == "chat":
-            await self._send_chat_action(chat_id, "typing")
+            # Jangan tunggu roundtrip "typing" — langsung jalankan Gemini detik ke-0.000!
+            asyncio.create_task(self._send_chat_action(chat_id, "typing"))
             await self.orchestrator._push_chat("user", text)
             reply = await self.orchestrator.brain.quick_chat(text, self.orchestrator.chat_messages[:-1])
             await self.orchestrator._push_chat("agent", reply)
@@ -621,18 +626,19 @@ class TelegramBotBridge:
         await self.orchestrator.start_goal(text)
 
     async def _download_telegram_file(self, file_id: str) -> bytes:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r_meta = await client.get(
-                f"https://api.telegram.org/bot{self.token}/getFile",
-                params={"file_id": file_id},
-            )
-            meta = r_meta.json()
-            if not meta.get("ok"):
-                raise RuntimeError("Gagal mengambil info file dari Telegram.")
-            file_path = meta["result"]["file_path"]
-            r_raw = await client.get(f"https://api.telegram.org/file/bot{self.token}/{file_path}")
-            r_raw.raise_for_status()
-            return r_raw.content
+        client = get_shared_http()
+        r_meta = await client.get(
+            f"https://api.telegram.org/bot{self.token}/getFile",
+            params={"file_id": file_id},
+            timeout=15.0,
+        )
+        meta = r_meta.json()
+        if not meta.get("ok"):
+            raise RuntimeError("Gagal mengambil info file dari Telegram.")
+        file_path = meta["result"]["file_path"]
+        r_raw = await client.get(f"https://api.telegram.org/file/bot{self.token}/{file_path}", timeout=30.0)
+        r_raw.raise_for_status()
+        return r_raw.content
 
     async def _handle_media_upload(self, chat_id: int, msg: Dict[str, Any]) -> None:
         from datetime import datetime as _dt
@@ -748,11 +754,11 @@ class TelegramBotBridge:
         if not self.token:
             return
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    f"https://api.telegram.org/bot{self.token}/sendChatAction",
-                    json={"chat_id": chat_id, "action": action},
-                )
+            await get_shared_http().post(
+                f"https://api.telegram.org/bot{self.token}/sendChatAction",
+                json={"chat_id": chat_id, "action": action},
+                timeout=4.0,
+            )
         except Exception:
             pass
 
@@ -760,22 +766,25 @@ class TelegramBotBridge:
         if not self.token:
             return
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                await client.post(
-                    f"https://api.telegram.org/bot{self.token}/editMessageText",
-                    json={"chat_id": chat_id, "message_id": message_id, "text": text[:3900]},
-                )
+            await get_shared_http().post(
+                f"https://api.telegram.org/bot{self.token}/editMessageText",
+                json={"chat_id": chat_id, "message_id": message_id, "text": text[:3900]},
+                timeout=8.0,
+            )
         except Exception:
             pass
 
     async def _answer_cb(self, cb_id: Optional[str], text: str) -> None:
         if not cb_id or not self.token:
             return
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
+        try:
+            await get_shared_http().post(
                 f"https://api.telegram.org/bot{self.token}/answerCallbackQuery",
                 json={"callback_query_id": cb_id, "text": text},
+                timeout=8.0,
             )
+        except Exception:
+            pass
 
     async def send_text(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Optional[int]:
         if not self.token:
@@ -784,11 +793,14 @@ class TelegramBotBridge:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json=payload)
-                d = r.json()
-                if d.get("ok"):
-                    return d["result"].get("message_id")
+            r = await get_shared_http().post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json=payload,
+                timeout=12.0,
+            )
+            d = r.json()
+            if d.get("ok"):
+                return d["result"].get("message_id")
         except Exception:
             pass
         return None
@@ -820,16 +832,14 @@ class TelegramBotBridge:
         if reply_markup:
             data["reply_markup"] = json.dumps(reply_markup)
         files = {"photo": ("screen.jpg", raw_bytes, "image/jpeg")}
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            await client.post(f"https://api.telegram.org/bot{self.token}/sendPhoto", data=data, files=files)
+        await get_shared_http().post(f"https://api.telegram.org/bot{self.token}/sendPhoto", data=data, files=files, timeout=18.0)
 
     async def send_document(self, chat_id: int, filename: str, file_bytes: bytes, caption: str = "") -> None:
         if not self.token:
             return
         data = {"chat_id": str(chat_id), "caption": caption[:950]}
         files = {"document": (filename, file_bytes)}
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            await client.post(f"https://api.telegram.org/bot{self.token}/sendDocument", data=data, files=files)
+        await get_shared_http().post(f"https://api.telegram.org/bot{self.token}/sendDocument", data=data, files=files, timeout=22.0)
 
     async def notify_takeover(self, reason: str, frame_b64: str) -> None:
         if not self.is_configured or not self.active_chat_ids:

@@ -541,7 +541,7 @@ class TelegramBotBridge:
             target_url = await self.orchestrator.brain.resolve_website_url(text)
             nav_msg = await self.orchestrator.browser.navigate(target_url)
             b64 = await self.orchestrator.browser.refresh_frame()
-            self.chat_modes[chat_id] = "agent"
+            self.chat_modes[chat_id] = "chat"
             if wait_mid:
                 await self._edit_text(chat_id, wait_mid, f"🌐 {nav_msg}")
             if b64:
@@ -550,22 +550,30 @@ class TelegramBotBridge:
                     b64,
                     f"🖥️ {nav_msg}\n\n"
                     "• Kalau mau login/klik sendiri, tap '🖥️ Buka & Kontrol Layar Live'.\n"
-                    "• Kalau mau langsung nyuruh gua ngerjain sesuatu di halaman ini, tinggal ketik perintahnya di bawah!",
-                    reply_markup=self._live_browser_inline_kb(include_task_btn=False),
+                    "• Kalau mau nyuruh robot nge-klik / ngisi sesuatu di halaman ini, tinggal ketik (contoh: 'klik tombol login' / 'isi formnya').",
+                    reply_markup=self._live_browser_inline_kb(include_task_btn=True),
                 )
             return
 
-        # Jalur Kilat Pintar: jika user cuma nanya harga saham/kripto/kurs/pertanyaan umum tanpa aksi klik/isi form browser,
-        # jawab instan 2 detik meski habis dari menu Buka Web!
-        browser_action_words = (
-            "klik", "pencet", "ketik", "isi ", "isiin", "login", "masuk ", "scroll", "geser",
-            "download", "unduh", "halaman ini", "di web ini", "form", "formulir", "daftar", "submit", "buka ",
+        # Deteksi pintar: bedakan perintah klik/isi web vs obrolan / cek harga saham / tanya jawab kilat!
+        strict_browser_verbs = (
+            "klik", "pencet", "ketik", "isi ", "isiin", "login", "scroll", "geser",
+            "download", "unduh", "halaman ini", "di web ini", "di halaman", "form", "formulir", "submit", "tombol", "pilih ",
         )
-        is_pure_price_or_qa = any(
-            w in low for w in ("saham", "harga", "etf", "kurs", "bitcoin", "btc", "kripto", "crypto", "ihsg", "kenapa", "knpa")
-        ) and not any(bw in low for bw in browser_action_words) and not has_url
-        if mode == "agent" and is_pure_price_or_qa:
+        has_strict_browser_verb = any(bw in low for bw in strict_browser_verbs)
+        is_price_or_chat_query = (
+            any(w in low for w in ("saham", "harga", "etf", "kurs", "bitcoin", "btc", "kripto", "crypto", "ihsg", "gimana", "gmna", "kenapa", "knpa", "terus", "trus", "maksudnya", "apa itu", "jelasin"))
+            and not has_strict_browser_verb
+            and not has_url
+        )
+
+        # Jika di mode chat tapi user eksplisit nyuruh klik/isi elemen di halaman yang sedang terbuka -> jalankan browser agent
+        if mode == "chat" and has_strict_browser_verb:
+            mode = "agent"
+        # Sebaliknya jika di mode agent tapi user cuma nanya harga saham ("buka harga saham qqqm") atau ngobrol ("trus gimanaa bro?") -> jawab kilat 1.5 detik!
+        elif mode == "agent" and (is_price_or_chat_query or (not has_strict_browser_verb and not has_url and len(low.split()) <= 7 and not any(w in low for w in ("cari", "buka", "masuk", "daftar", "cek web")))):
             mode = "chat"
+            self.chat_modes[chat_id] = "chat"
 
         if mode == "chat":
             await self._send_chat_action(chat_id, "typing")

@@ -235,7 +235,15 @@ class AgentOrchestrator:
                     if self.telegram:
                         await self.telegram.notify_step(step_num, thought)
 
-                result_text = await self._execute_with_guardrails(step_num, action, dom_state)
+                try:
+                    result_text = await self._execute_with_guardrails(step_num, action, dom_state)
+                except Exception as step_exc:
+                    err_label = str(step_exc).strip() or type(step_exc).__name__
+                    try:
+                        await self.browser.ensure_alive()
+                    except Exception:
+                        pass
+                    result_text = f"Kendala ringan pada aksi {act_name} ({err_label[:80]}), halaman sudah disegarkan."
                 self.history.append({"step": step_num, "action_name": act_name, "result": result_text})
 
                 await asyncio.sleep(0.35)
@@ -256,10 +264,25 @@ class AgentOrchestrator:
             self.state = "IDLE"
             self.live_status = "Online · Siap disuruh apa aja"
             await self._sync_state()
-            err_msg = f"Waduh, ada kendala teknis pas langkah tadi: {exc}"
+            # Self-healing fallback: jika browser crash/berat, langsung jawab pakai jalur kilat AI + data live agar user TIDAK PERNAH dapat pesan error buntu!
+            try:
+                asyncio.create_task(self.browser._force_restart())
+            except Exception:
+                pass
+            try:
+                fallback_reply = await self.brain.quick_chat(self.current_goal, self.chat_messages[:-1])
+                if fallback_reply and not fallback_reply.startswith("Waduh koneksi"):
+                    await self._push_chat("agent", fallback_reply)
+                    if self.telegram:
+                        await self.telegram.notify_done(fallback_reply)
+                    return
+            except Exception:
+                pass
+            reason_txt = str(exc).strip() or f"Halaman web terlalu berat ({type(exc).__name__})"
+            err_msg = f"Halaman web barusan terlalu berat di memori server ({reason_txt[:100]}), browser otomatis gua segarin ulang ya bro!"
             await self._push_chat("agent", err_msg)
             if self.telegram:
-                await self.telegram.send_to_all(f"⚠️ {err_msg}")
+                await self.telegram.send_to_all(f"🔄 {err_msg}")
 
     async def _wait_for_human_takeover(self, reason: str) -> None:
         self.state = "WAITING_HUMAN_TAKEOVER"

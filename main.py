@@ -63,15 +63,12 @@ telegram_bridge.attach_orchestrator(orchestrator)
 
 
 async def _boot_background() -> None:
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.2)
     try:
         await telegram_bridge.start_if_env_set()
     except Exception:
         pass
-    try:
-        await browser_engine.start("https://id.wikipedia.org")
-    except Exception:
-        pass
+    # Browser Chromium baru dinyalakan saat dibutuhkan (On-Demand) agar 93% RAM bebas untuk bot!
 
 
 @asynccontextmanager

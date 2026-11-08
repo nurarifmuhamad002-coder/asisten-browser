@@ -46,8 +46,26 @@ class CloudBrowserEngine:
         self.show_som_badges: bool = False
         self._lock = asyncio.Lock()
         self._started = False
+        self._last_active: float = 0.0
+        self._idle_task: Optional[asyncio.Task] = None
+
+    def _touch(self) -> None:
+        import time as _t
+        self._last_active = _t.monotonic()
+
+    async def _idle_watchdog(self) -> None:
+        import time as _t
+        while self._started:
+            await asyncio.sleep(30)
+            if self._started and (_t.monotonic() - self._last_active > 300):
+                try:
+                    await self.stop()
+                except Exception:
+                    pass
+                break
 
     async def start(self, start_url: Optional[str] = None) -> None:
+        self._touch()
         if self._started:
             return
         self.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -72,6 +90,16 @@ class CloudBrowserEngine:
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
+                "--renderer-process-limit=1",
+                "--js-flags=--max-old-space-size=320",
+                "--disk-cache-size=1",
+                "--media-cache-size=1",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--mute-audio",
             ],
         )
         await self.context.add_init_script(
@@ -84,18 +112,23 @@ class CloudBrowserEngine:
                 req = route.request
                 rtype = req.resource_type
                 rurl = req.url.lower()
-                if rtype == "media" or any(
+                if rtype in ("media", "font") or any(
                     bad in rurl
                     for bad in (
                         "doubleclick.net",
                         "googlesyndication.com",
                         "adservice.google",
+                        "google-analytics.com",
+                        "googletagmanager.com",
                         "taboola.com",
                         "outbrain.com",
                         "criteo.com",
                         "scorecardresearch.com",
                         "amazon-adsystem.com",
                         "ads.yahoo.com",
+                        "consent.yahoo.com",
+                        "guce.yahoo.com",
+                        "opus.analytics.yahoo.com",
                         "video.media.yql.yahoo.com",
                         ".mp4",
                         ".m3u8",
@@ -122,12 +155,16 @@ class CloudBrowserEngine:
 
         await self._attach_page(self.page)
         self._started = True
+        self._touch()
+        if not self._idle_task or self._idle_task.done():
+            self._idle_task = asyncio.create_task(self._idle_watchdog())
 
-        initial_target = start_url or f"http://127.0.0.1:{self.internal_port}/demo-portal"
-        try:
-            await self.navigate(initial_target)
-        except Exception:
-            pass
+        initial_target = start_url or "about:blank"
+        if initial_target != "about:blank":
+            try:
+                await self.navigate(initial_target)
+            except Exception:
+                pass
 
     async def stop(self) -> None:
         self._started = False
@@ -284,6 +321,7 @@ class CloudBrowserEngine:
 
     async def ensure_alive(self) -> None:
         """Otomatis menghidupkan ulang Chromium jika tab/proses crash atau nge-freeze >4 detik."""
+        self._touch()
         needs_restart = False
         if not self._started or not self.context or not self.page:
             needs_restart = True
@@ -301,11 +339,11 @@ class CloudBrowserEngine:
                 needs_restart = True
 
         if needs_restart:
-            await asyncio.wait_for(self._force_restart(), timeout=18.0)
+            await asyncio.wait_for(self._force_restart(), timeout=25.0)
 
     async def _force_restart(self) -> None:
         try:
-            await asyncio.wait_for(self.stop(), timeout=4.0)
+            await asyncio.wait_for(self.stop(), timeout=5.0)
         except Exception:
             self._started = False
         for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
@@ -315,7 +353,7 @@ class CloudBrowserEngine:
                     lock_file.unlink()
                 except Exception:
                     pass
-        await self.start("https://id.wikipedia.org")
+        await self.start("about:blank")
 
     async def refresh_frame(self) -> str:
         """Mengambil screenshot terbaru secara eksplisit dan mengirimkannya ke semua klien UI."""
@@ -449,9 +487,18 @@ class CloudBrowserEngine:
                 await self.page.mouse.click(target_el["rect"]["centerX"], target_el["rect"]["centerY"])
             else:
                 return f"Elemen [{index}] tidak ditemukan di halaman."
-        except Exception:
+        except Exception as exc:
+            if "Target crashed" in str(exc) or "Target closed" in str(exc) or "closed" in str(exc).lower():
+                await self._force_restart()
+                return "Tab browser sempat penuh memori (auto-refresh bersih). Lanjutkan langkah berikutnya."
             if target_el:
-                await self.page.mouse.click(target_el["rect"]["centerX"], target_el["rect"]["centerY"])
+                try:
+                    await self.page.mouse.click(target_el["rect"]["centerX"], target_el["rect"]["centerY"])
+                except Exception as exc2:
+                    if "Target crashed" in str(exc2) or "closed" in str(exc2).lower():
+                        await self._force_restart()
+                        return "Tab browser sempat penuh memori (auto-refresh bersih)."
+                    raise
             else:
                 raise
 

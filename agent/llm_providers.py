@@ -45,11 +45,11 @@ async def _fetch_live_web_context(query: str) -> str:
             if needs_finance:
                 # Cari simbol ticker resmi lewat Yahoo Finance Search atau huruf kapital (misal QQQM, VOO, NVDA, BBCA)
                 tickers: List[str] = re.findall(r"\b([A-Z]{2,6}(?:\.[A-Z]{2})?)\b", query or "")
-                stop_caps = {"BRO", "GUA", "LIAT", "CEK", "DONG", "APA", "INI", "ITU", "DAN", "YANG", "WEB", "PDF", "SAHAM"}
+                stop_caps = {"BRO", "GUA", "LIAT", "BUKA", "CEK", "DONG", "APA", "INI", "ITU", "DAN", "YANG", "WEB", "PDF", "SAHAM"}
                 tickers = [t for t in tickers if t not in stop_caps]
                 if not tickers:
                     clean_fin = re.sub(
-                        r"\b(bro|gua|lu|liat|lihat|cek|berapa|harga|saham|etf|koin|kripto|crypto|kurs|emiten|indeks|sekarang|skrg|dong|hari|ini|tolong|tuh|nih|ya)\b",
+                        r"\b(bro|gua|lu|buka|bukain|liat|lihat|cek|berapa|harga|saham|etf|koin|kripto|crypto|kurs|emiten|indeks|sekarang|skrg|dong|hari|ini|tolong|tuh|nih|ya)\b",
                         " ",
                         q_low,
                     )
@@ -69,13 +69,16 @@ async def _fetch_live_web_context(query: str) -> str:
                             meta = res_list[0].get("meta", {})
                             price = meta.get("regularMarketPrice")
                             prev = meta.get("chartPreviousClose")
+                            d_high = meta.get("regularMarketDayHigh")
+                            d_low = meta.get("regularMarketDayLow")
                             cur = meta.get("currency", "")
                             name = meta.get("longName") or meta.get("shortName") or sym
                             diff_str = ""
                             if price is not None and prev:
                                 pct = ((price - prev) / prev) * 100
                                 diff_str = f" ({pct:+.2f}% dari penutupan sebelumnya {prev} {cur})"
-                            chunks.append(f"[DATA PASAR REAL-TIME YAHOO FINANCE] {name} ({sym}): {price} {cur}{diff_str}")
+                            hl_str = f" | High hari ini: {d_high} {cur}, Low hari ini: {d_low} {cur}" if d_high and d_low else ""
+                            chunks.append(f"[DATA PASAR REAL-TIME YAHOO FINANCE] {name} ({sym}): {price} {cur}{diff_str}{hl_str}")
 
             # Ambil cuplikan web live singkat
             from bs4 import BeautifulSoup

@@ -555,6 +555,18 @@ class TelegramBotBridge:
                 )
             return
 
+        # Jalur Kilat Pintar: jika user cuma nanya harga saham/kripto/kurs/pertanyaan umum tanpa aksi klik/isi form browser,
+        # jawab instan 2 detik meski habis dari menu Buka Web!
+        browser_action_words = (
+            "klik", "pencet", "ketik", "isi ", "isiin", "login", "masuk ", "scroll", "geser",
+            "download", "unduh", "halaman ini", "di web ini", "form", "formulir", "daftar", "submit", "buka ",
+        )
+        is_pure_price_or_qa = any(
+            w in low for w in ("saham", "harga", "etf", "kurs", "bitcoin", "btc", "kripto", "crypto", "ihsg", "kenapa", "knpa")
+        ) and not any(bw in low for bw in browser_action_words) and not has_url
+        if mode == "agent" and is_pure_price_or_qa:
+            mode = "chat"
+
         if mode == "chat":
             await self._send_chat_action(chat_id, "typing")
             await self.orchestrator._push_chat("user", text)

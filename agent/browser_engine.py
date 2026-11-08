@@ -42,6 +42,7 @@ class CloudBrowserEngine:
         self._cdp: Optional[CDPSession] = None
 
         self.latest_frame_b64: str = ""
+        self._cached_title: str = ""
         self.show_som_badges: bool = False
         self._lock = asyncio.Lock()
         self._started = False
@@ -76,6 +77,41 @@ class CloudBrowserEngine:
         await self.context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
+
+        # Blokir iklan berat, tracker, & video streaming agar portal berat (Yahoo Finance, berita, dll) 5x lebih ngebut & hemat RAM!
+        async def _block_heavy_bloat(route: Any) -> None:
+            try:
+                req = route.request
+                rtype = req.resource_type
+                rurl = req.url.lower()
+                if rtype == "media" or any(
+                    bad in rurl
+                    for bad in (
+                        "doubleclick.net",
+                        "googlesyndication.com",
+                        "adservice.google",
+                        "taboola.com",
+                        "outbrain.com",
+                        "criteo.com",
+                        "scorecardresearch.com",
+                        "amazon-adsystem.com",
+                        "ads.yahoo.com",
+                        "video.media.yql.yahoo.com",
+                        ".mp4",
+                        ".m3u8",
+                        ".webm",
+                    )
+                ):
+                    await route.abort()
+                    return
+                await route.continue_()
+            except Exception:
+                pass
+
+        try:
+            await self.context.route("**/*", _block_heavy_bloat)
+        except Exception:
+            pass
 
         self.context.on("page", lambda new_page: asyncio.create_task(self._on_new_page(new_page)))
 
@@ -152,10 +188,10 @@ class CloudBrowserEngine:
                 "Page.startScreencast",
                 {
                     "format": "jpeg",
-                    "quality": 72,
+                    "quality": 52,
                     "maxWidth": self.VIEWPORT_WIDTH,
                     "maxHeight": self.VIEWPORT_HEIGHT,
-                    "everyNthFrame": 1,
+                    "everyNthFrame": 6,
                 },
             )
         except Exception:
@@ -180,7 +216,7 @@ class CloudBrowserEngine:
                     "type": "frame",
                     "data": data_b64,
                     "url": self._display_url(self.page.url if self.page else ""),
-                    "title": await self._safe_title(),
+                    "title": self._cached_title,
                 }
             )
 
@@ -229,9 +265,11 @@ class CloudBrowserEngine:
         if not self.page:
             return ""
         try:
-            return await self.page.title()
+            t = await asyncio.wait_for(self.page.title(), timeout=2.5)
+            self._cached_title = t or ""
+            return self._cached_title
         except Exception:
-            return ""
+            return self._cached_title
 
     async def _broadcast_page_meta(self) -> None:
         if not self.page:
@@ -245,7 +283,7 @@ class CloudBrowserEngine:
         )
 
     async def ensure_alive(self) -> None:
-        """Otomatis menghidupkan ulang Chromium jika tab/proses crash di tengah jalan."""
+        """Otomatis menghidupkan ulang Chromium jika tab/proses crash atau nge-freeze >4 detik."""
         needs_restart = False
         if not self._started or not self.context or not self.page:
             needs_restart = True
@@ -258,20 +296,26 @@ class CloudBrowserEngine:
                     else:
                         self.page = await self.context.new_page()
                         await self._attach_page(self.page)
-                await self.page.evaluate("1")
+                await asyncio.wait_for(self.page.evaluate("1"), timeout=4.5)
             except Exception:
                 needs_restart = True
 
         if needs_restart:
-            await self.stop()
-            for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-                lock_file = self.profile_dir / lock_name
-                if lock_file.exists() or lock_file.is_symlink():
-                    try:
-                        lock_file.unlink()
-                    except Exception:
-                        pass
-            await self.start("https://id.wikipedia.org")
+            await asyncio.wait_for(self._force_restart(), timeout=18.0)
+
+    async def _force_restart(self) -> None:
+        try:
+            await asyncio.wait_for(self.stop(), timeout=4.0)
+        except Exception:
+            self._started = False
+        for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lock_file = self.profile_dir / lock_name
+            if lock_file.exists() or lock_file.is_symlink():
+                try:
+                    lock_file.unlink()
+                except Exception:
+                    pass
+        await self.start("https://id.wikipedia.org")
 
     async def refresh_frame(self) -> str:
         """Mengambil screenshot terbaru secara eksplisit dan mengirimkannya ke semua klien UI."""
@@ -303,28 +347,37 @@ class CloudBrowserEngine:
 
     async def observe(self, annotated_screenshot: bool = True) -> Dict[str, Any]:
         """
-        Membaca kondisi halaman secara menyeluruh (DOM + elemen interaktif + screenshot Vision).
+        Membaca kondisi halaman secara menyeluruh (DOM + elemen interaktif + screenshot Vision)
+        dengan batas waktu ketat agar TIDAK PERNAH nyangkut di web berat.
         """
         await self.ensure_alive()
         if not self.page:
             raise RuntimeError("Browser belum siap.")
         try:
-            dom_state = await inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges))
+            dom_state = await asyncio.wait_for(
+                inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges)),
+                timeout=6.5,
+            )
         except Exception:
-            await self.stop()
-            await self.ensure_alive()
-            dom_state = await inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges))
+            await self._force_restart()
+            dom_state = await asyncio.wait_for(
+                inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges)),
+                timeout=6.5,
+            )
 
         screenshot_b64 = ""
         try:
-            raw = await self.page.screenshot(type="jpeg", quality=46, timeout=6000, animations="disabled")
+            raw = await self.page.screenshot(type="jpeg", quality=46, timeout=5000, animations="disabled")
             screenshot_b64 = base64.b64encode(raw).decode("ascii")
             self.latest_frame_b64 = screenshot_b64
         except Exception:
             screenshot_b64 = self.latest_frame_b64
 
         if annotated_screenshot and not self.show_som_badges:
-            await clear_som_badges(self.page)
+            try:
+                await asyncio.wait_for(clear_som_badges(self.page), timeout=2.0)
+            except Exception:
+                pass
 
         dom_state["url_display"] = self._display_url(dom_state.get("url", ""))
         dom_state["screenshot_b64"] = screenshot_b64

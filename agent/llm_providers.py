@@ -43,12 +43,17 @@ async def _fetch_live_web_context(query: str) -> str:
             follow_redirects=True,
         ) as client:
             if needs_finance:
-                # Cari simbol ticker resmi lewat Yahoo Finance Search atau huruf kapital (misal QQQM, NVDA, BBCA)
+                # Cari simbol ticker resmi lewat Yahoo Finance Search atau huruf kapital (misal QQQM, VOO, NVDA, BBCA)
                 tickers: List[str] = re.findall(r"\b([A-Z]{2,6}(?:\.[A-Z]{2})?)\b", query or "")
-                stop_caps = {"BRO", "GUA", "LIAT", "CEK", "DONG", "APA", "INI", "ITU", "DAN", "YANG", "WEB", "PDF"}
+                stop_caps = {"BRO", "GUA", "LIAT", "CEK", "DONG", "APA", "INI", "ITU", "DAN", "YANG", "WEB", "PDF", "SAHAM"}
                 tickers = [t for t in tickers if t not in stop_caps]
                 if not tickers:
-                    clean_fin = re.sub(r"\b(bro|liat|lihat|cek|berapa|harga|sekarang|dong|hari|ini|tolong)\b", " ", q_low).strip()
+                    clean_fin = re.sub(
+                        r"\b(bro|gua|lu|liat|lihat|cek|berapa|harga|saham|etf|koin|kripto|crypto|kurs|emiten|indeks|sekarang|skrg|dong|hari|ini|tolong|tuh|nih|ya)\b",
+                        " ",
+                        q_low,
+                    )
+                    clean_fin = re.sub(r"\s+", " ", clean_fin).strip()
                     if clean_fin:
                         rs = await client.get("https://query2.finance.yahoo.com/v1/finance/search", params={"q": clean_fin, "quotesCount": 3})
                         if rs.status_code == 200:

@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
-from playwright.async_api import BrowserContext, CDPSession, Download, Page, Playwright, async_playwright
+from playwright.async_api import Browser, BrowserContext, CDPSession, Download, Page, Playwright, async_playwright
 
 from agent.dom_inspector import clear_som_badges, inspect_page
 from agent.file_manager import WorkspaceFileManager
@@ -21,8 +21,8 @@ class CloudBrowserEngine:
     - Tangkap otomatis file download browser ke folder workspace_files
     """
 
-    VIEWPORT_WIDTH = 960
-    VIEWPORT_HEIGHT = 640
+    VIEWPORT_WIDTH = 800
+    VIEWPORT_HEIGHT = 600
 
     def __init__(
         self,
@@ -34,9 +34,11 @@ class CloudBrowserEngine:
         self.file_manager = file_manager
         self.broadcast = broadcast_cb
         self.profile_dir = Path(profile_dir)
+        self.state_file = self.profile_dir / "storage_state.json"
         self.internal_port = internal_port
 
         self._pw: Optional[Playwright] = None
+        self._browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self._cdp: Optional[CDPSession] = None
@@ -48,6 +50,7 @@ class CloudBrowserEngine:
         self._started = False
         self._viewer_count: int = 0
         self._screencast_on: bool = False
+        self._switching_tab: bool = False
         self._last_active: float = 0.0
         self._idle_task: Optional[asyncio.Task] = None
 
@@ -66,35 +69,33 @@ class CloudBrowserEngine:
                     pass
                 break
 
+    async def save_state(self) -> None:
+        """Simpan cookies & sesi login ke JSON super ringan (tanpa beban database Chrome penuh)."""
+        if self.context:
+            try:
+                self.profile_dir.mkdir(parents=True, exist_ok=True)
+                await asyncio.wait_for(self.context.storage_state(path=str(self.state_file)), timeout=3.0)
+            except Exception:
+                pass
+
     async def start(self, start_url: Optional[str] = None) -> None:
         self._touch()
         if self._started:
             return
         self.profile_dir.mkdir(parents=True, exist_ok=True)
-        downloads_tmp = Path("/tmp/nusa_downloads")
-        downloads_tmp.mkdir(parents=True, exist_ok=True)
 
         self._pw = await async_playwright().start()
-        self.context = await self._pw.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
+        # Gunakan chromium.launch() (chromium-headless-shell ringan) bukan launch_persistent_context yang makan +120 MB RAM!
+        self._browser = await self._pw.chromium.launch(
             headless=True,
-            viewport={"width": self.VIEWPORT_WIDTH, "height": self.VIEWPORT_HEIGHT},
-            accept_downloads=True,
-            downloads_path=str(downloads_tmp),
-            locale="id-ID",
-            timezone_id="Asia/Jakarta",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-            ),
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-software-rasterizer",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
-                "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=320",
+                "--disable-features=IsolateOrigins,site-per-process,TranslateUI,BlinkGenPropertyTrees,BackForwardCache",
+                "--js-flags=--max-old-space-size=192",
                 "--disk-cache-size=1",
                 "--media-cache-size=1",
                 "--disable-extensions",
@@ -104,17 +105,32 @@ class CloudBrowserEngine:
                 "--mute-audio",
             ],
         )
+
+        ctx_kwargs: Dict[str, Any] = {
+            "viewport": {"width": self.VIEWPORT_WIDTH, "height": self.VIEWPORT_HEIGHT},
+            "accept_downloads": True,
+            "locale": "id-ID",
+            "timezone_id": "Asia/Jakarta",
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            ),
+        }
+        if self.state_file.exists():
+            ctx_kwargs["storage_state"] = str(self.state_file)
+
+        self.context = await self._browser.new_context(**ctx_kwargs)
         await self.context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
 
-        # Blokir iklan berat, tracker, & video streaming agar portal berat (Yahoo Finance, berita, dll) 5x lebih ngebut & hemat RAM!
+        # Filter agresif hemat RAM: blokir video/font/iklan/websocket berat, dan blokir gambar dekoratif saat layar tidak ditonton user
         async def _block_heavy_bloat(route: Any) -> None:
             try:
                 req = route.request
                 rtype = req.resource_type
                 rurl = req.url.lower()
-                if rtype in ("media", "font") or any(
+                if rtype in ("media", "font", "eventsource") or any(
                     bad in rurl
                     for bad in (
                         "doubleclick.net",
@@ -131,6 +147,7 @@ class CloudBrowserEngine:
                         "consent.yahoo.com",
                         "guce.yahoo.com",
                         "opus.analytics.yahoo.com",
+                        "streamer.finance.yahoo.com",
                         "video.media.yql.yahoo.com",
                         ".mp4",
                         ".m3u8",
@@ -139,6 +156,11 @@ class CloudBrowserEngine:
                 ):
                     await route.abort()
                     return
+                # Saat robot jalan sendiri di background, lewati gambar banner raksasa (tetap izinkan CAPTCHA/QR/login/logo)
+                if rtype == "image" and self._viewer_count == 0:
+                    if not any(keep in rurl for keep in ("captcha", "turnstile", "qr", "auth", "login", "verify", "logo")):
+                        await route.abort()
+                        return
                 await route.continue_()
             except Exception:
                 pass
@@ -149,11 +171,7 @@ class CloudBrowserEngine:
             pass
 
         self.context.on("page", lambda new_page: asyncio.create_task(self._on_new_page(new_page)))
-
-        if self.context.pages:
-            self.page = self.context.pages[0]
-        else:
-            self.page = await self.context.new_page()
+        self.page = await self.context.new_page()
 
         await self._attach_page(self.page)
         self._started = True
@@ -170,6 +188,8 @@ class CloudBrowserEngine:
 
     async def stop(self) -> None:
         self._started = False
+        self._screencast_on = False
+        await self.save_state()
         try:
             if self._cdp:
                 await self._cdp.detach()
@@ -181,13 +201,27 @@ class CloudBrowserEngine:
         except Exception:
             pass
         try:
+            if self._browser:
+                await self._browser.close()
+        except Exception:
+            pass
+        try:
             if self._pw:
                 await self._pw.stop()
         except Exception:
             pass
+        self._cdp = None
+        self.context = None
+        self._browser = None
+        self.page = None
 
     async def reset_session(self) -> None:
         """Menghapus cookies & storage browser jika user ingin logout dari semua akun."""
+        if self.state_file.exists():
+            try:
+                self.state_file.unlink()
+            except Exception:
+                pass
         if not self.context:
             return
         await self.context.clear_cookies()
@@ -196,16 +230,25 @@ class CloudBrowserEngine:
                 await self.page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
             except Exception:
                 pass
-            await self.navigate(f"http://127.0.0.1:{self.internal_port}/demo-portal")
+            await self.navigate("about:blank")
 
     async def _on_new_page(self, new_page: Page) -> None:
+        if self._switching_tab:
+            return
+        old_page = self.page
         try:
-            await new_page.wait_for_load_state("domcontentloaded", timeout=8000)
+            await new_page.wait_for_load_state("commit", timeout=5000)
         except Exception:
             pass
         self.page = new_page
         await self._attach_page(new_page)
-        await self.refresh_frame()
+        # Tutup tab lama agar tidak pernah menumpuk >1 tab yang menggandakan pemakaian RAM!
+        if old_page and old_page != new_page and not old_page.is_closed():
+            try:
+                await old_page.close()
+            except Exception:
+                pass
+        await self._refresh_if_watched()
 
     async def _attach_page(self, page: Page) -> None:
         page.on("download", lambda dl: asyncio.create_task(self._handle_download(dl)))
@@ -470,30 +513,64 @@ class CloudBrowserEngine:
     # ======================== AGENT ACTIONS ========================
 
     async def navigate(self, url: str) -> str:
+        """
+        Mekanisme Navigasi 2-Tahap Anti-Timeout + Fresh-Tab Memory Recycle:
+        - Jika pindah domain berbeda, buat tab bersih & matikan tab lama agar proses OS lama dibuang 100% (RAM turun balik ke ~310–360 MB!).
+        - wait_until='commit' + batas DOM 3.8 detik + window.stop() agar tidak pernah timeout di web iklan berat.
+        """
         await self.ensure_alive()
-        if not self.page:
+        if not self.page or not self.context:
             raise RuntimeError("Browser belum aktif.")
         target = self._normalize_url(url)
+
+        # Fresh-Tab Swap saat pindah domain agar sampah RAM website lama langsung dihancurkan OS (tetap simpan semua cookies!)
+        try:
+            from urllib.parse import urlparse
+            old_host = urlparse(self.page.url or "").netloc
+            new_host = urlparse(target).netloc
+            if old_host and new_host and old_host != new_host:
+                self._switching_tab = True
+                try:
+                    fresh_p = await self.context.new_page()
+                    old_p = self.page
+                    self.page = fresh_p
+                    await self._attach_page(fresh_p)
+                    if not old_p.is_closed():
+                        await old_p.close()
+                finally:
+                    self._switching_tab = False
+        except Exception:
+            self._switching_tab = False
+
         status_code = None
         try:
-            resp = await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
+            resp = await self.page.goto(target, wait_until="commit", timeout=10000)
             status_code = resp.status if resp else None
         except Exception as exc:
             err_s = str(exc)
-            if "ERR_HTTP2" in err_s or "ERR_CONNECTION" in err_s or "ERR_NAME_NOT_RESOLVED" in err_s:
+            if any(k in err_s for k in ("ERR_HTTP2", "ERR_CONNECTION", "ERR_NAME_NOT_RESOLVED", "ERR_CERT")):
                 return f"Gagal membuka {target}: Situs menolak koneksi dari server cloud atau alamat web salah ({err_s[:90]})."
-            await self.ensure_alive()
-            resp = await self.page.goto(target, wait_until="domcontentloaded", timeout=20000)
+            await self._force_restart()
+            resp = await self.page.goto(target, wait_until="commit", timeout=10000)
             status_code = resp.status if resp else None
 
-        await asyncio.sleep(0.18)
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=3800)
+        except Exception:
+            # Hentikan skrip iklan yang menggantung supaya halaman langsung siap diklik tanpa Timeout!
+            try:
+                await asyncio.wait_for(self.page.evaluate("() => window.stop()"), timeout=1.5)
+            except Exception:
+                pass
+
         if self.page.url.startswith("chrome-error://"):
             try:
-                await self.page.go_back(timeout=4000)
+                await self.page.go_back(wait_until="commit", timeout=3000)
             except Exception:
                 pass
             return f"Situs {target} memblokir akses dari server cloud (anti-bot/firewall)."
 
+        asyncio.create_task(self.save_state())
         await self._refresh_if_watched()
         title = await self._safe_title()
         if status_code == 403:

@@ -536,17 +536,35 @@ class TelegramBotBridge:
         # -------------------- EKSEKUSI SESUAI MODE AKTIF --------------------
         mode = self.chat_modes.get(chat_id, "chat")
 
-        # Auto-switch pintar: kalau masih di mode Ngobrol tapi user jelas minta buka web / kasih URL
-        has_url = bool(re.search(r"(https?://[^\s]+|(?:[a-z0-9\-]+\.)+(?:com|id|co\.id|org|net|go\.id|ac\.id|sa))", low))
-        starts_open = low.startswith(("buka web ", "buka situs ", "buka halaman ", "buka link ", "masuk ke web "))
-        if mode == "chat" and (starts_open or (has_url and any(w in low for w in ("buka", "cek", "kerjain", "rangkum", "masuk")))):
-            if any(w in low for w in ("kerjain", "rangkum", "simpan", "isi", "cari di")):
+        # Auto-switch pintar: deteksi bahasa sehari-hari ("lu masuk ke web nya bro", "bukain web ...", URL, dll) dimanapun di kalimat!
+        has_url = bool(re.search(r"(https?://[^\s]+|(?:[a-z0-9\-]+\.)+(?:com|id|co\.id|org|net|go\.id|ac\.id|sa|io|app))", low))
+        mentions_open_web = any(
+            p in low
+            for p in (
+                "buka web", "bukain web", "buka situs", "buka halaman", "buka link",
+                "masuk ke web", "masuk web", "masuk situs", "ke web nya", "ke webnya",
+                "cek web", "liat web", "lihat web",
+            )
+        )
+        refers_prev_context = any(p in low for p in ("web nya", "webnya", "situsnya", "linknya", "link nya", "ke sana", "kesana"))
+
+        if mode == "chat" and (mentions_open_web or has_url):
+            if refers_prev_context or any(w in low for w in ("kerjain", "rangkum", "simpan", "isi", "cari", "booking", "pesan", "klik")):
                 mode = "agent"
                 self.chat_modes[chat_id] = "agent"
             else:
-                clean_q = re.sub(r"^(buka\s+web|buka\s+situs|buka\s+halaman|buka\s+link|buka)\s+", "", text, flags=re.I).strip()
-                text = clean_q or text
-                mode = "open_web"
+                clean_q = re.sub(
+                    r"^.*?\b(buka\s+web|bukain\s+web|buka\s+situs|buka\s+halaman|buka\s+link|masuk\s+ke\s+web|masuk\s+web|buka)\b\s*",
+                    "",
+                    text,
+                    flags=re.I,
+                ).strip()
+                if clean_q and clean_q.lower() not in ("bro", "dong", "ya", "nih"):
+                    text = clean_q
+                    mode = "open_web"
+                else:
+                    mode = "agent"
+                    self.chat_modes[chat_id] = "agent"
 
         if mode == "open_web":
             wait_mid = await self.send_text(chat_id, f"🌐 Lagi ngebukain web '{text}'...")
@@ -567,10 +585,11 @@ class TelegramBotBridge:
                 )
             return
 
-        # Deteksi pintar: bedakan perintah klik/isi web vs obrolan / cek harga saham / tanya jawab kilat!
+        # Deteksi pintar: bedakan perintah klik/isi/booking web vs obrolan / cek harga saham kilat!
         strict_browser_verbs = (
             "klik", "pencet", "ketik", "isi ", "isiin", "login", "scroll", "geser",
-            "download", "unduh", "halaman ini", "di web ini", "di halaman", "form", "formulir", "submit", "tombol", "pilih ",
+            "download", "unduh", "halaman ini", "di web ini", "di halaman", "form", "formulir",
+            "submit", "tombol", "pilih ", "booking", "pesan kursi", "masuk ke web", "ke web nya", "ke webnya",
         )
         has_strict_browser_verb = any(bw in low for bw in strict_browser_verbs)
         is_price_or_chat_query = (

@@ -219,10 +219,11 @@ function syncUiState(data) {
     openBrowserSheet('login', data.takeover_reason);
   }
 
-  // Footer tombol selesai login di dalam sheet
+  // Footer tombol selesai login di dalam sheet (sembunyikan bila Kartu Isi Cepat sudah tampil)
+  const hasQuickCard = !document.getElementById('quickCredCard').classList.contains('hidden');
   document
     .getElementById('sheetTakeoverFooter')
-    .classList.toggle('hidden', appState.state !== 'WAITING_HUMAN_TAKEOVER');
+    .classList.toggle('hidden', appState.state !== 'WAITING_HUMAN_TAKEOVER' || hasQuickCard);
 
   prevServerState = appState.state;
   redrawCanvas();
@@ -415,11 +416,130 @@ async function decideApproval(containerId, decision) {
 
 /* ================= SLIDE-UP LIVE BROWSER SHEET ================= */
 
+let detectedCredFields = [];
+
+async function loadQuickCredentialFields(isLoginMode) {
+  const card = document.getElementById('quickCredCard');
+  const box = document.getElementById('quickCredInputs');
+  const manualBar = document.getElementById('manualTypeBar');
+  const footer = document.getElementById('sheetTakeoverFooter');
+
+  if (!isLoginMode) {
+    card.classList.add('hidden');
+    manualBar.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    const res = await fetch('./api/browser/login-fields');
+    const data = await res.json();
+    detectedCredFields = (data && data.fields) || [];
+  } catch (e) {
+    detectedCredFields = [];
+  }
+
+  if (!detectedCredFields.length) {
+    // Halaman login pakai QR / Tombol Google / Captcha (tidak ada input teks password)
+    card.classList.add('hidden');
+    manualBar.classList.remove('hidden');
+    footer.classList.toggle('hidden', appState.state !== 'WAITING_HUMAN_TAKEOVER');
+    return;
+  }
+
+  box.innerHTML = '';
+  let firstEmptyId = null;
+
+  detectedCredFields.forEach((f, i) => {
+    const inpId = 'qc_inp_' + i;
+    const isSecret = f.kind === 'password';
+    const initVal = f.current_value || '';
+    if (!firstEmptyId && !initVal) firstEmptyId = inpId;
+
+    const row = document.createElement('div');
+    row.className = 'qc-field';
+    row.innerHTML = `
+      <label for="${inpId}">${isSecret ? '🔑' : (f.kind === 'otp' ? '🔢' : '👤')} ${esc(f.label)}</label>
+      <div class="qc-input-row">
+        <input
+          id="${inpId}"
+          type="${isSecret ? 'password' : 'text'}"
+          value="${esc(initVal)}"
+          placeholder="Ketik ${esc(f.label)} di sini..."
+          autocomplete="off"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();submitQuickCredentials();}"
+        />
+        ${isSecret ? `<button type="button" class="qc-eye-btn" onclick="toggleQuickPass('${inpId}', this)">👁️</button>` : ''}
+      </div>
+    `;
+    box.appendChild(row);
+  });
+
+  card.classList.remove('hidden');
+  manualBar.classList.add('hidden');
+  // Sembunyikan footer dobel saat kartu isi cepat tampil supaya 1 tombol jelas!
+  footer.classList.add('hidden');
+
+  setTimeout(() => {
+    const target = document.getElementById(firstEmptyId || 'qc_inp_0');
+    if (target) target.focus();
+  }, 120);
+}
+
+function toggleQuickPass(inpId, btn) {
+  const inp = document.getElementById(inpId);
+  if (!inp) return;
+  const toText = inp.type === 'password';
+  inp.type = toText ? 'text' : 'password';
+  btn.textContent = toText ? '🙈' : '👁️';
+}
+
+function toggleManualTypeBar() {
+  const manualBar = document.getElementById('manualTypeBar');
+  const footer = document.getElementById('sheetTakeoverFooter');
+  manualBar.classList.toggle('hidden');
+  if (appState.state === 'WAITING_HUMAN_TAKEOVER') {
+    footer.classList.remove('hidden');
+  }
+}
+
+async function submitQuickCredentials() {
+  const btn = document.getElementById('quickCredSubmitBtn');
+  const items = [];
+  detectedCredFields.forEach((f, i) => {
+    const inp = document.getElementById('qc_inp_' + i);
+    if (inp && inp.value !== '') {
+      items.push({ selector: f.selector, value: inp.value });
+    }
+  });
+
+  if (!items.length) {
+    alert('Ketik dulu Password / kodenya di kotak atas ya bro!');
+    return;
+  }
+
+  const origTxt = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '⏳ Mengisi & Melanjutkan...';
+
+  try {
+    await fetch('./api/browser/fill-credentials', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items, auto_resume: true }),
+    });
+    closeBrowserSheet();
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = origTxt;
+  }
+}
+
 function openBrowserSheet(mode, reasonText) {
   const sheet = document.getElementById('browserSheet');
   const title = document.getElementById('sheetTitle');
-  if (mode === 'login' || appState.state === 'WAITING_HUMAN_TAKEOVER') {
-    title.textContent = '🔐 Silakan Login di Layar Bawah';
+  const isLogin = mode === 'login' || appState.state === 'WAITING_HUMAN_TAKEOVER';
+  if (isLogin) {
+    title.textContent = '🔐 Isi Login Cepat';
   } else {
     title.textContent = '🖥️ Layar Browser Live';
   }
@@ -428,6 +548,7 @@ function openBrowserSheet(mode, reasonText) {
     .classList.toggle('hidden', appState.state !== 'WAITING_HUMAN_TAKEOVER');
   sheet.classList.remove('hidden');
   redrawCanvas();
+  loadQuickCredentialFields(isLogin);
 }
 
 function closeBrowserSheet() {

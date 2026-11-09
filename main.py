@@ -309,6 +309,31 @@ async def browser_reload():
     return {"ok": True}
 
 
+class CredentialItem(BaseModel):
+    selector: str
+    value: str
+
+
+class CredentialFillPayload(BaseModel):
+    items: list[CredentialItem] = []
+    auto_resume: bool = True
+
+
+@app.get("/api/browser/login-fields")
+async def get_browser_login_fields():
+    fields = await browser_engine.get_credential_fields()
+    return {"ok": True, "fields": fields, "url": browser_engine._display_url(browser_engine.page.url) if browser_engine.page else ""}
+
+
+@app.post("/api/browser/fill-credentials")
+async def fill_browser_credentials(payload: CredentialFillPayload):
+    raw_items = [{"selector": it.selector, "value": it.value} for it in payload.items]
+    filled = await browser_engine.fill_credential_fields(raw_items)
+    if payload.auto_resume:
+        await orchestrator.resume_from_takeover()
+    return {"ok": True, "filled": filled}
+
+
 @app.post("/api/browser/som")
 async def browser_som_toggle(payload: SomPayload):
     await browser_engine.set_som_badges(payload.enabled)

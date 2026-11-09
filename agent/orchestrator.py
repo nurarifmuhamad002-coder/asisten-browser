@@ -4,7 +4,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 from agent.browser_engine import CloudBrowserEngine
 from agent.file_manager import WorkspaceFileManager
-from agent.guardrails import inspect_element_sensitivity, is_credential_element
+from agent.guardrails import inspect_element_sensitivity, is_credential_element, is_practice_sandbox_url
 from agent.llm_providers import LLMConfig, MultiLLMBrain
 from agent.telegram_bridge import TelegramBotBridge
 
@@ -369,10 +369,19 @@ class AgentOrchestrator:
             idx = int(action.get("index", -1))
             target_el = next((e for e in elements if e["index"] == idx), None)
             if is_credential_element(target_el):
-                await self._wait_for_human_takeover(
-                    "Ketemu kolom Password/OTP. Silakan ketik sendiri di layar biar rahasia akun lu aman."
+                cur_url = dom_state.get("url", "")
+                typed_val = str(action.get("text", "")).strip()
+                # Hanya izinkan isi otomatis jika ini situs latihan/sandbox publik DAN nilai dummy memang ditulis langsung oleh user di perintahnya
+                is_explicit_dummy = (
+                    is_practice_sandbox_url(cur_url)
+                    and bool(typed_val)
+                    and typed_val.lower() in self.current_goal.lower()
                 )
-                return "User mengisi kredensial sendiri."
+                if not is_explicit_dummy:
+                    await self._wait_for_human_takeover(
+                        "Ketemu kolom Password/OTP. Isi langsung di kotak praktis di atas layar HP lu (nggak perlu tap gambar kecil!)."
+                    )
+                    return "User mengisi kredensial sendiri."
 
         if act_name in ("click", "ask_approval"):
             idx = int(action.get("index", -1))

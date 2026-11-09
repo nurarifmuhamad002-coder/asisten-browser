@@ -92,22 +92,35 @@
   <!-- ========================================================================= -->
   <div id="browserSheet" class="browser-sheet hidden">
     <div class="sheet-header">
-      <div id="sheetTitle" class="sheet-title">🔐 Silakan Login Sendiri</div>
+      <div id="sheetTitle" class="sheet-title">🔐 Isi Login Cepat</div>
       <div class="sheet-tools">
+        <button id="toggleManualBarBtn" class="small-pill" onclick="toggleManualTypeBar()">👆 Sentuh Manual</button>
         <button id="zoomBtn" class="small-pill" onclick="toggleZoom()">🔍 Perbesar</button>
         <button class="small-pill" onclick="closeBrowserSheet()">Tutup ✕</button>
       </div>
     </div>
 
-    <!-- Bar Ketik Gampang buat Keyboard HP -->
-    <div class="sheet-type-bar">
+    <!-- KARTU ISI CEPAT KHUSUS HP (NGGAK PERLU TAP GAMBAR KECIL DI LAYAR!) -->
+    <div id="quickCredCard" class="quick-cred-card hidden">
+      <div class="qc-head">
+        <span>⚡ <b>Isi Langsung di Sini</b> — Nggak perlu tap gambar kecil!</span>
+        <span class="qc-badge">🔒 Privat (Nggak lewat AI)</span>
+      </div>
+      <div id="quickCredInputs" class="qc-inputs"></div>
+      <button id="quickCredSubmitBtn" class="big-btn btn-green" onclick="submitQuickCredentials()">
+        🚀 Masukkan &amp; Lanjut Otomatis!
+      </button>
+    </div>
+
+    <!-- Bar Ketik Manual (Disembunyikan otomatis saat Kartu Isi Cepat tampil biar nggak puyeng!) -->
+    <div id="manualTypeBar" class="sheet-type-bar hidden">
       <button class="small-pill" onclick="scrollBrowser(-340)">▲</button>
       <button class="small-pill" onclick="scrollBrowser(340)">▼</button>
       <input
         id="mobileKeyInput"
         type="text"
         autocomplete="off"
-        placeholder="Tap kolom di layar, lalu ketik di sini..."
+        placeholder="Tap kolom di layar bawah, lalu ketik di sini..."
         onkeydown="if(event.key==='Enter'){event.preventDefault();sendMobileText();}"
       />
       <button class="small-pill active" onclick="sendMobileText()">Ketik</button>
@@ -121,7 +134,7 @@
       </div>
     </div>
 
-    <!-- Footer Tombol Hijau Gede pas Mode Login -->
+    <!-- Footer Tombol Hijau Gede pas Mode Login Manual (mis. tombol Login Google / Captcha) -->
     <div id="sheetTakeoverFooter" class="sheet-footer">
       <button class="big-btn btn-green" onclick="finishLoginAndResume()">
         ✅ Udah Beres Login — Lanjut Kerjain!

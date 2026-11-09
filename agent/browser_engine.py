@@ -1265,3 +1265,95 @@ class CloudBrowserEngine:
         await self.page.keyboard.insert_text(text)
         await asyncio.sleep(0.08)
         await self.refresh_frame()
+
+    async def get_credential_fields(self) -> List[Dict[str, Any]]:
+        """Mendeteksi kolom Username/Email, Password, atau OTP di halaman agar user HP bisa isi langsung via form rapi tanpa tap-tap gambar kecil."""
+        if not self.page:
+            return []
+        try:
+            return await self.page.evaluate(
+                """() => {
+                    const cssEsc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([ #;?%&,.+*~\\':"!^$[\\]()=>|/@])/g, '\\\\$1');
+                    const fields = [];
+                    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]):not([type="file"])'));
+
+                    for (let i = 0; i < inputs.length; i++) {
+                        const el = inputs[i];
+                        if (el.disabled) continue;
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden') continue;
+
+                        const t = (el.getAttribute('type') || 'text').toLowerCase();
+                        const name = el.getAttribute('name') || '';
+                        const id = el.id || '';
+                        const ph = el.getAttribute('placeholder') || '';
+                        const aria = el.getAttribute('aria-label') || '';
+
+                        let lbl = '';
+                        if (id) {
+                            const l = document.querySelector(`label[for="${cssEsc(id)}"]`);
+                            if (l) lbl = (l.innerText || '').trim();
+                        }
+                        if (!lbl) {
+                            const wrapL = el.closest('label');
+                            if (wrapL) lbl = (wrapL.innerText || '').trim();
+                        }
+                        if (!lbl) {
+                            const prev = el.previousElementSibling;
+                            if (prev && (prev.innerText || '').trim().length <= 40) lbl = (prev.innerText || '').trim();
+                        }
+                        if (!lbl && el.parentElement) {
+                            const pPrev = el.parentElement.previousElementSibling;
+                            if (pPrev && (pPrev.innerText || '').trim().length <= 40) lbl = (pPrev.innerText || '').trim();
+                        }
+
+                        const combined = `${t} ${name} ${id} ${ph} ${aria} ${lbl}`.toLowerCase();
+                        const isPass = t === 'password' || /password|kata\\s*sandi|passcode/.test(combined);
+                        const isOtp = /\\b(otp|2fa|kode\\s*verifikasi|verification\\s*code|pin|token)\\b/.test(combined);
+                        const isUser = t === 'email' || /\\b(user|username|userid|login|email|nim|npm|nisn|nik|phone|telepon|no_hp)\\b/.test(combined);
+
+                        if (!isPass && !isOtp && !isUser) continue;
+
+                        let selector = '';
+                        if (id) selector = `#${cssEsc(id)}`;
+                        else if (name) selector = `input[name="${cssEsc(name)}"]`;
+                        else if (ph) selector = `input[placeholder="${cssEsc(ph)}"]`;
+                        else if (t === 'password') selector = 'input[type="password"]';
+                        if (!selector) continue;
+
+                        const cleanLbl = (lbl || ph || aria || name || (isPass ? 'Password' : (isOtp ? 'Kode OTP / PIN' : 'Username / Email'))).replace(/:$/, '').trim();
+                        fields.push({
+                            selector,
+                            label: cleanLbl,
+                            kind: isPass ? 'password' : (isOtp ? 'otp' : 'user'),
+                            current_value: isPass ? '' : (el.value || ''),
+                            has_existing_value: Boolean((el.value || '').trim()),
+                        });
+                    }
+                    return fields.slice(0, 4);
+                }"""
+            )
+        except Exception:
+            return []
+
+    async def fill_credential_fields(self, items: List[Dict[str, str]]) -> int:
+        """Mengisi kredensial langsung dari HP user ke DOM Playwright (100% privat, tidak pernah menyentuh AI)."""
+        if not self.page or not items:
+            return 0
+        filled = 0
+        for item in items:
+            sel = (item.get("selector") or "").strip()
+            val = item.get("value")
+            if not sel or val is None or val == "":
+                continue
+            try:
+                loc = self.page.locator(sel).first
+                await loc.scroll_into_view_if_needed(timeout=2000)
+                await loc.fill(str(val), timeout=3500)
+                filled += 1
+            except Exception:
+                continue
+        await asyncio.sleep(0.15)
+        await self.save_state()
+        await self.refresh_frame()
+        return filled

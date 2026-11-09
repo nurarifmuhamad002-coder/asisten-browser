@@ -88,6 +88,22 @@ def inspect_element_sensitivity(element: Optional[Dict[str, Any]]) -> Optional[D
     return None
 
 
+PRACTICE_SANDBOX_HOSTS = (
+    "testpages.eviltester.com",
+    "testpages.herokuapp.com",
+    "demoqa.com",
+    "the-internet.herokuapp.com",
+    "automationexercise.com",
+    "practicetestautomation.com",
+    "saucedemo.com",
+)
+
+
+def is_practice_sandbox_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(host in u for host in PRACTICE_SANDBOX_HOSTS)
+
+
 def is_credential_element(element: Optional[Dict[str, Any]]) -> bool:
     """
     Mencegah Agent mengetik langsung ke kolom password atau kode OTP/2FA.

@@ -539,6 +539,90 @@ html, body {
   color: #34d399;
 }
 
+/* Mobile Quick-Fill Credential Card (Anti-Puyeng HP!) */
+.quick-cred-card {
+  background: linear-gradient(180deg, #13222b 0%, #0f1920 100%);
+  border-bottom: 1.5px solid #00a884;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.qc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: #e2e8f0;
+  flex-wrap: wrap;
+}
+
+.qc-badge {
+  font-size: 11px;
+  background: rgba(16, 185, 129, 0.16);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  border-radius: 99px;
+  padding: 2px 8px;
+  font-weight: 600;
+}
+
+.qc-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.qc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.qc-field label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #94a3b8;
+}
+
+.qc-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.qc-input-row input {
+  flex: 1;
+  min-width: 0;
+  background: #1e2c35;
+  border: 1.5px solid #384c59;
+  color: #fff;
+  border-radius: 10px;
+  padding: 11px 13px;
+  font-size: 16px;
+}
+
+.qc-input-row input:focus {
+  outline: none;
+  border-color: #00a884;
+  box-shadow: 0 0 0 2px rgba(0, 168, 132, 0.22);
+}
+
+.qc-eye-btn {
+  background: #273742;
+  color: #e2e8f0;
+  border: 1px solid #3c4f5c;
+  border-radius: 10px;
+  height: 44px;
+  padding: 0 12px;
+  font-size: 15px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
 /* Mobile Typing Strip inside Browser Sheet */
 .sheet-type-bar {
   display: flex;

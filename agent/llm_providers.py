@@ -313,10 +313,10 @@ class MultiLLMBrain:
         live_ctx = await _fetch_live_web_context(message)
         chat_sys = (
             "Kamu adalah Asisten AI & Cloud Browser Operator pribadi berbahasa Indonesia santai (gua/lu/bro secukupnya). "
-            "PENTING: Kamu memang punya fitur Cloud Browser (lewat tombol '📝 Kerjain Tugas Web'), TAPI saat ini kamu sedang berada di jalur OBROLAN CEPAT (belum mengeksekusi klik web pada balasan ini). "
+            "Kamu punya fitur Cloud Browser otomatis — user TIDAK perlu menekan tombol mode apa pun, cukup ketik langsung perintahnya di chat! "
             "ATURAN ANTI-HALUSINASI MUTLAK: "
-            "1. DILARANG KERAS pura-pura sudah selesai mengerjakan tugas web/form, dan DILARANG KERAS menulis placeholder kurung siku seperti '[Laporan Hasil...]' atau mengarang hasil fiktif! "
-            "2. DILARANG bilang 'Sebagai AI saya tidak bisa membuka web' — jika user meminta mengerjakan sesuatu di website namun masuk ke mode obrolan, arahkan jujur & singkat: 'Tap tombol 📝 Kerjain Tugas Web lalu kirim perintahnya lagi ya bro biar robot browser langsung jalan!' "
+            "1. Pada balasan ini kamu sedang menjawab pertanyaan/obrolan cepat. DILARANG KERAS pura-pura sudah membuka web/mengisi form atau menulis placeholder kurung siku seperti '[Laporan Hasil...]'. "
+            "2. Jika user baru bertanya apakah bisa buka web / login / kerjain sesuatu tanpa menyebut web/tugasnya, jawab santai: 'Bisa banget bro! Langsung ketik aja mau buka web apa dan mau diapain, langsung gua sikat otomatis!' "
             "3. Jika tersedia 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka tersebut secara akurat. "
             "Jangan pakai simbol bintang (** atau *) berlebihan agar rapi di Telegram HP."
         )
@@ -386,6 +386,53 @@ class MultiLLMBrain:
             if resp.status_code == 200:
                 return resp.json()["choices"][0]["message"]["content"].strip()
         return "Koneksi AI sedang sibuk, coba kirim lagi bro."
+
+    async def classify_intent(
+        self,
+        message: str,
+        current_url: str = "",
+        recent_chat: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """
+        Klasifikasi otomatis <0.45 detik untuk kalimat ambigu agar user TIDAK PERLU menekan tombol mode dulu!
+        Mengembalikan: 'chat' | 'open_web' | 'agent'
+        """
+        if not self.config.has_api_key or self.config.provider != "gemini":
+            return "chat"
+
+        hist_tail = ""
+        for m in (recent_chat or [])[-4:]:
+            if m.get("role") in ("user", "agent"):
+                hist_tail += f"{m['role'].upper()}: {(m.get('text') or '')[:140]}\n"
+
+        sys_i = (
+            "Tentukan rute eksekusi untuk pesan user berikut menjadi TEPAT SATU JSON: {\"route\": \"chat\" | \"open_web\" | \"agent\"}.\n"
+            "- \"agent\": jika user menyuruh membuka/mengakses situs/akun/layanan web tertentu lalu melakukan aksi (login, isi form, klik, cari di web tertentu, rangkum halaman web, belanja, cek dashboard/classroom/portal, atau menindaklanjuti halaman browser yang sedang terbuka).\n"
+            "- \"open_web\": jika user HANYA menyuruh membuka 1 website/link saja tanpa tugas lanjutan (contoh: 'bukain web konami id', 'buka traveloka').\n"
+            "- \"chat\": jika user ngobrol biasa, bertanya pengetahuan umum/soal/coding, minta dibuatkan teks/surat/esai tanpa perlu buka website tertentu, atau tanya harga saham/kripto/kurs cepat."
+        )
+        u_txt = f"URL Browser Aktif: {current_url or '(kosong)'}\n{hist_tail}PESAN USER: {message}"
+        payload = {
+            "system_instruction": {"parts": [{"text": sys_i}]},
+            "contents": [{"role": "user", "parts": [{"text": u_txt}]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 30, "responseMimeType": "application/json"},
+        }
+        client = get_shared_http()
+        for m_name in ("gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"):
+            try:
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}",
+                    json=payload,
+                    timeout=3.2,
+                )
+                if r.status_code == 200:
+                    raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    route = _extract_json(raw).get("route", "chat")
+                    if route in ("chat", "open_web", "agent"):
+                        return route
+            except Exception:
+                continue
+        return "chat"
 
     async def analyze_media(
         self,

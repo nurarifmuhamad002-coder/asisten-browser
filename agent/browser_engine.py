@@ -1374,12 +1374,16 @@ class CloudBrowserEngine:
             return False
         login_selectors = [
             '#login-button',
+            '#identifierNext button',
+            '#passwordNext button',
             'button[type="submit"]',
             'input[type="submit"]',
             'button:has-text("Login")',
             'button:has-text("Log in")',
             'button:has-text("Sign in")',
             'button:has-text("Masuk")',
+            'button:has-text("Berikutnya")',
+            'button:has-text("Selanjutnya")',
             'button:has-text("Lanjut")',
             'button:has-text("Next")',
             'button:has-text("Verify")',

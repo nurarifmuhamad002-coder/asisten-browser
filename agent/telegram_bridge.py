@@ -16,9 +16,8 @@ if TYPE_CHECKING:
 
 MAIN_MENU_KB: Dict[str, Any] = {
     "keyboard": [
-        [{"text": "💬 Ngobrol AI"}, {"text": "📝 Kerjain Tugas Web"}],
-        [{"text": "🌐 Buka Web"}, {"text": "📸 Cek Layar"}],
-        [{"text": "📂 Daftar File"}, {"text": "🔒 Keamanan"}, {"text": "⏹️ Stop / Menu"}],
+        [{"text": "📸 Cek Layar"}, {"text": "📂 Daftar File"}],
+        [{"text": "🔒 Keamanan"}, {"text": "⏹️ Stop / Menu"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -249,24 +248,19 @@ class TelegramBotBridge:
             )
 
     async def _send_main_menu(self, chat_id: int, prefix: str = "") -> None:
-        cur_mode = self.chat_modes.get(chat_id, "chat")
-        mode_labels = {
-            "chat": "💬 Ngobrol AI Cepat",
-            "agent": "📝 Kerjain Tugas Web",
-            "open_web": "🌐 Buka Web",
-        }
         sec_status = f"🔒 Terkunci Khusus HP Lu (ID: {self.owner_id})" if self.is_locked else "⚠️ Belum Dikunci (Tap '🔒 Keamanan')"
         body = (
             f"{prefix}"
-            "🤖 Menu Utama Asisten Lu:\n"
-            f"• Mode aktif: {mode_labels.get(cur_mode, '💬 Ngobrol AI')}\n"
+            "🤖 Asisten Pintar Otomatis Aktif!\n"
             f"• Keamanan: {sec_status}\n\n"
-            "Tinggal tap tombol menu di bawah layar HP lu:\n"
-            "• 💬 Ngobrol AI — Tanya jawab & bantu tugas kilat\n"
-            "• 📝 Kerjain Tugas Web — Suruh AI jalanin web & bikin file\n"
-            "• 🌐 Buka Web — Bukain web tujuan & login aman\n"
+            "Sekarang lu NGGAK PERLU pencet mode apa-apa dulu — langsung ketik aja bebas di chat:\n"
+            "• Mau ngobrol / tanya soal / cek saham & BTC ➔ langsung dijawab kilat!\n"
+            "• Mau nyuruh buka web, login, isi form, belanja, atau riset jadi Word/Excel/PDF ➔ robot browser langsung jalan otomatis!\n\n"
+            "Tombol bantu cepat di bawah:\n"
             "• 📸 Cek Layar — Intip foto layar browser sekarang\n"
-            "• 🔒 Keamanan — Kunci bot & layar web khusus HP lu"
+            "• 📂 Daftar File — Ambil / hapus file hasil kerjaan\n"
+            "• 🔒 Keamanan — Kunci bot khusus HP lu\n"
+            "• ⏹️ Stop / Menu — Hentikan proses kapan aja"
         )
         await self.send_text(chat_id, body, reply_markup=MAIN_MENU_KB)
 
@@ -475,18 +469,18 @@ class TelegramBotBridge:
 
         # 1. START / MENU / STOP
         if low in ("/start", "/menu", "menu"):
-            if chat_id not in self.chat_modes:
-                self.chat_modes[chat_id] = "chat"
+            self.chat_modes[chat_id] = "auto"
             await self._send_main_menu(chat_id, "Halo bro! 👋 ")
             return
 
         if text == "⏹️ Stop / Menu" or low in ("/stop", "stop", "berhenti", "batal"):
             await self.orchestrator.stop_goal(silent=True)
+            self.chat_modes[chat_id] = "auto"
             await self._send_main_menu(chat_id, "⏹️ Proses yang lagi jalan udah dihentikan.\n\n")
             return
 
-        # 2. LANJUT SETELAH LOGIN
-        if low in ("/lanjut", "lanjut", "udah login", "sudah login"):
+        # 2. LANJUT SETELAH LOGIN (Hanya jika memang sedang menunggu takeover login!)
+        if low in ("/lanjut", "udah login", "sudah login") or (low == "lanjut" and self.orchestrator.state == "WAITING_HUMAN_TAKEOVER"):
             await self.orchestrator.resume_from_takeover()
             await self.send_text(chat_id, "✅ Oke sip, gua lanjutin kerjanya!", reply_markup=MAIN_MENU_KB)
             return
@@ -516,27 +510,12 @@ class TelegramBotBridge:
             )
             return
 
-        # 5. GANTI MODE LEWAT TOMBOL MENU
-        if text == "💬 Ngobrol AI" or low == "/ngobrol":
-            await self.orchestrator.stop_goal(silent=True)
-            self.chat_modes[chat_id] = "chat"
+        # Backward compatibility bila tombol/command lama ditekan
+        if text in ("💬 Ngobrol AI", "📝 Kerjain Tugas Web") or low in ("/ngobrol", "/tugas"):
+            self.chat_modes[chat_id] = "auto"
             await self.send_text(
                 chat_id,
-                "💬 Mode Ngobrol AI Aktif!\n\n"
-                "Sekarang lu bebas ngobrol santai, tanya soal, minta bikinin jawaban/esai, atau diskusi apa aja — gua jawab kilat tanpa nunggu browser!",
-                reply_markup=MAIN_MENU_KB,
-            )
-            return
-
-        if text == "📝 Kerjain Tugas Web" or low == "/tugas":
-            await self.orchestrator.stop_goal(silent=True)
-            self.chat_modes[chat_id] = "agent"
-            await self.send_text(
-                chat_id,
-                "📝 Mode Kerjain Tugas Web Aktif!\n\n"
-                "Ketik link/nama web + tugas yang mau dikerjain, contoh:\n"
-                "• buka id.wikipedia.org cari Sejarah Indonesia lalu simpan ke tugas.md\n"
-                "• kerjakan form / rangkum isi halaman yang sedang terbuka sekarang",
+                "⚡ Sekarang udah 100% Otomatis bro — nggak perlu pencet mode dulu! Langsung ketik aja mau ngobrol atau mau nyuruh kerjain tugas web apa!",
                 reply_markup=MAIN_MENU_KB,
             )
             return
@@ -546,58 +525,21 @@ class TelegramBotBridge:
             self.chat_modes[chat_id] = "open_web"
             await self.send_text(
                 chat_id,
-                "🌐 Mau buka web apa bro?\n\n"
-                "Langsung ketik alamat linknya (misal: allindonesia.imigrasi.go.id) ATAU nama layanannya (misal: Elharamain Wisata / Google Classroom):",
+                "🌐 Langsung ketik alamat link atau nama website-nya bro:",
                 reply_markup=MAIN_MENU_KB,
             )
             return
 
-        # -------------------- EKSEKUSI SESUAI MODE AKTIF --------------------
-        mode = self.chat_modes.get(chat_id, "chat")
-
-        # Auto-switch pintar: deteksi bahasa sehari-hari ("lu masuk ke web nya bro", "bukain web ...", URL, dll) dimanapun di kalimat!
-        has_url = bool(re.search(r"(https?://[^\s]+|(?:[a-z0-9\-]+\.)+(?:com|id|co\.id|org|net|go\.id|ac\.id|sa|io|app))", low))
-        mentions_open_web = any(
-            p in low
-            for p in (
-                "buka web", "bukain web", "buka situs", "buka halaman", "buka link",
-                "masuk ke web", "masuk web", "masuk situs", "ke web nya", "ke webnya",
-                "cek web", "liat web", "lihat web",
-            )
-        )
-        refers_prev_context = any(p in low for p in ("web nya", "webnya", "situsnya", "linknya", "link nya", "ke sana", "kesana"))
-
-        if mode == "chat" and (mentions_open_web or has_url):
-            if refers_prev_context or any(w in low for w in ("kerjain", "rangkum", "simpan", "isi", "cari", "booking", "pesan", "klik")):
-                mode = "agent"
-                self.chat_modes[chat_id] = "agent"
-            else:
-                clean_q = re.sub(
-                    r"^.*?\b(buka\s+web|bukain\s+web|buka\s+situs|buka\s+halaman|buka\s+link|masuk\s+ke\s+web|masuk\s+web|buka)\b\s*",
-                    "",
-                    text,
-                    flags=re.I,
-                ).strip()
-                if clean_q and clean_q.lower() not in ("bro", "dong", "ya", "nih"):
-                    text = clean_q
-                    mode = "open_web"
-                else:
-                    mode = "agent"
-                    self.chat_modes[chat_id] = "agent"
-
-        # Jika user terlanjur menekan tombol "🌐 Buka Web", tapi ternyata mengetik instruksi tugas panjang ("lalu isi...", "klik...", "cari...", dll), otomatis alihkan ke Agent!
-        if mode == "open_web" and any(
-            w in low for w in (" lalu ", " isi ", "first name", "submit", "verifikasi", "rangkum", "simpan ke", "klik ", "cari ")
-        ):
-            mode = "agent"
-            self.chat_modes[chat_id] = "agent"
+        # ==================== AUTO-ROUTER PINTAR (TANPA PENCET MODE DULU!) ====================
+        mode, routed_text = await self._detect_auto_route(chat_id, text, low)
+        text = routed_text
 
         if mode == "open_web":
             wait_mid = await self.send_text(chat_id, f"🌐 Lagi ngebukain web '{text}'...")
             target_url = await self.orchestrator.brain.resolve_website_url(text)
             nav_msg = await self.orchestrator.browser.navigate(target_url)
             b64 = await self.orchestrator.browser.refresh_frame()
-            self.chat_modes[chat_id] = "chat"
+            self.chat_modes[chat_id] = "auto"
             if wait_mid:
                 await self._edit_text(chat_id, wait_mid, f"🌐 {nav_msg}")
             if b64:
@@ -605,39 +547,10 @@ class TelegramBotBridge:
                     chat_id,
                     b64,
                     f"🖥️ {nav_msg}\n\n"
-                    "• Kalau mau login/klik sendiri, tap '🖥️ Buka & Kontrol Layar Live'.\n"
-                    "• Kalau mau nyuruh robot nge-klik / ngisi sesuatu di halaman ini, tinggal ketik (contoh: 'klik tombol login' / 'isi formnya').",
-                    reply_markup=self._live_browser_inline_kb(include_task_btn=True),
+                    "Tinggal ketik aja langsung di chat kalau mau nyuruh gua klik/isi/rangkum sesuatu di halaman ini!",
+                    reply_markup=self._live_browser_inline_kb(include_task_btn=False),
                 )
             return
-
-        # Deteksi pintar: bedakan perintah klik/isi/booking web vs obrolan / cek harga saham kilat!
-        strict_browser_verbs = (
-            "klik", "pencet", "ketik", "isi ", "isiin", "login", "scroll", "geser",
-            "download", "unduh", "halaman ini", "di web ini", "di halaman", "form", "formulir",
-            "submit", "tombol", "pilih ", "booking", "pesan kursi", "masuk ke web", "ke web nya", "ke webnya",
-        )
-        has_strict_browser_verb = any(bw in low for bw in strict_browser_verbs)
-        is_price_or_chat_query = (
-            any(w in low for w in ("saham", "harga", "etf", "kurs", "bitcoin", "btc", "kripto", "crypto", "ihsg", "gimana", "gmna", "kenapa", "knpa", "terus", "trus", "maksudnya", "apa itu", "jelasin"))
-            and not has_strict_browser_verb
-            and not has_url
-        )
-
-        # Jika user mengetik "lanjut" / "terusin" dan ada tugas browser sebelumnya, teruskan di browser!
-        is_continue_cmd = low in ("lanjut", "lanjut bro", "lanjutin", "terusin", "lanjutkan", "gas lanjut")
-        if is_continue_cmd and self.orchestrator.current_goal:
-            mode = "agent"
-            self.chat_modes[chat_id] = "agent"
-            text = f"Lanjutkan tugas ini sampai tuntas dari posisi halaman browser yang sedang terbuka sekarang: {self.orchestrator.current_goal}"
-
-        # Jika di mode chat tapi user eksplisit nyuruh klik/isi elemen di halaman yang sedang terbuka -> jalankan browser agent
-        if mode == "chat" and has_strict_browser_verb:
-            mode = "agent"
-        # Sebaliknya jika di mode agent tapi user cuma nanya harga saham ("buka harga saham qqqm") atau ngobrol ("trus gimanaa bro?") -> jawab kilat 1.5 detik!
-        elif mode == "agent" and not is_continue_cmd and (is_price_or_chat_query or (not has_strict_browser_verb and not has_url and len(low.split()) <= 7 and not any(w in low for w in ("cari", "buka", "masuk", "daftar", "cek web", "lanjut", "terusin")))):
-            mode = "chat"
-            self.chat_modes[chat_id] = "chat"
 
         if mode == "chat":
             # Jangan tunggu roundtrip "typing" — langsung jalankan Gemini detik ke-0.000!
@@ -684,6 +597,106 @@ class TelegramBotBridge:
         if mid:
             self._status_msg_ids[chat_id] = mid
         await self.orchestrator.start_goal(text)
+
+    async def _detect_auto_route(self, chat_id: int, text: str, low: str) -> tuple[str, str]:
+        """
+        Router otomatis pintar 2-lapis (0ms aturan pasti + <0.4s AI untuk kalimat abu-abu)
+        supaya user CUKUP KETIK BEBAS tanpa perlu menekan tombol mode apa pun terlebih dahulu!
+        """
+        # 1. Perintah "lanjut" / "terusin" dari pekerjaan browser sebelumnya
+        if low in ("lanjut", "lanjut bro", "lanjutin", "terusin", "lanjutkan", "gas lanjut") and self.orchestrator.current_goal:
+            return (
+                "agent",
+                f"Lanjutkan tugas ini sampai tuntas dari posisi halaman browser yang sedang terbuka sekarang: {self.orchestrator.current_goal}",
+            )
+
+        has_url = bool(
+            re.search(
+                r"(https?://[^\s]+|(?:[a-z0-9\-]+\.)+(?:com|id|co\.id|org|net|go\.id|ac\.id|sa|io|app|edu|gov))",
+                low,
+            )
+        )
+        task_verbs = (
+            " lalu ", " terus ", " setelah itu ", " kemudian ", "isi ", "isiin", "klik", "pencet",
+            "submit", "verifikasi", "rangkum", "catat", "kumpulkan", "ambil ", "simpan ke", "buatkan laporan",
+            "buatkan rekap", "masukkan ", "checkout", "keranjang", "login", "sign in", "daftar ", "booking",
+            "pesan ", "tunggu gua login", "first name", "username:", "password:", "kerjakan tugas",
+        )
+        has_task_verb = any(tv in low for tv in task_verbs)
+
+        # 2. Jika baru saja menekan tombol eksplisit "/buka" atau "🌐 Buka Web"
+        if self.chat_modes.get(chat_id) == "open_web":
+            self.chat_modes[chat_id] = "auto"
+            if has_task_verb:
+                return ("agent", text)
+            return ("open_web", text)
+
+        # 3. Jelas Tugas Multi-Langkah Browser (0ms — langsung jalan tanpa delay!)
+        known_sites = (
+            "wikipedia", "classroom", "google drive", "youtube", "github", "konami", "shopee",
+            "tokopedia", "traveloka", "tiket", "demoqa", "saucedemo", "testpages", "toscrape",
+            "kompas", "detik", "cnbc", "elearning", "e-learning", "kampus", "portal", "gmail",
+            "instagram", "linkedin",
+        )
+        mentions_site = has_url or any(ks in low for ks in known_sites) or any(
+            w in low for w in ("di web ", "ke web ", "di situs ", "ke situs ", "dari web ", "dari situs ")
+        )
+        direct_page_actions = (
+            "halaman ini", "di web ini", "di layar", "web nya", "webnya", "situsnya",
+            "masuk ke web", "ke web nya", "ke webnya", "isi form", "formulir",
+        )
+
+        if (mentions_site and (has_task_verb or any(w in low for w in ("cari ", "cek ", "baca ", "lihat ", "liat ", "rekap")))) or any(
+            dp in low for dp in direct_page_actions
+        ):
+            return ("agent", text)
+
+        if any(low.startswith(p) for p in ("klik ", "pencet ", "isi ", "ketik ", "scroll ", "geser ", "pilih ")):
+            return ("agent", text)
+
+        # 4. Cuma minta bukain 1 alamat web / situs pendek tanpa tugas lanjutan (contoh: "buka youtube.com", "bukain konami id")
+        words = low.split()
+        starts_open = any(low.startswith(p) for p in ("buka ", "bukain ", "masuk ke ", "masuk "))
+        is_finance_word = any(fw in low for fw in ("saham", "harga", "etf", "kurs", "bitcoin", "btc", "kripto", "crypto", "ihsg", "emas"))
+
+        if not is_finance_word and not has_task_verb:
+            if has_url and len(words) <= 4:
+                clean_u = re.sub(r"^(?:tolong\s+|coba\s+)?(?:buka(?:in)?(?:\s+web|\s+situs|\s+link)?|masuk(?:\s+ke)?(?:\s+web)?)\s*", "", text, flags=re.I).strip()
+                return ("open_web", clean_u or text)
+            if starts_open and len(words) <= 5 and any(ks in low or "web" in low or "situs" in low for ks in known_sites):
+                clean_u = re.sub(r"^(?:tolong\s+|coba\s+)?(?:buka(?:in)?(?:\s+web|\s+situs|\s+link)?|masuk(?:\s+ke)?(?:\s+web)?)\s*", "", text, flags=re.I).strip()
+                if clean_u and clean_u.lower() not in ("bro", "dong", "ya"):
+                    return ("open_web", clean_u)
+
+        # 5. Jelas Ngobrol / Harga Saham & Kripto / Soal / Bikin Surat Tanpa Buka Website (0ms!)
+        obvious_chat = (
+            is_finance_word
+            or (
+                not mentions_site
+                and not starts_open
+                and not has_task_verb
+                and not any(w in low for w in ("web", "situs", "browser", "link", "url", "akun ", "halaman"))
+            )
+        )
+        if obvious_chat:
+            return ("chat", text)
+
+        # 6. Kalimat Abu-Abu / Bahasa Gaul Bebas -> Tanya AI Classifier Kilat (<0.4 detik)
+        cur_u = ""
+        try:
+            if self.orchestrator.browser.page:
+                cur_u = self.orchestrator.browser._display_url(self.orchestrator.browser.page.url)
+        except Exception:
+            pass
+        ai_route = await self.orchestrator.brain.classify_intent(
+            text,
+            current_url=cur_u,
+            recent_chat=self.orchestrator.chat_messages[-4:],
+        )
+        if ai_route == "open_web":
+            clean_u = re.sub(r"^(?:tolong\s+|coba\s+)?(?:buka(?:in)?(?:\s+web|\s+situs|\s+link)?|masuk(?:\s+ke)?(?:\s+web)?)\s*", "", text, flags=re.I).strip()
+            return ("open_web", clean_u or text)
+        return (ai_route, text)
 
     async def _download_telegram_file(self, file_id: str) -> bytes:
         client = get_shared_http()

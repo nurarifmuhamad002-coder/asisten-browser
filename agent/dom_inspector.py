@@ -51,9 +51,9 @@ INSPECT_DOM_JS = """
         'select',
         'button',
         'a[href]',
-        'a[class]',
-        '[data-test]',
-        '[data-testid]',
+        'a[role="button"]',
+        'a[class*="cart"]',
+        'a[class*="btn"]',
         '[role="button"]',
         '[role="combobox"]',
         '[role="listbox"]',
@@ -109,25 +109,33 @@ INSPECT_DOM_JS = """
         document.body.appendChild(overlay);
     }
 
+    const attrEsc = (s) => String(s).split('"').join('\\"');
+
     const buildDomSelector = (el, tag, inputType, idAttr, nameAttr, placeholder, ariaLabel) => {
         if (idAttr) {
             const byId = `#${CSS.escape(idAttr)}`;
             if (document.querySelectorAll(byId).length === 1) return byId;
         }
+        const dt = el.getAttribute('data-test') || el.getAttribute('data-testid') || '';
+        if (dt) {
+            const dk = el.hasAttribute('data-test') ? 'data-test' : 'data-testid';
+            const byDt = `${tag}[${dk}="${attrEsc(dt)}"]`;
+            if (document.querySelectorAll(byDt).length === 1) return byDt;
+        }
         if (nameAttr && (inputType === 'radio' || inputType === 'checkbox') && el.value) {
-            const byNV = `${tag}[name="${CSS.escape(nameAttr)}"][value="${CSS.escape(el.value)}"]`;
+            const byNV = `${tag}[name="${attrEsc(nameAttr)}"][value="${attrEsc(el.value)}"]`;
             if (document.querySelectorAll(byNV).length === 1) return byNV;
         }
         if (nameAttr) {
-            const byName = `${tag}[name="${CSS.escape(nameAttr)}"]`;
+            const byName = `${tag}[name="${attrEsc(nameAttr)}"]`;
             if (document.querySelectorAll(byName).length === 1) return byName;
         }
         if (placeholder) {
-            const byPh = `${tag}[placeholder="${CSS.escape(placeholder)}"]`;
+            const byPh = `${tag}[placeholder="${attrEsc(placeholder)}"]`;
             if (document.querySelectorAll(byPh).length === 1) return byPh;
         }
         if (ariaLabel) {
-            const byAria = `${tag}[aria-label="${CSS.escape(ariaLabel)}"]`;
+            const byAria = `${tag}[aria-label="${attrEsc(ariaLabel)}"]`;
             if (document.querySelectorAll(byAria).length === 1) return byAria;
         }
         return '';

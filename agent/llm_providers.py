@@ -213,13 +213,23 @@ def _extract_json(raw_text: str) -> Dict[str, Any]:
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if match:
-            return json.loads(match.group(0))
-        raise
+    # Bersihkan trailing comma sebelum } atau ] yang kadang muncul dari LLM cepat
+    cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+    for candidate in (text, cleaned):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if match:
+        frag = match.group(0)
+        try:
+            return json.loads(frag)
+        except json.JSONDecodeError:
+            # Ganti kontrol newline mentah di dalam nilai string
+            frag_single = frag.replace("\r", " ").replace("\n", " ")
+            return json.loads(frag_single)
+    raise ValueError("Respons JSON dari model tidak valid.")
 
 
 class LLMConfig:
@@ -303,11 +313,12 @@ class MultiLLMBrain:
         live_ctx = await _fetch_live_web_context(message)
         chat_sys = (
             "Kamu adalah Asisten AI & Cloud Browser Operator pribadi berbahasa Indonesia santai (gua/lu/bro secukupnya). "
-            "PENTING: Kamu PUNYA fitur Cloud Browser asli (bisa membuka website apa saja, klik tombol, ketik/isi formulir, booking, baca halaman, bikin file Word/Excel/PDF, dan menyerahkan layar Live Browser ke user saat butuh login password/OTP). "
-            "DILARANG KERAS pernah bilang 'Sebagai AI saya/gue nggak bisa masuk atau membuka website'! "
-            "Jika user menyuruh masuk/buka website tapi belum jelas nama/link webnya, jawab santai: 'Siap bro! Sebut aja nama web atau link-nya (misal: traveloka.com), langsung gua bukain di browser sekarang!' "
-            "Jika tersedia bagian 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka/fakta terbaru tersebut untuk menjawab akurat. "
-            "Jangan pakai format Markdown bintang (** atau *) yang berlebihan agar bersih dibaca di Telegram HP."
+            "PENTING: Kamu memang punya fitur Cloud Browser (lewat tombol '📝 Kerjain Tugas Web'), TAPI saat ini kamu sedang berada di jalur OBROLAN CEPAT (belum mengeksekusi klik web pada balasan ini). "
+            "ATURAN ANTI-HALUSINASI MUTLAK: "
+            "1. DILARANG KERAS pura-pura sudah selesai mengerjakan tugas web/form, dan DILARANG KERAS menulis placeholder kurung siku seperti '[Laporan Hasil...]' atau mengarang hasil fiktif! "
+            "2. DILARANG bilang 'Sebagai AI saya tidak bisa membuka web' — jika user meminta mengerjakan sesuatu di website namun masuk ke mode obrolan, arahkan jujur & singkat: 'Tap tombol 📝 Kerjain Tugas Web lalu kirim perintahnya lagi ya bro biar robot browser langsung jalan!' "
+            "3. Jika tersedia 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka tersebut secara akurat. "
+            "Jangan pakai simbol bintang (** atau *) berlebihan agar rapi di Telegram HP."
         )
         prompt = f"{hist_block}{live_ctx}USER: {message}"
 
@@ -560,40 +571,71 @@ class MultiLLMBrain:
             candidates.insert(0, self.config.model)
 
         last_err = ""
-        # Tahap 1: Dengan gambar screenshot Vision; Tahap 2 (fallback anti-ReadTimeout): Mode teks DOM super ringan
-        passes = [True, False] if screenshot_b64 else [False]
-        async with _fast_http_client(timeout=28.0) as client:
-            for include_img in passes:
-                parts: List[Dict[str, Any]] = [{"text": prompt_text}]
-                if include_img and screenshot_b64:
-                    parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
-                payload = {
-                    "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                    "contents": [{"role": "user", "parts": parts}],
-                    "generationConfig": {
-                        "temperature": 0.2,
-                        "responseMimeType": "application/json",
-                    },
-                }
-                for model in candidates:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
-                    try:
-                        resp = await client.post(url, json=payload)
-                    except Exception as exc:
-                        last_err = f"Koneksi AI sibuk ({type(exc).__name__}) pada {model}"
-                        continue
-                    if resp.status_code in (404, 429, 503):
-                        last_err = f"Gemini API ({resp.status_code}) pada {model}"
-                        if resp.status_code == 429:
-                            await _aio.sleep(1.5)
-                        continue
-                    if resp.status_code >= 400:
-                        raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
-                    if model != self.config.model:
-                        self.config.model = model
-                    data = resp.json()
-                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    return _extract_json(text)
+        client = get_shared_http()
+
+        async def _try_step_model(m_name: str, include_img: bool) -> Optional[Dict[str, Any]]:
+            nonlocal last_err
+            parts: List[Dict[str, Any]] = [{"text": prompt_text}]
+            if include_img and screenshot_b64:
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
+            payload = {
+                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "responseMimeType": "application/json",
+                },
+            }
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}"
+            try:
+                resp = await client.post(url, json=payload, timeout=16.0)
+            except Exception as exc:
+                last_err = f"Koneksi AI sibuk ({type(exc).__name__}) pada {m_name}"
+                return None
+            if resp.status_code >= 400:
+                last_err = f"Gemini API ({resp.status_code}) pada {m_name}"
+                return None
+            try:
+                data = resp.json()
+                cands = data.get("candidates") or []
+                if not cands:
+                    return None
+                parts_out = (cands[0].get("content") or {}).get("parts") or []
+                text = "".join(p.get("text", "") for p in parts_out).strip()
+                parsed = _extract_json(text)
+                if isinstance(parsed, dict) and parsed.get("action"):
+                    return parsed
+            except Exception as parse_exc:
+                last_err = f"Format JSON melenceng pada {m_name} ({type(parse_exc).__name__})"
+            return None
+
+        # Hedged Racing untuk langkah Browser Agent: jika model #1 antri > 4.5 detik, langsung balapkan model #2 paralel!
+        for include_img in ([True, False] if screenshot_b64 else [False]):
+            t1 = _aio.create_task(_try_step_model(candidates[0], include_img))
+            done, _ = await _aio.wait({t1}, timeout=4.5)
+            if done and t1.result():
+                return t1.result()
+
+            t2 = _aio.create_task(_try_step_model(candidates[1], include_img))
+            pending = {t for t in (t1, t2) if not t.done()}
+            while pending:
+                done_set, pending = await _aio.wait(pending, timeout=12.0, return_when=_aio.FIRST_COMPLETED)
+                if not done_set:
+                    break
+                for dt in done_set:
+                    res = dt.result()
+                    if res:
+                        for p in pending:
+                            p.cancel()
+                        return res
+            for p in pending:
+                p.cancel()
+
+            if len(candidates) > 2:
+                res3 = await _try_step_model(candidates[2], include_img)
+                if res3:
+                    return res3
+
         raise RuntimeError(last_err or "Server AI sedang padat sesaat, coba kirim ulang 5 detik lagi.")
 
     async def _call_openai_compatible(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:

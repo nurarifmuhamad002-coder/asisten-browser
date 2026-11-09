@@ -624,11 +624,18 @@ class TelegramBotBridge:
             and not has_url
         )
 
+        # Jika user mengetik "lanjut" / "terusin" dan ada tugas browser sebelumnya, teruskan di browser!
+        is_continue_cmd = low in ("lanjut", "lanjut bro", "lanjutin", "terusin", "lanjutkan", "gas lanjut")
+        if is_continue_cmd and self.orchestrator.current_goal:
+            mode = "agent"
+            self.chat_modes[chat_id] = "agent"
+            text = f"Lanjutkan tugas ini sampai tuntas dari posisi halaman browser yang sedang terbuka sekarang: {self.orchestrator.current_goal}"
+
         # Jika di mode chat tapi user eksplisit nyuruh klik/isi elemen di halaman yang sedang terbuka -> jalankan browser agent
         if mode == "chat" and has_strict_browser_verb:
             mode = "agent"
         # Sebaliknya jika di mode agent tapi user cuma nanya harga saham ("buka harga saham qqqm") atau ngobrol ("trus gimanaa bro?") -> jawab kilat 1.5 detik!
-        elif mode == "agent" and (is_price_or_chat_query or (not has_strict_browser_verb and not has_url and len(low.split()) <= 7 and not any(w in low for w in ("cari", "buka", "masuk", "daftar", "cek web")))):
+        elif mode == "agent" and not is_continue_cmd and (is_price_or_chat_query or (not has_strict_browser_verb and not has_url and len(low.split()) <= 7 and not any(w in low for w in ("cari", "buka", "masuk", "daftar", "cek web", "lanjut", "terusin")))):
             mode = "chat"
             self.chat_modes[chat_id] = "chat"
 

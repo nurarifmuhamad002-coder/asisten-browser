@@ -199,17 +199,32 @@ class AgentOrchestrator:
                 self.live_status = f"Langkah {step_num}: Membaca tampilan website..."
                 await self._sync_state()
 
-                dom_state = await self.browser.observe(annotated_screenshot=self.llm_config.has_api_key)
-                ws_files = self.file_manager.list_files()
+                decision = None
+                dom_state = None
+                last_step_err = None
+                for _attempt in range(2):
+                    try:
+                        dom_state = await self.browser.observe(annotated_screenshot=self.llm_config.has_api_key)
+                        ws_files = self.file_manager.list_files()
+                        decision = await self.brain.decide_next_step(
+                            goal=self.current_goal,
+                            dom_state=dom_state,
+                            history=self.history,
+                            workspace_files=ws_files,
+                            memory_notes=self.memory_notes,
+                            recent_chat=self.chat_messages[:-1],
+                        )
+                        break
+                    except Exception as _dec_exc:
+                        last_step_err = _dec_exc
+                        try:
+                            await self.browser.ensure_alive()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.0)
 
-                decision = await self.brain.decide_next_step(
-                    goal=self.current_goal,
-                    dom_state=dom_state,
-                    history=self.history,
-                    workspace_files=ws_files,
-                    memory_notes=self.memory_notes,
-                    recent_chat=self.chat_messages[:-1],
-                )
+                if decision is None or dom_state is None:
+                    raise RuntimeError(str(last_step_err) or "Gagal membaca respons langkah AI")
 
                 thought = decision.get("thought", "")
                 if decision.get("plan") and isinstance(decision["plan"], list):
@@ -330,25 +345,22 @@ class AgentOrchestrator:
             self.state = "IDLE"
             self.live_status = "Online · Siap disuruh apa aja"
             await self._sync_state()
-            # Self-healing fallback: jika browser crash/berat, langsung jawab pakai jalur kilat AI + data live agar user TIDAK PERNAH dapat pesan error buntu!
+            # DILARANG memanggil quick_chat di sini karena quick_chat tidak melihat browser dan bisa mengarang klaim palsu!
+            reason_txt = str(exc).strip() or f"Gangguan koneksi sementara ({type(exc).__name__})"
+            cur_u = ""
             try:
-                asyncio.create_task(self.browser._force_restart())
+                if self.browser.page:
+                    cur_u = self.browser._display_url(self.browser.page.url)
             except Exception:
                 pass
-            try:
-                fallback_reply = await self.brain.quick_chat(self.current_goal, self.chat_messages[:-1])
-                if fallback_reply and not fallback_reply.startswith("Waduh koneksi"):
-                    await self._push_chat("agent", fallback_reply)
-                    if self.telegram:
-                        await self.telegram.notify_done(fallback_reply)
-                    return
-            except Exception:
-                pass
-            reason_txt = str(exc).strip() or f"Halaman web terlalu berat ({type(exc).__name__})"
-            err_msg = f"Halaman web barusan terlalu berat di memori server ({reason_txt[:100]}), browser otomatis gua segarin ulang ya bro!"
+            loc_info = f" di halaman `{cur_u}`" if cur_u and cur_u != "about:blank" else ""
+            err_msg = (
+                f"⚠️ Langkah pengerjaan web sempat terputus{loc_info} ({reason_txt[:110]}).\n\n"
+                "Posisi halaman terakhir masih tersimpan — ketik `lanjut` kalau mau gua terusin dari halaman itu!"
+            )
             await self._push_chat("agent", err_msg)
             if self.telegram:
-                await self.telegram.send_to_all(f"🔄 {err_msg}")
+                await self.telegram.send_to_all(err_msg)
 
     async def _wait_for_human_takeover(self, reason: str) -> None:
         self.state = "WAITING_HUMAN_TAKEOVER"
@@ -559,10 +571,15 @@ class AgentOrchestrator:
             return False
         etype = (target_el.get("type") or "").lower()
         eid = (target_el.get("el_id") or "").lower()
+        name_attr = (target_el.get("name") or "").lower()
         txt = (target_el.get("text") or target_el.get("label") or "").strip().lower()
-        if etype == "submit" or eid == "submit":
+        combined = f"{eid} {name_attr} {txt}"
+        # Jangan anggap tombol Login, Continue, Next, Search, atau Add sebagai Submit akhir formulir!
+        if any(skip in combined for skip in ("login", "log in", "signin", "sign in", "masuk", "continue", "next", "lanjut", "search", "cari", "cancel", "batal", "close", "add-to-cart", "remove")):
+            return False
+        if eid == "submit" or txt in ("submit", "kirim", "daftar", "simpan"):
             return True
-        if target_el.get("tag") in ("button", "input") and txt in ("submit", "kirim", "daftar", "register", "save", "simpan"):
+        if etype == "submit" and txt not in ("", "go"):
             return True
         return False
 
@@ -609,8 +626,10 @@ class AgentOrchestrator:
                 + f"\nData terisi saat ini: [{current_dump}]. Perbaiki field yang bermasalah terlebih dahulu sebelum klik Submit!"
             )
 
+        url_before = self.browser.page.url if self.browser.page else ""
         click_msg = await self.browser.click_element(idx, elements)
         await asyncio.sleep(0.45)
+        url_after = self.browser.page.url if self.browser.page else ""
 
         sub_res = await self.browser.read_submission_result()
         problems: List[str] = []
@@ -620,6 +639,12 @@ class AgentOrchestrator:
             problems.append(f"Field '{warn_f}': {warn_msg.replace('❌ ', '')}")
 
         if not sub_res.get("submitted"):
+            # Jika tidak ada field :invalid DAN halaman sudah berpindah URL (mis. halaman konfirmasi non-tabel) atau modal sudah tertutup bersih
+            has_invalids = bool(sub_res.get("invalid_fields")) or bool(audit.get("issues"))
+            if not has_invalids and not problems and (url_after != url_before or "tabel" not in goal_low):
+                self._last_submit_verification = {"ok": True, "rows": [], "problems": []}
+                return f"{click_msg} -> ✅ Form berhasil dikirim (tidak ada error validasi)."
+
             for inv in sub_res.get("invalid_fields", []):
                 problems.append(
                     f"Field '{inv.get('field')}': nilai '{inv.get('value')}' ditolak ({inv.get('reason')})"

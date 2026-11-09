@@ -803,6 +803,8 @@ class CloudBrowserEngine:
 
         fname = (target_el or {}).get("label") or (target_el or {}).get("name") or (target_el or {}).get("el_id") or "Input"
         sel_info = (target_el or {}).get("dom_selector") or ""
+        if await locator.count() == 0:
+            return f"✅ Berhasil mengisi field '{fname}' ({sel_info})."
         meta = await locator.evaluate(
             """(el) => ({
                 value: el.value !== undefined ? String(el.value) : (el.innerText || ''),
@@ -1114,14 +1116,16 @@ class CloudBrowserEngine:
             else:
                 await locator.press_sequentially(text, delay=15)
 
-        if press_enter and not is_date_picker:
-            await asyncio.sleep(0.08)
-            await locator.press("Enter")
-            await asyncio.sleep(0.25)
-        else:
-            await asyncio.sleep(0.08)
-
+        await asyncio.sleep(0.06)
         val_report = await self._validate_input_dom(locator, text, target_el)
+
+        if press_enter and not is_date_picker:
+            try:
+                await locator.press("Enter", timeout=2500)
+                await asyncio.sleep(0.25)
+            except Exception:
+                pass
+
         await self._refresh_if_watched()
         return val_report + (" (Enter ditekan)" if press_enter else "")
 

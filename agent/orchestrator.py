@@ -1,4 +1,7 @@
 import asyncio
+import json
+import os
+import re
 from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
@@ -41,6 +44,8 @@ class AgentOrchestrator:
         self.history: List[Dict[str, Any]] = []
         self.memory_notes: Dict[str, str] = {}
         self.persistent_notes: Dict[str, str] = {}
+        self._user_mem_file = self.browser.profile_dir / "user_memory.json"
+        self.user_memories: List[str] = self._load_user_memories()
         self._form_touched: bool = False
         self._expected_fields: Dict[str, str] = {}
         self._field_warnings: Dict[str, str] = {}
@@ -101,6 +106,72 @@ class AgentOrchestrator:
             }
         )
 
+    def _load_user_memories(self) -> List[str]:
+        try:
+            if self._user_mem_file.exists():
+                arr = json.loads(self._user_mem_file.read_text(encoding="utf-8"))
+                if isinstance(arr, list):
+                    return [str(x).strip() for x in arr if str(x).strip()]
+        except Exception:
+            pass
+        env_mem = os.getenv("USER_MEMORY_INIT", "").strip()
+        if env_mem:
+            return [ln.strip() for ln in env_mem.splitlines() if ln.strip()]
+        return []
+
+    def _save_user_memories(self) -> None:
+        try:
+            self.browser.profile_dir.mkdir(parents=True, exist_ok=True)
+            self._user_mem_file.write_text(json.dumps(self.user_memories, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def add_user_memories(self, raw_text: str) -> List[str]:
+        """Menyimpan 1 atau beberapa baris fakta profil/gaya kerja user (otomatis update jika labelnya sama)."""
+        lines = [
+            re.sub(r"^[\-\*•\d\.\)\s]+", "", ln).strip()
+            for ln in (raw_text or "").splitlines()
+            if ln.strip()
+        ]
+        added: List[str] = []
+        for item in lines:
+            if not item:
+                continue
+            key_prefix = item.split(":", 1)[0].strip().lower() if ":" in item else ""
+            replaced = False
+            if key_prefix and len(key_prefix) <= 28:
+                for idx, existing in enumerate(self.user_memories):
+                    ex_prefix = existing.split(":", 1)[0].strip().lower() if ":" in existing else ""
+                    if ex_prefix and ex_prefix == key_prefix:
+                        self.user_memories[idx] = item
+                        replaced = True
+                        break
+            if not replaced and item not in self.user_memories:
+                self.user_memories.append(item)
+            added.append(item)
+        self._save_user_memories()
+        return added
+
+    def remove_user_memory(self, idx_1based: int) -> Optional[str]:
+        if 1 <= idx_1based <= len(self.user_memories):
+            removed = self.user_memories.pop(idx_1based - 1)
+            self._save_user_memories()
+            return removed
+        return None
+
+    def clear_user_memories(self) -> None:
+        self.user_memories.clear()
+        self._save_user_memories()
+
+    def format_user_memory_block(self) -> str:
+        if not self.user_memories:
+            return ""
+        joined = "\n".join(f"- {m}" for m in self.user_memories)
+        return (
+            "=== MEMORI PROFIL & GAYA KERJA PEMILIK BOT (GUNAKAN OTOMATIS SAAT MENGISI FORM / MEMBUAT DOKUMEN / MENJAWAB) ===\n"
+            f"{joined}\n"
+        )
+
     async def start_goal(self, goal: str) -> None:
         clean_goal = (goal or "").strip()
         if not clean_goal:
@@ -113,6 +184,8 @@ class AgentOrchestrator:
         self.current_plan = [{"step": "Memahami perintah & menyiapkan langkah...", "status": "in_progress"}]
         self.history = []
         self.memory_notes = dict(self.persistent_notes)
+        if self.user_memories:
+            self.memory_notes["PROFIL_DAN_PREFERENSI_USER"] = "\n".join(self.user_memories)
         self.pending_approval = None
         self.takeover_reason = ""
         self.manual_takeover = False

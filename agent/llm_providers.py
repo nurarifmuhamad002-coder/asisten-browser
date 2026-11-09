@@ -296,7 +296,12 @@ class MultiLLMBrain:
         self.config = config
         self.autopilot = SmartAutopilotPlanner()
 
-    async def quick_chat(self, message: str, recent_chat: Optional[List[Dict[str, Any]]] = None) -> str:
+    async def quick_chat(
+        self,
+        message: str,
+        recent_chat: Optional[List[Dict[str, Any]]] = None,
+        user_memory_block: str = "",
+    ) -> str:
         """Mode Ngobrol AI cepat (<1 detik) tanpa beban browser."""
         if not self.config.has_api_key:
             return (
@@ -312,9 +317,11 @@ class MultiLLMBrain:
         hist_block = ("\n".join(hist_lines) + "\n\n") if hist_lines else ""
 
         live_ctx = await _fetch_live_web_context(message)
+        mem_part = (user_memory_block.strip() + "\n\n") if user_memory_block else ""
         chat_sys = (
             "Kamu adalah Asisten AI & Cloud Browser Operator pribadi berbahasa Indonesia santai (gua/lu/bro secukupnya). "
-            "Kamu punya fitur Cloud Browser otomatis — user TIDAK perlu menekan tombol mode apa pun, cukup ketik langsung perintahnya di chat! "
+            "Kamu punya fitur Cloud Browser otomatis & Memori Profil User (/ingat) — user TIDAK perlu menekan tombol mode apa pun! "
+            "Jika terdapat 'MEMORI PROFIL & GAYA KERJA PEMILIK BOT', gunakan data tersebut secara otomatis saat membuat surat, CV, dokumen, atau menjawab pertanyaan tentang user. "
             "ATURAN ANTI-HALUSINASI MUTLAK: "
             "1. Pada balasan ini kamu HANYA menjawab obrolan teks cepat dan TIDAK sedang menjalankan proses background apa pun. "
             "DILARANG KERAS menulis kalimat janji palsu seperti 'Lagi gua proses buka...', 'Tunggu bentar ya lagi loading...', atau '[Laporan Hasil...]'. "
@@ -322,7 +329,7 @@ class MultiLLMBrain:
             "3. Jika tersedia 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka tersebut secara akurat. "
             "Jangan pakai simbol bintang (** atau *) berlebihan agar rapi di Telegram HP."
         )
-        prompt = f"{hist_block}{live_ctx}USER: {message}"
+        prompt = f"{mem_part}{hist_block}{live_ctx}USER: {message}"
 
         if self.config.provider == "gemini":
             # Urutan model tercepat dari hasil benchmark nyata (~1.1s vs 5.5s!) + Hedged Racing anti-ngelag

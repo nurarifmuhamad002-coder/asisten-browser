@@ -332,6 +332,10 @@ class TelegramBotBridge:
                 await self.orchestrator.stop_goal()
                 await self._finalize_progress_cards("⏹️ PEKERJAAN DIHENTIKAN OLEH LU")
                 await self._answer_cb(cb_id, "Pekerjaan dihentikan.")
+            elif data == "clear_user_mem":
+                self.orchestrator.clear_user_memories()
+                await self._answer_cb(cb_id, "🗑️ Memori dikosongkan!")
+                await self.send_text(chat_id, "🗑️ Semua memori profil sudah dikosongkan.", reply_markup=MAIN_MENU_KB)
             elif data == "snap_screen":
                 await self._answer_cb(cb_id, "Mengambil foto layar...")
                 await self._send_screen_snapshot(chat_id)
@@ -466,20 +470,92 @@ class TelegramBotBridge:
         if low in ("/setting", "/settings", "setting"):
             llm_info = self.orchestrator.llm_config.public_dict()
             px_stat = self.orchestrator.browser.proxy_summary()
+            mem_cnt = len(self.orchestrator.user_memories)
             await self.send_text(
                 chat_id,
                 "⚙️ PENGATURAN ASISTEN LU SEKARANG:\n\n"
                 f"• Otak AI: {llm_info.get('mode')}\n"
                 f"• Kunci AI: {llm_info.get('masked_key') or '(belum ada)'}\n"
+                f"• Memori Profil: {mem_cnt} data tersimpan (/ingat)\n"
                 f"• Jalur IP Browser: {px_stat}\n"
                 f"• Keamanan: {'🔒 Terkunci' if self.is_locked else '🔓 Terbuka'}\n\n"
-                "🇮🇩 Cara pasang IP Indonesia (buat tembus web pemerintah .go.id / Siskopatuh):\n"
-                "/proxy host:port:username:password\n"
-                "(atau ketik /proxy buat lihat panduan & cek lokasi IP sekarang)\n\n"
+                "🧠 Lihat/tambah data profil yang dihafal bot:\n"
+                "/ingat\n\n"
+                "🇮🇩 Cara pasang IP Indonesia (buat tembus web .go.id):\n"
+                "/proxy host:port:username:password\n\n"
                 "Cara ganti API Key Gemini:\n"
                 "/apikey KODE_API_KEY_BARU\n\n"
                 "Cara segarin ulang browser:\n"
                 "/reset",
+                reply_markup=MAIN_MENU_KB,
+            )
+            return
+
+        # FITUR MEMORI PROFIL & GAYA KERJA OTOMATIS (/ingat + bahasa santai "ingat ya..." / "hafalin...")
+        natural_mem_match = re.match(
+            r"^(?:tolong\s+|bro\s+|eh\s+)?(?:ingat(?:\s+ya)?|ingetin|hafalin(?:\s+ya)?|simpan\s+(?:data|profil|memori)(?:\s+gua)?|catat\s+(?:data|profil)(?:\s+gua)?)\s*[:,\-]?\s*(.+)$",
+            text.strip(),
+            flags=re.I | re.S,
+        )
+        if low == "/ingat" or low.startswith("/ingat ") or natural_mem_match:
+            arg = text[6:].strip() if (low == "/ingat" or low.startswith("/ingat ")) else natural_mem_match.group(1).strip()
+            arg_low = arg.lower()
+
+            if not arg or arg_low in ("list", "cek", "lihat"):
+                mems = self.orchestrator.user_memories
+                if not mems:
+                    await self.send_text(
+                        chat_id,
+                        "🧠 MEMORI PROFIL & GAYA KERJA LU MASIH KOSONG!\n\n"
+                        "Cara nyimpannya gampang banget, tinggal ketik bebas (bisa 1 baris atau banyak baris sekaligus):\n\n"
+                        "Contoh:\n"
+                        "`/ingat Nama Lengkap: Muhamad Nur Arif\n"
+                        "Email: arif@gmail.com\n"
+                        "No HP: 081234567890\n"
+                        "Kantor: PT Travel Umrah ...\n"
+                        "Alamat: Jakarta`\n\n"
+                        "Atau ketik santai aja di chat: *'ingat ya bro nama lengkap gua ..., email gua ...'*\n"
+                        "Nanti tiap disuruh **isi formulir web** atau **bikin surat/dokumen Word/Excel/PDF**, otomatis gua pake data itu tanpa nanya ulang!",
+                        reply_markup=MAIN_MENU_KB,
+                    )
+                else:
+                    lines = "\n".join(f"{i}. {m}" for i, m in enumerate(mems, 1))
+                    kb_mem = {
+                        "inline_keyboard": [
+                            [{"text": "🗑️ Hapus Semua Memori", "callback_data": "clear_user_mem"}]
+                        ]
+                    }
+                    await self.send_text(
+                        chat_id,
+                        f"🧠 DATA PROFIL & GAYA KERJA YANG GUA HAFAL ({len(mems)} item):\n\n"
+                        f"{lines}\n\n"
+                        "• Tambah/ubah data: `/ingat Email: emailbaru@gmail.com`\n"
+                        "• Hapus 1 baris: `/ingat hapus 2`",
+                        reply_markup=kb_mem,
+                    )
+                return
+
+            if arg_low in ("reset", "hapus semua", "clear", "kosongkan"):
+                self.orchestrator.clear_user_memories()
+                await self.send_text(chat_id, "🗑️ Sip, semua memori profil lu udah dikosongkan bersih!", reply_markup=MAIN_MENU_KB)
+                return
+
+            del_m = re.match(r"^(?:hapus|del|delete|buang)\s+(\d+)$", arg_low)
+            if del_m:
+                removed = self.orchestrator.remove_user_memory(int(del_m.group(1)))
+                if removed:
+                    await self.send_text(chat_id, f"🗑️ Dihapus dari memori: `{removed}`", reply_markup=MAIN_MENU_KB)
+                else:
+                    await self.send_text(chat_id, "Nomor urut memori nggak ketemu bro. Ketik `/ingat` buat lihat daftarnya!", reply_markup=MAIN_MENU_KB)
+                return
+
+            saved_items = self.orchestrator.add_user_memories(arg)
+            recap = "\n".join(f"• {x}" for x in saved_items)
+            await self.send_text(
+                chat_id,
+                f"🧠 Sip bro, udah masuk ke otak gua ({len(self.orchestrator.user_memories)} total memori tersimpan):\n\n"
+                f"{recap}\n\n"
+                "Mulai sekarang tiap lu nyuruh **isi form di web** (*'isi form ini pake data gua'*) atau **bikin surat/dokumen**, langsung otomatis gua pake! Ketik `/ingat` kapan aja buat ngecek.",
                 reply_markup=MAIN_MENU_KB,
             )
             return
@@ -663,7 +739,11 @@ class TelegramBotBridge:
             # Jangan tunggu roundtrip "typing" — langsung jalankan Gemini detik ke-0.000!
             asyncio.create_task(self._send_chat_action(chat_id, "typing"))
             await self.orchestrator._push_chat("user", text)
-            reply = await self.orchestrator.brain.quick_chat(text, self.orchestrator.chat_messages[:-1])
+            reply = await self.orchestrator.brain.quick_chat(
+                text,
+                self.orchestrator.chat_messages[:-1],
+                user_memory_block=self.orchestrator.format_user_memory_block(),
+            )
             await self.orchestrator._push_chat("agent", reply)
             self.last_output_text[chat_id] = reply
 

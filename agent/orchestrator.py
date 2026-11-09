@@ -341,10 +341,16 @@ class AgentOrchestrator:
                         self.state = "IDLE"
                         self.live_status = "Situs tujuan menolak koneksi Cloud"
                         await self._sync_state()
+                        px_hint = (
+                            "Pasang Proxy Indonesia lewat ketik `/proxy` kalau mau tembus situs `.go.id` ini, "
+                            "atau lanjut ke situs lain!"
+                            if not self.browser.proxy_config
+                            else "Cek status `/proxy` untuk memastikan kuota/koneksi Proxy Indonesia aktif!"
+                        )
                         clean_unreach = (
-                            f"🚫 Situs `{req_host}` menolak atau tidak merespons koneksi dari server Cloud Singapore dalam 9 detik.\n\n"
-                            "Ini biasa terjadi pada sebagian web pemerintah (`.go.id`) yang dikunci khusus jaringan provider lokal Indonesia (Telkomsel/IndiHome/Biznet). "
-                            "Browser lu tetap aman & segar 100% buat lanjut ke situs lain!"
+                            f"🚫 Situs `{req_host}` menolak atau tidak merespons koneksi dalam 9 detik.\n\n"
+                            "Ini biasa terjadi pada portal pemerintah (`.go.id`) yang dikunci khusus jaringan provider lokal Indonesia (Telkomsel/IndiHome/Biznet). "
+                            f"{px_hint}"
                         )
                         await self._push_chat("agent", clean_unreach)
                         if self.telegram:

@@ -430,21 +430,84 @@ class TelegramBotBridge:
             await self.orchestrator.resume_from_takeover()
             return
 
-        # PENGATURAN AI LANGSUNG DARI TELEGRAM (/setting & /apikey)
+        # PENGATURAN AI & PROXY INDONESIA LANGSUNG DARI TELEGRAM (/setting, /apikey, /proxy)
         if low in ("/setting", "/settings", "setting"):
             llm_info = self.orchestrator.llm_config.public_dict()
+            px_stat = self.orchestrator.browser.proxy_summary()
             await self.send_text(
                 chat_id,
                 "⚙️ PENGATURAN ASISTEN LU SEKARANG:\n\n"
                 f"• Otak AI: {llm_info.get('mode')}\n"
                 f"• Kunci AI: {llm_info.get('masked_key') or '(belum ada)'}\n"
+                f"• Jalur IP Browser: {px_stat}\n"
                 f"• Keamanan: {'🔒 Terkunci' if self.is_locked else '🔓 Terbuka'}\n\n"
-                "Cara ganti API Key Gemini baru kapan aja langsung lewat chat:\n"
+                "🇮🇩 Cara pasang IP Indonesia (buat tembus web pemerintah .go.id / Siskopatuh):\n"
+                "/proxy host:port:username:password\n"
+                "(atau ketik /proxy buat lihat panduan & cek lokasi IP sekarang)\n\n"
+                "Cara ganti API Key Gemini:\n"
                 "/apikey KODE_API_KEY_BARU\n\n"
-                "Cara reset/segarin ulang browser kalau nyangkut:\n"
+                "Cara segarin ulang browser:\n"
                 "/reset",
                 reply_markup=MAIN_MENU_KB,
             )
+            return
+
+        if low == "/proxy" or low.startswith("/proxy "):
+            arg = text[6:].strip() if len(text) > 6 else ""
+            if not arg or arg.lower() in ("cek", "status", "info", "ip"):
+                wait_id = await self.send_text(chat_id, "🌐 Mengecek lokasi IP jalur browser sekarang...")
+                ip_now = await self.orchestrator.browser.check_exit_ip()
+                px_stat = self.orchestrator.browser.proxy_summary()
+                msg_px = (
+                    "🇮🇩 STATUS JALUR IP BROWSER:\n\n"
+                    f"• Mode Proxy: {px_stat}\n"
+                    f"• IP Keluar Saat Ini: {ip_now}\n\n"
+                    "💡 Cara Aktifkan IP Indonesia (tembus Siskopatuh / web .go.id):\n"
+                    "Tinggal tempel kode proxy dari penyedia Proxy Residential Indo (format apa aja langsung kebaca otomatis):\n"
+                    "  `/proxy host:port:user:pass`\n"
+                    "  atau `/proxy http://user:pass@host:port`\n"
+                    "  atau `/proxy socks5://user:pass@host:port`\n\n"
+                    "🔌 Cara matikan proxy (balik gratis Singapore):\n"
+                    "  `/proxy off`"
+                )
+                if wait_id:
+                    await self._edit_text(chat_id, wait_id, msg_px)
+                else:
+                    await self.send_text(chat_id, msg_px, reply_markup=MAIN_MENU_KB)
+                return
+
+            # Hapus pesan berisi kredensial proxy dari riwayat chat biar aman!
+            if msg_id and arg.lower() not in ("off", "mati", "hapus", "none", "reset", "matikan"):
+                asyncio.create_task(self._delete_msg(chat_id, msg_id))
+
+            wait_id = await self.send_text(chat_id, "🔄 Memasang jalur jaringan baru ke browser & mengecek lokasi IP...")
+            try:
+                await self.orchestrator.stop_goal(silent=True)
+                res_px = await self.orchestrator.browser.configure_proxy(arg)
+                if res_px.get("enabled"):
+                    done_txt = (
+                        "✅ JALUR PROXY BERHASIL DIPASANG!\n"
+                        "🧹 Pesan kode proxy lu tadi otomatis gua hapus dari chat biar aman.\n\n"
+                        f"• Server Proxy: {res_px.get('server')}\n"
+                        f"• Lokasi IP Browser Sekarang: {res_px.get('ip_info')}\n\n"
+                        "(Kuota super irit: cuma halaman browser yang lewat proxy, iklan/video otomatis diblokir, dan AI Gemini nggak makan kuota proxy!).\n"
+                        "Gas langsung ketik perintah buka Siskopatuh atau web apa aja!"
+                    )
+                else:
+                    done_txt = (
+                        "🔌 Proxy dimatikan — Browser balik ke jalur gratis Cloud Singapore!\n"
+                        f"• Lokasi IP Sekarang: {res_px.get('ip_info')}"
+                    )
+                if wait_id:
+                    await self._edit_text(chat_id, wait_id, done_txt)
+                else:
+                    await self.send_text(chat_id, done_txt, reply_markup=MAIN_MENU_KB)
+            except Exception as px_exc:
+                err_txt = f"⚠️ Gagal memasang proxy: {px_exc}"
+                if wait_id:
+                    await self._edit_text(chat_id, wait_id, err_txt)
+                else:
+                    await self.send_text(chat_id, err_txt, reply_markup=MAIN_MENU_KB)
             return
 
         if low.startswith("/apikey "):

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional
@@ -35,7 +36,9 @@ class CloudBrowserEngine:
         self.broadcast = broadcast_cb
         self.profile_dir = Path(profile_dir)
         self.state_file = self.profile_dir / "storage_state.json"
+        self.proxy_file = self.profile_dir / "proxy_config.json"
         self.internal_port = internal_port
+        self.proxy_config: Optional[Dict[str, str]] = self._load_saved_proxy()
 
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
@@ -57,6 +60,117 @@ class CloudBrowserEngine:
     def _touch(self) -> None:
         import time as _t
         self._last_active = _t.monotonic()
+
+    @staticmethod
+    def parse_proxy_input(raw: str) -> Optional[Dict[str, str]]:
+        """
+        Menerima SEMUA format kode proxy dari penyedia Proxy Indonesia:
+        1) http://user:pass@host:port atau socks5://user:pass@host:port
+        2) host:port:user:pass  (format populer toko proxy Indo)
+        3) user:pass@host:port
+        4) host:port
+        """
+        s = (raw or "").strip()
+        if not s or s.lower() in ("off", "mati", "hapus", "none", "reset", "matikan"):
+            return None
+
+        from urllib.parse import urlparse, unquote
+
+        # Jika belum ada skema tapi memakai '@', tambahkan http://
+        if "://" not in s and "@" in s:
+            s = "http://" + s
+
+        if "://" in s:
+            u = urlparse(s)
+            if not u.hostname or not u.port:
+                raise ValueError("Format proxy tidak lengkap (pastikan ada host dan port).")
+            scheme = (u.scheme or "http").lower()
+            if scheme not in ("http", "https", "socks5"):
+                scheme = "http"
+            cfg: Dict[str, str] = {"server": f"{scheme}://{u.hostname}:{u.port}"}
+            if u.username:
+                cfg["username"] = unquote(u.username)
+            if u.password is not None:
+                cfg["password"] = unquote(u.password)
+            return cfg
+
+        # Format tanpa skema: host:port atau host:port:user:pass
+        parts = s.split(":")
+        if len(parts) == 2 and parts[1].isdigit():
+            return {"server": f"http://{parts[0]}:{parts[1]}"}
+        if len(parts) >= 4 and parts[1].isdigit():
+            host, port, user = parts[0], parts[1], parts[2]
+            pw = ":".join(parts[3:])
+            return {"server": f"http://{host}:{port}", "username": user, "password": pw}
+
+        raise ValueError(
+            "Format proxy belum dikenali. Contoh yang valid:\n"
+            "• host:port:username:password\n"
+            "• http://username:password@host:port\n"
+            "• socks5://username:password@host:port"
+        )
+
+    def _load_saved_proxy(self) -> Optional[Dict[str, str]]:
+        try:
+            if self.proxy_file.exists():
+                data = json.loads(self.proxy_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("server"):
+                    return data
+        except Exception:
+            pass
+        env_px = os.getenv("BROWSER_PROXY_URL", "").strip()
+        if env_px:
+            try:
+                return self.parse_proxy_input(env_px)
+            except Exception:
+                return None
+        return None
+
+    def proxy_summary(self) -> str:
+        if not self.proxy_config or not self.proxy_config.get("server"):
+            return "Mati (Pakai IP Cloud Singapore langsung)"
+        srv = self.proxy_config["server"]
+        has_auth = " + Login" if self.proxy_config.get("username") else ""
+        return f"Aktif ({srv}{has_auth})"
+
+    async def configure_proxy(self, raw_proxy: str) -> Dict[str, Any]:
+        """Pasang atau matikan Proxy Browser secara live + langsung cek lokasi IP keluarnya."""
+        clean = (raw_proxy or "").strip()
+        if clean.lower() in ("off", "mati", "hapus", "none", "reset", "matikan"):
+            self.proxy_config = None
+            if self.proxy_file.exists():
+                try:
+                    self.proxy_file.unlink()
+                except Exception:
+                    pass
+            await self._force_restart()
+            ip_info = await self.check_exit_ip()
+            return {"enabled": False, "ip_info": ip_info}
+
+        parsed = self.parse_proxy_input(clean)
+        self.proxy_config = parsed
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        if parsed:
+            self.proxy_file.write_text(json.dumps(parsed), encoding="utf-8")
+        await self._force_restart()
+        ip_info = await self.check_exit_ip()
+        return {"enabled": bool(parsed), "server": (parsed or {}).get("server", ""), "ip_info": ip_info}
+
+    async def check_exit_ip(self) -> str:
+        """Mengecek alamat IP publik, negara, kota, dan ISP yang dipakai browser saat ini."""
+        await self.ensure_alive()
+        if not self.page:
+            return "Browser belum aktif"
+        try:
+            resp = await self.page.goto("http://ip-api.com/json/?fields=status,message,country,city,isp,query", wait_until="commit", timeout=8000)
+            if resp:
+                txt = await asyncio.wait_for(self.page.inner_text("body"), timeout=3500)
+                data = json.loads(txt.strip())
+                if data.get("status") == "success":
+                    return f"{data.get('query')} ({data.get('country')} · {data.get('city')} · {data.get('isp')})"
+        except Exception as exc:
+            return f"Gagal mengecek IP lewat proxy ({str(exc)[:70]}) — pastikan kode/kuota proxy aktif!"
+        return "IP tidak terdeteksi"
 
     async def _idle_watchdog(self) -> None:
         import time as _t
@@ -89,10 +203,9 @@ class CloudBrowserEngine:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
 
         self._pw = await async_playwright().start()
-        # Gunakan chromium.launch() (chromium-headless-shell ringan) bukan launch_persistent_context yang makan +120 MB RAM!
-        self._browser = await self._pw.chromium.launch(
-            headless=True,
-            args=[
+        launch_kwargs: Dict[str, Any] = {
+            "headless": True,
+            "args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
@@ -108,11 +221,17 @@ class CloudBrowserEngine:
                 "--metrics-recording-only",
                 "--mute-audio",
             ],
-        )
+        }
+        if self.proxy_config and self.proxy_config.get("server"):
+            launch_kwargs["proxy"] = dict(self.proxy_config)
+
+        # Gunakan chromium.launch() (chromium-headless-shell ringan) bukan launch_persistent_context yang makan +120 MB RAM!
+        self._browser = await self._pw.chromium.launch(**launch_kwargs)
 
         ctx_kwargs: Dict[str, Any] = {
             "viewport": {"width": self.VIEWPORT_WIDTH, "height": self.VIEWPORT_HEIGHT},
             "accept_downloads": True,
+            "ignore_https_errors": True,
             "locale": "id-ID",
             "timezone_id": "Asia/Jakarta",
             "user_agent": (

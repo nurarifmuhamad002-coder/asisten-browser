@@ -924,7 +924,7 @@ class TelegramBotBridge:
     async def notify_done(self, summary: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
-        clean = summary.replace("**", "")
+        clean = summary.replace("**", "").strip()
         export_kb = {
             "inline_keyboard": [
                 [
@@ -934,10 +934,12 @@ class TelegramBotBridge:
                 ]
             ]
         }
+        is_failure = clean.startswith("❌") or "GAGAL Verifikasi" in clean or "BELUM SESUAI" in clean.upper()
+        out_msg = clean if is_failure else f"✅ Beres!\n\n{clean}"
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
         for cid in targets:
             self.last_output_text[cid] = summary
-            await self.send_text(cid, f"✅ Beres!\n\n{clean}", reply_markup=export_kb)
+            await self.send_text(cid, out_msg, reply_markup=(MAIN_MENU_KB if is_failure else export_kb))
 
     async def send_to_all(self, message: str) -> None:
         if not self.is_configured or not self.active_chat_ids:

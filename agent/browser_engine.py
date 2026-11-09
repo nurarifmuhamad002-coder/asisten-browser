@@ -573,47 +573,479 @@ class CloudBrowserEngine:
             return f"Membuka {self._display_url(self.page.url)} ({title}) — Catatan: Situs ini menampilkan 403/Anti-Bot terhadap IP server cloud."
         return f"Berhasil membuka {self._display_url(self.page.url)} ({title})"
 
+    # ======================== PURE DOM FORM & ELEMENT HELPERS ========================
+
+    async def _resolve_dom_locator(
+        self,
+        target_el: Optional[Dict[str, Any]],
+        index: int,
+        for_click: bool = False,
+    ):
+        """
+        Resolusi elemen 100% berbasis DOM Selector, Label, atau Atribut HTML.
+        TIDAK PERNAH menggunakan koordinat piksel (x, y).
+        """
+        assert self.page is not None
+        if target_el:
+            etype = (target_el.get("type") or "").lower()
+            lbl_sel = target_el.get("label_selector") or ""
+            dom_sel = target_el.get("dom_selector") or ""
+
+            # Radio/checkbox custom dengan <input opacity:0> wajib diklik lewat <label for="...">
+            if for_click and lbl_sel and etype in ("radio", "checkbox"):
+                loc = self.page.locator(lbl_sel).first
+                if await loc.count() > 0:
+                    return loc
+
+            if dom_sel:
+                loc = self.page.locator(dom_sel).first
+                if await loc.count() > 0:
+                    return loc
+
+            if lbl_sel:
+                loc = self.page.locator(lbl_sel).first
+                if await loc.count() > 0:
+                    return loc
+
+        if index > 0:
+            by_idx = self.page.locator(f'[data-nusa-idx="{index}"]').first
+            if await by_idx.count() > 0:
+                if for_click and target_el and (target_el.get("type") or "").lower() in ("radio", "checkbox"):
+                    proxy_loc = self.page.locator(f'[data-nusa-proxy-idx="{index}"]').first
+                    if await proxy_loc.count() > 0:
+                        return proxy_loc
+                return by_idx
+
+        if target_el:
+            if target_el.get("label"):
+                by_lbl = self.page.get_by_label(target_el["label"], exact=False).first
+                if await by_lbl.count() > 0:
+                    return by_lbl
+            if target_el.get("placeholder"):
+                by_ph = self.page.get_by_placeholder(target_el["placeholder"], exact=False).first
+                if await by_ph.count() > 0:
+                    return by_ph
+            if target_el.get("text") and target_el.get("tag") in ("button", "a", "label", "div", "span", "li"):
+                by_txt = self.page.get_by_text(target_el["text"], exact=True).first
+                if await by_txt.count() > 0:
+                    return by_txt
+
+        return None
+
+    async def _dom_click_locator(self, locator: Any) -> None:
+        """Klik elemen murni lewat DOM (tanpa mouse.click(x,y)), otomatis singkirkan banner iklan penghalang."""
+        assert self.page is not None
+        try:
+            await locator.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})")
+        except Exception:
+            pass
+        try:
+            await locator.click(timeout=3500)
+        except Exception as exc:
+            if "Target crashed" in str(exc) or "closed" in str(exc).lower():
+                raise
+            # Singkirkan sticky footer / fixed ad banner yang menghalangi pointer, lalu klik ulang node DOM
+            try:
+                await self.page.evaluate(
+                    """() => {
+                        for (const s of ['#fixedban', 'footer', '[id*="google_ads"]', '.ad-banner']) {
+                            document.querySelectorAll(s).forEach(n => { n.style.display = 'none'; });
+                        }
+                    }"""
+                )
+                await locator.click(timeout=2500)
+            except Exception:
+                await locator.evaluate("el => el.click()")
+
+    async def _fill_autocomplete_dom(
+        self,
+        locator: Any,
+        raw_text: str,
+        target_el: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        Mengetik ke input Autocomplete / React-Select (seperti Subjects, State, City)
+        dan WAJIB memilih opsi hasil autocomplete yang muncul di DOM, lalu memverifikasi hasilnya.
+        """
+        assert self.page is not None
+        import re as _re
+
+        fname = (target_el or {}).get("label") or (target_el or {}).get("el_id") or "Autocomplete"
+        sel_info = (target_el or {}).get("dom_selector") or ""
+        items = [s.strip() for s in _re.split(r"[,;]+", raw_text) if s.strip()]
+        if not items:
+            return f"❌ GAGAL: Nilai untuk field '{fname}' kosong."
+
+        chosen_labels: List[str] = []
+        failed_items: List[str] = []
+
+        option_selector = (
+            '.subjects-auto-complete__option, '
+            '[id^="react-select-"][id*="-option-"], '
+            '[class*="auto-complete__option"], '
+            '[class*="__option"], '
+            '[role="option"], '
+            'ul[role="listbox"] li, '
+            '.autocomplete-items div, '
+            '.ui-menu-item'
+        )
+
+        for idx_i, item in enumerate(items):
+            if idx_i == 0:
+                try:
+                    await locator.focus()
+                except Exception:
+                    await self._dom_click_locator(locator)
+            else:
+                await locator.focus()
+
+            try:
+                cur_raw = await locator.input_value(timeout=1500)
+                if cur_raw:
+                    await locator.fill("", timeout=1500)
+            except Exception:
+                pass
+            await locator.press_sequentially(item, delay=35)
+
+            # Tunggu daftar opsi autocomplete muncul di DOM
+            opts = self.page.locator(option_selector)
+            appeared = False
+            for _ in range(18):
+                if await opts.count() > 0:
+                    appeared = True
+                    break
+                await asyncio.sleep(0.1)
+
+            picked_text = ""
+            if appeared:
+                cnt = await opts.count()
+                exact_idx = -1
+                prefix_idx = -1
+                contains_idx = -1
+                item_low = item.lower()
+
+                for i in range(min(cnt, 25)):
+                    cand = opts.nth(i)
+                    try:
+                        if not await cand.is_visible():
+                            continue
+                        t = (await cand.inner_text()).strip()
+                    except Exception:
+                        continue
+                    tl = t.lower()
+                    if tl == item_low and exact_idx < 0:
+                        exact_idx = i
+                        picked_text = t
+                        break
+                    elif tl.startswith(item_low) and prefix_idx < 0:
+                        prefix_idx = i
+                        picked_text = t
+                    elif item_low in tl and contains_idx < 0:
+                        contains_idx = i
+                        picked_text = t
+
+                best_idx = exact_idx if exact_idx >= 0 else (prefix_idx if prefix_idx >= 0 else contains_idx)
+                if best_idx >= 0:
+                    chosen_opt = opts.nth(best_idx)
+                    picked_text = (await chosen_opt.inner_text()).strip()
+                    await self._dom_click_locator(chosen_opt)
+                    await asyncio.sleep(0.12)
+                    chosen_labels.append(picked_text)
+                else:
+                    # Bersihkan teks mentah yang tidak cocok agar tidak memicu salah validasi
+                    try:
+                        await locator.fill("", timeout=1500)
+                        await self.page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    failed_items.append(f"'{item}' (tidak ada opsi autocomplete yang cocok)")
+            else:
+                try:
+                    await locator.fill("", timeout=1500)
+                except Exception:
+                    pass
+                failed_items.append(f"'{item}' (daftar saran autocomplete tidak muncul)")
+
+        # Baca ulang chip / nilai aktual dari container DOM untuk memastikan benar-benar terpilih!
+        verified_dom_val = await locator.evaluate(
+            """(el) => {
+                const box = el.closest('#subjectsContainer, #state, #city') || el.closest('[class$="-container"]');
+                if (box) {
+                    const m1 = Array.from(box.querySelectorAll('[class*="multi-value__label"]')).map(n => (n.innerText || '').trim()).filter(Boolean);
+                    if (m1.length) return m1.join(', ');
+                    const m2 = Array.from(box.querySelectorAll('[class*="multiValue"] > div:first-child')).map(n => (n.innerText || '').trim()).filter(Boolean);
+                    if (m2.length) return m2.join(', ');
+                    const single = box.querySelector('[class*="singleValue"], [class*="single-value"]');
+                    if (single && (single.innerText || '').trim()) return (single.innerText || '').trim();
+                }
+                return (el.value || '').trim();
+            }"""
+        )
+
+        if failed_items:
+            return (
+                f"❌ PERINGATAN AUTOCOMPLETE pada field '{fname}' ({sel_info}): "
+                f"gagal memilih {', '.join(failed_items)}. Nilai tersimpan saat ini: '{verified_dom_val or '(kosong)'}'."
+            )
+        return (
+            f"✅ Berhasil memilih autocomplete pada field '{fname}' ({sel_info}) -> "
+            f"Terpilih: '{verified_dom_val or ', '.join(chosen_labels)}'."
+        )
+
+    async def _validate_input_dom(
+        self,
+        locator: Any,
+        expected_text: str,
+        target_el: Optional[Dict[str, Any]],
+    ) -> str:
+        """Memeriksa panjang karakter, atribut maxlength/minlength/pattern, format email/angka, & checkValidity() DOM."""
+        import re as _re
+
+        fname = (target_el or {}).get("label") or (target_el or {}).get("name") or (target_el or {}).get("el_id") or "Input"
+        sel_info = (target_el or {}).get("dom_selector") or ""
+        meta = await locator.evaluate(
+            """(el) => ({
+                value: el.value !== undefined ? String(el.value) : (el.innerText || ''),
+                type: (el.getAttribute('type') || '').toLowerCase(),
+                id: el.id || '',
+                name: el.name || '',
+                maxLength: (typeof el.maxLength === 'number' && el.maxLength > 0 && el.maxLength < 524288) ? el.maxLength : null,
+                minLength: (typeof el.minLength === 'number' && el.minLength > 0) ? el.minLength : null,
+                pattern: el.getAttribute('pattern') || '',
+                required: !!el.required,
+                valid: (typeof el.checkValidity === 'function') ? el.checkValidity() : true,
+                validationMsg: el.validationMessage || ''
+            })"""
+        )
+        actual = meta.get("value", "")
+        max_len = meta.get("maxLength")
+        min_len = meta.get("minLength")
+        pattern = meta.get("pattern") or ""
+        etype = meta.get("type") or ""
+        ident = f"{meta.get('id', '')} {meta.get('name', '')} {fname}".lower()
+
+        problems: List[str] = []
+
+        if max_len and len(expected_text) > max_len:
+            problems.append(
+                f"panjang input ({len(expected_text)} karakter) melebihi batas maxlength={max_len} sehingga terpotong menjadi '{actual}' ({len(actual)} karakter)"
+            )
+        if min_len and len(actual) < min_len:
+            problems.append(f"panjang input ({len(actual)} karakter) kurang dari batas minlength={min_len}")
+
+        # Cek khusus nomor telepon 10 digit / pattern regex HTML
+        if pattern:
+            try:
+                if not _re.fullmatch(pattern, actual):
+                    problems.append(f"nilai '{actual}' tidak sesuai format pattern HTML '{pattern}'")
+            except Exception:
+                pass
+        elif ("usernumber" in ident or "mobile" in ident) and max_len == 10:
+            if not _re.fullmatch(r"\d{10}", actual):
+                problems.append(f"field '{fname}' mewajibkan tepat 10 digit angka (saat ini '{actual}', {len(actual)} karakter)")
+
+        if etype == "email" or "email" in ident:
+            if actual and not _re.fullmatch(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", actual):
+                problems.append(f"format email '{actual}' tidak valid")
+
+        if not meta.get("valid", True) and meta.get("validationMsg"):
+            problems.append(f"validasi HTML menolak nilai: {meta['validationMsg']}")
+
+        if actual != expected_text and not max_len and "date" not in ident:
+            if actual.strip() != expected_text.strip():
+                problems.append(f"nilai aktual di DOM ('{actual}') berbeda dari yang diketik ('{expected_text}')")
+
+        if problems:
+            return (
+                f"❌ MASALAH FORMAT/PANJANG pada field '{fname}' ({sel_info}): "
+                + "; ".join(problems)
+                + ". Wajib diperbaiki sebelum Submit!"
+            )
+        return f"✅ Berhasil mengisi field '{fname}' ({sel_info}) = '{actual}' (panjang {len(actual)} karakter, format valid)."
+
+    async def audit_form_state(self) -> Dict[str, Any]:
+        """Memeriksa seluruh field di dalam <form> sebelum tombol Submit diizinkan diklik."""
+        if not self.page:
+            return {"has_form": False, "fields": [], "issues": []}
+        return await self.page.evaluate(
+            """() => {
+                const form = document.querySelector('form');
+                if (!form) return { has_form: false, fields: [], issues: [] };
+
+                const fields = [];
+                const issues = [];
+                const radioGroups = new Map();
+
+                const resolveLbl = (el) => {
+                    if (el.id) {
+                        const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                        if (l && l.innerText.trim()) return l.innerText.trim();
+                    }
+                    const row = el.closest('.row, .mt-2, .form-group, tr');
+                    if (row) {
+                        const rl = row.querySelector('label.form-label, .col-md-3 label, td:first-child, label');
+                        if (rl && !rl.htmlFor && rl.innerText.trim()) return rl.innerText.trim();
+                    }
+                    return el.getAttribute('placeholder') || el.name || el.id || 'Field';
+                };
+
+                for (const el of Array.from(form.querySelectorAll('input:not([type="hidden"]), textarea, select'))) {
+                    const type = (el.getAttribute('type') || el.tagName).toLowerCase();
+                    if (type === 'submit' || type === 'button' || type === 'file') continue;
+
+                    const label = resolveLbl(el);
+                    if (type === 'radio') {
+                        const gName = el.name || el.id || 'radio';
+                        if (!radioGroups.has(gName)) {
+                            const row = el.closest('.row, .mt-2, .form-group') || form;
+                            const gLblNode = row.querySelector('label.form-label, .col-md-3');
+                            const gLabel = gLblNode ? gLblNode.innerText.trim() : gName;
+                            radioGroups.set(gName, { group: gLabel, required: !!el.required, chosen: [] });
+                        }
+                        if (el.checked) {
+                            radioGroups.get(gName).chosen.push(label || el.value);
+                        }
+                        if (el.required) radioGroups.get(gName).required = true;
+                        continue;
+                    }
+
+                    if (type === 'checkbox') {
+                        fields.push({ field: label, id: el.id, type, value: el.checked ? 'Checked' : 'Unchecked', checked: !!el.checked, valid: true });
+                        continue;
+                    }
+
+                    // Cek React-Select chips / singleValue
+                    let val = (el.value || '').trim();
+                    const box = el.closest('#subjectsContainer, #state, #city') || el.closest('[class$="-container"]');
+                    if (box && (el.id.includes('subjects') || el.id.startsWith('react-select-'))) {
+                        let chips = Array.from(box.querySelectorAll('[class*="multi-value__label"]')).map(n => n.innerText.trim()).filter(Boolean);
+                        if (!chips.length) {
+                            chips = Array.from(box.querySelectorAll('[class*="multiValue"] > div:first-child')).map(n => n.innerText.trim()).filter(Boolean);
+                        }
+                        const single = box.querySelector('[class*="singleValue"], [class*="single-value"]');
+                        const rawResidual = (el.value || '').trim();
+                        if (rawResidual && chips.length === 0 && !(single && single.innerText.trim())) {
+                            issues.push({ field: label, reason: `Teks '${rawResidual}' belum dipilih dari daftar autocomplete` });
+                        }
+                        val = chips.length ? chips.join(', ') : ((single && single.innerText.trim()) ? single.innerText.trim() : val);
+                    }
+
+                    const req = !!el.required || el.getAttribute('aria-required') === 'true';
+                    const valid = (typeof el.checkValidity === 'function') ? el.checkValidity() : true;
+                    const maxLen = (typeof el.maxLength === 'number' && el.maxLength > 0 && el.maxLength < 524288) ? el.maxLength : null;
+                    const minLen = (typeof el.minLength === 'number' && el.minLength > 0) ? el.minLength : null;
+
+                    if (req && !val) {
+                        issues.push({ field: label, reason: 'Field wajib (required) masih kosong' });
+                    } else if (!valid) {
+                        issues.push({ field: label, reason: el.validationMessage || `Format/panjang nilai '${val}' tidak valid` });
+                    } else if ((el.id === 'userNumber' || (maxLen === 10 && minLen === 10)) && val && !/^\\d{10}$/.test(val)) {
+                        issues.push({ field: label, reason: `Nomor harus tepat 10 digit angka (saat ini '${val}', ${val.length} karakter)` });
+                    }
+
+                    fields.push({ field: label, id: el.id, type, value: val, required: req, valid });
+                }
+
+                for (const [, rg] of radioGroups.entries()) {
+                    fields.push({ field: rg.group, type: 'radio-group', value: rg.chosen.join(', '), required: rg.required, valid: !rg.required || rg.chosen.length > 0 });
+                    if (rg.required && rg.chosen.length === 0) {
+                        issues.push({ field: rg.group, reason: 'Pilihan wajib (radio) belum dipilih' });
+                    }
+                }
+
+                return { has_form: true, fields, issues };
+            }"""
+        )
+
+    async def read_submission_result(self) -> Dict[str, Any]:
+        """Membaca tabel hasil setelah klik Submit & mendeteksi jika form gagal terkirim karena error field."""
+        if not self.page:
+            return {"submitted": False, "modal_title": "", "rows": [], "invalid_fields": []}
+        return await self.page.evaluate(
+            """() => {
+                const modal = document.querySelector('.modal.show, .modal-content, [role="dialog"]');
+                const rows = [];
+                const tables = modal
+                    ? Array.from(modal.querySelectorAll('table'))
+                    : Array.from(document.querySelectorAll('table'));
+
+                for (const tbl of tables) {
+                    const st = window.getComputedStyle(tbl);
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    for (const tr of Array.from(tbl.querySelectorAll('tbody tr, tr'))) {
+                        const cells = Array.from(tr.querySelectorAll('td, th')).map(c => (c.innerText || '').trim().replace(/\\s+/g, ' '));
+                        if (cells.length >= 2 && cells[0] && cells[0].toLowerCase() !== 'label') {
+                            rows.push({ label: cells[0], value: cells.slice(1).join(' | ') });
+                        }
+                    }
+                }
+
+                const invalidFields = [];
+                for (const inv of Array.from(document.querySelectorAll('form :invalid, form .is-invalid'))) {
+                    const tag = (inv.tagName || '').toLowerCase();
+                    if (tag === 'form' || tag === 'fieldset') continue;
+                    let lbl = inv.getAttribute('placeholder') || inv.name || inv.id || tag;
+                    if (inv.id) {
+                        const l = document.querySelector(`label[for="${CSS.escape(inv.id)}"]`);
+                        if (l && l.innerText.trim()) lbl = l.innerText.trim();
+                    }
+                    invalidFields.push({
+                        field: lbl,
+                        value: inv.value || '',
+                        reason: inv.validationMessage || 'Format tidak valid atau wajib diisi'
+                    });
+                }
+
+                const titleNode = modal ? modal.querySelector('.modal-title, h1, h2, h3, h4') : null;
+                return {
+                    submitted: rows.length > 0 || !!modal,
+                    modal_title: titleNode ? titleNode.innerText.trim() : '',
+                    rows,
+                    invalid_fields: invalidFields
+                };
+            }"""
+        )
+
     async def click_element(self, index: int, elements: List[Dict[str, Any]]) -> str:
         if not self.page:
             raise RuntimeError("Browser belum aktif.")
         target_el = next((e for e in elements if e["index"] == index), None)
-        selector = f'[data-nusa-idx="{index}"]'
 
         if target_el and self._viewer_count > 0:
             cx = target_el["rect"]["centerX"]
             cy = target_el["rect"]["centerY"]
             lbl = target_el.get("text") or target_el.get("label") or target_el.get("placeholder") or f"#{index}"
             await self.emit_cursor(cx, cy, f"Klik [{index}] {lbl[:28]}", "click")
-            await asyncio.sleep(0.1)
 
-        locator = self.page.locator(selector).first
+        locator = await self._resolve_dom_locator(target_el, index, for_click=True)
+        if locator is None:
+            return f"❌ Elemen [{index}] tidak ditemukan berdasarkan DOM selector maupun label."
+
         try:
-            if await locator.count() > 0:
-                await locator.scroll_into_view_if_needed(timeout=3000)
-                await locator.click(timeout=5000)
-            elif target_el:
-                await self.page.mouse.click(target_el["rect"]["centerX"], target_el["rect"]["centerY"])
-            else:
-                return f"Elemen [{index}] tidak ditemukan di halaman."
+            await self._dom_click_locator(locator)
         except Exception as exc:
             if "Target crashed" in str(exc) or "Target closed" in str(exc) or "closed" in str(exc).lower():
                 await self._force_restart()
                 return "Tab browser sempat penuh memori (auto-refresh bersih). Lanjutkan langkah berikutnya."
-            if target_el:
-                try:
-                    await self.page.mouse.click(target_el["rect"]["centerX"], target_el["rect"]["centerY"])
-                except Exception as exc2:
-                    if "Target crashed" in str(exc2) or "closed" in str(exc2).lower():
-                        await self._force_restart()
-                        return "Tab browser sempat penuh memori (auto-refresh bersih)."
-                    raise
-            else:
-                raise
+            return f"❌ Gagal klik elemen [{index}] lewat DOM selector: {exc}"
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.18)
         await self._refresh_if_watched()
-        desc = (target_el.get("text") or target_el.get("label") or f"elemen [{index}]") if target_el else f"elemen [{index}]"
-        return f"Berhasil klik [{index}] '{desc[:50]}'"
+
+        # Jika elemen adalah radio/checkbox, verifikasi langsung atribut .checked pada <input> aslinya!
+        if target_el and (target_el.get("type") or "").lower() in ("radio", "checkbox"):
+            inp_sel = target_el.get("dom_selector") or f'[data-nusa-idx="{index}"]'
+            inp_loc = self.page.locator(inp_sel).first
+            if await inp_loc.count() > 0:
+                try:
+                    is_chk = await inp_loc.is_checked()
+                    lbl_name = target_el.get("label") or target_el.get("name") or f"elemen [{index}]"
+                    return f"✅ Berhasil klik '{lbl_name}' ({inp_sel}) -> Status CHECKED={is_chk}."
+                except Exception:
+                    pass
+
+        desc = (target_el.get("text") or target_el.get("label") or target_el.get("dom_selector") or f"elemen [{index}]") if target_el else f"elemen [{index}]"
+        return f"Berhasil klik [{index}] '{desc[:60]}'"
 
     async def type_into_element(
         self,
@@ -626,69 +1058,112 @@ class CloudBrowserEngine:
         if not self.page:
             raise RuntimeError("Browser belum aktif.")
         target_el = next((e for e in elements if e["index"] == index), None)
-        selector = f'[data-nusa-idx="{index}"]'
 
-        if target_el:
+        if target_el and self._viewer_count > 0:
             cx = target_el["rect"]["centerX"]
             cy = target_el["rect"]["centerY"]
             await self.emit_cursor(cx, cy, f"Ketik '{text[:22]}'", "type")
-            await asyncio.sleep(0.2)
 
-        locator = self.page.locator(selector).first
-        if await locator.count() > 0:
-            await locator.scroll_into_view_if_needed(timeout=3000)
-            await locator.click(timeout=4000)
-            if clear_first:
-                try:
-                    await locator.fill(text, timeout=4000)
-                except Exception:
+        locator = await self._resolve_dom_locator(target_el, index, for_click=False)
+        if locator is None:
+            auto_inp = self.page.locator('input[type="search"], input[name*="search" i], input[name="q"], input[name="p"]').first
+            if index <= 0 and await auto_inp.count() > 0:
+                locator = auto_inp
+            else:
+                return f"❌ Field input [{index}] tidak ditemukan berdasarkan DOM selector, label, atau atribut HTML."
+
+        # Deteksi apakah ini field Autocomplete / Subjects / React-Select!
+        el_meta_id = ((target_el or {}).get("el_id") or "").lower()
+        is_auto = bool((target_el or {}).get("is_autocomplete")) or ("subject" in el_meta_id) or el_meta_id.startswith("react-select-")
+        if not is_auto:
+            try:
+                is_auto = await locator.evaluate(
+                    "el => (el.getAttribute('aria-autocomplete') === 'list') || /subject|auto-complete|react-select/i.test(el.id + ' ' + el.className)"
+                )
+            except Exception:
+                is_auto = False
+
+        if is_auto:
+            res_msg = await self._fill_autocomplete_dom(locator, text, target_el)
+            await self._refresh_if_watched()
+            return res_msg
+
+        # Deteksi khusus Datepicker (contoh: #dateOfBirthInput) agar nilai lama tidak bertumpuk & popup tertutup rapi
+        is_date_picker = ("date" in el_meta_id) or ("birth" in el_meta_id) or ((target_el or {}).get("type") == "date")
+        await self._dom_click_locator(locator)
+
+        if is_date_picker:
+            try:
+                if (target_el or {}).get("type") == "date":
+                    await locator.fill(text, timeout=3000)
+                else:
                     await self.page.keyboard.press("Control+A")
-                    await self.page.keyboard.press("Backspace")
                     await self.page.keyboard.insert_text(text)
-            else:
-                await self.page.keyboard.insert_text(text)
-        elif target_el:
-            await self.page.mouse.click(target_el["rect"]["centerX"], target_el["rect"]["centerY"])
+                    await self.page.keyboard.press("Enter")
+                    await self.page.keyboard.press("Escape")
+            except Exception:
+                await locator.fill(text, timeout=3000)
+        else:
             if clear_first:
-                await self.page.keyboard.press("Control+A")
-                await self.page.keyboard.press("Backspace")
-            await self.page.keyboard.insert_text(text)
-        else:
-            # Fallback pintar: cari kotak pencarian / input teks pertama di halaman
-            auto_inp = self.page.locator('input[type="search"], input[name*="search" i], input[name="q"], input[name="p"], input[type="text"], textarea').first
-            if await auto_inp.count() > 0:
                 try:
-                    await auto_inp.fill(text, timeout=3000)
+                    await locator.fill(text, timeout=3500)
                 except Exception:
-                    await self.page.keyboard.insert_text(text)
+                    await locator.press("Control+A")
+                    await locator.press("Backspace")
+                    await locator.press_sequentially(text, delay=15)
             else:
-                return f"Kolom input [{index}] tidak ditemukan — klik dulu ikon/tombol cari atau formnya."
+                await locator.press_sequentially(text, delay=15)
 
-        if press_enter:
+        if press_enter and not is_date_picker:
             await asyncio.sleep(0.08)
-            await self.page.keyboard.press("Enter")
-            await asyncio.sleep(0.3)
+            await locator.press("Enter")
+            await asyncio.sleep(0.25)
         else:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.08)
 
+        val_report = await self._validate_input_dom(locator, text, target_el)
         await self._refresh_if_watched()
-        return f"Mengetik '{text}' pada kolom [{index}]" + (" lalu tekan Enter." if press_enter else ".")
+        return val_report + (" (Enter ditekan)" if press_enter else "")
 
     async def select_dropdown(self, index: int, option_value_or_text: str, elements: List[Dict[str, Any]]) -> str:
         if not self.page:
             raise RuntimeError("Browser belum aktif.")
         target_el = next((e for e in elements if e["index"] == index), None)
-        selector = f'[data-nusa-idx="{index}"]'
-        if target_el:
-            await self.emit_cursor(
-                target_el["rect"]["centerX"],
-                target_el["rect"]["centerY"],
-                f"Pilih '{option_value_or_text[:22]}'",
-                "select",
-            )
-        locator = self.page.locator(selector).first
-        if await locator.count() == 0:
-            return f"Dropdown [{index}] tidak ditemukan."
+        locator = await self._resolve_dom_locator(target_el, index, for_click=False)
+        if locator is None:
+            return f"❌ Dropdown [{index}] tidak ditemukan berdasarkan DOM selector."
+
+        tag_name = ((target_el or {}).get("tag") or "").lower()
+        if not tag_name:
+            try:
+                tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
+            except Exception:
+                tag_name = "select"
+
+        # Jika bukan <select> asli (mis. custom dropdown React-Select #state / #city), pilih lewat DOM option!
+        if tag_name != "select":
+            await self._dom_click_locator(locator)
+            await asyncio.sleep(0.15)
+            opts = self.page.locator('[id^="react-select-"][id*="-option-"], [class*="__option"], [role="option"], li[role="option"]')
+            for _ in range(15):
+                if await opts.count() > 0:
+                    break
+                await asyncio.sleep(0.08)
+            cnt = await opts.count()
+            want_low = option_value_or_text.strip().lower()
+            for i in range(min(cnt, 30)):
+                cand = opts.nth(i)
+                try:
+                    if not await cand.is_visible():
+                        continue
+                    t = (await cand.inner_text()).strip()
+                    if t.lower() == want_low or want_low in t.lower():
+                        await self._dom_click_locator(cand)
+                        await self._refresh_if_watched()
+                        return f"✅ Berhasil memilih opsi '{t}' pada dropdown '{(target_el or {}).get('label') or index}'."
+                except Exception:
+                    continue
+            return f"❌ Opsi '{option_value_or_text}' tidak ditemukan pada custom dropdown [{index}]."
 
         try:
             await locator.select_option(label=option_value_or_text, timeout=3000)
@@ -696,7 +1171,6 @@ class CloudBrowserEngine:
             try:
                 await locator.select_option(value=option_value_or_text, timeout=3000)
             except Exception:
-                # Partial match fallback
                 opts = (target_el or {}).get("options", [])
                 matched = next(
                     (
@@ -710,11 +1184,12 @@ class CloudBrowserEngine:
                 if matched is not None:
                     await locator.select_option(value=matched, timeout=3000)
                 else:
-                    return f"Opsi '{option_value_or_text}' tidak ditemukan pada dropdown [{index}]."
+                    return f"❌ Opsi '{option_value_or_text}' tidak ditemukan pada <select> [{index}]."
 
-        await asyncio.sleep(0.3)
-        await self.refresh_frame()
-        return f"Memilih opsi '{option_value_or_text}' pada dropdown [{index}]."
+        selected_txt = await locator.evaluate("el => (el.selectedOptions && el.selectedOptions[0]) ? el.selectedOptions[0].text.trim() : el.value")
+        await asyncio.sleep(0.12)
+        await self._refresh_if_watched()
+        return f"✅ Berhasil memilih opsi '{selected_txt}' pada dropdown '{(target_el or {}).get('label') or index}'."
 
     async def scroll_page(self, direction: str = "down", amount: int = 520) -> str:
         if not self.page:

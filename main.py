@@ -334,7 +334,10 @@ async def get_browser_login_fields():
 @app.post("/api/browser/fill-credentials")
 async def fill_browser_credentials(payload: CredentialFillPayload):
     raw_items = [{"selector": it.selector, "value": it.value} for it in payload.items]
-    filled = await browser_engine.fill_credential_fields(raw_items)
+    filled = await browser_engine.fill_credential_fields(
+        raw_items,
+        captcha_solver=orchestrator.brain.solve_captcha_image,
+    )
     if payload.auto_resume:
         await orchestrator.resume_from_takeover()
     return {"ok": True, "filled": filled}

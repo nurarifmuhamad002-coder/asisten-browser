@@ -80,6 +80,17 @@ class CloudBrowserEngine:
         if "://" not in s and "@" in s:
             s = "http://" + s
 
+        cdn_bypass = "*.cloudflare.com,unpkg.com,*.unpkg.com,*.googleapis.com,*.gstatic.com,*.jsdelivr.net"
+
+        def _enrich_id_proxy(c: Dict[str, str]) -> Dict[str, str]:
+            c["bypass"] = cdn_bypass
+            # Jika user menempel kode mentah WaroengProxy tanpa kode negara, otomatis kunci ke IP Indonesia Sticky!
+            srv_l = c.get("server", "").lower()
+            usr = c.get("username", "")
+            if "waroengproxy.com" in srv_l and usr and "-cc-" not in usr:
+                c["username"] = f"{usr}-cc-ID-s-bot01-ttl-3600"
+            return c
+
         if "://" in s:
             u = urlparse(s)
             if not u.hostname or not u.port:
@@ -92,16 +103,16 @@ class CloudBrowserEngine:
                 cfg["username"] = unquote(u.username)
             if u.password is not None:
                 cfg["password"] = unquote(u.password)
-            return cfg
+            return _enrich_id_proxy(cfg)
 
         # Format tanpa skema: host:port atau host:port:user:pass
         parts = s.split(":")
         if len(parts) == 2 and parts[1].isdigit():
-            return {"server": f"http://{parts[0]}:{parts[1]}"}
+            return _enrich_id_proxy({"server": f"http://{parts[0]}:{parts[1]}"})
         if len(parts) >= 4 and parts[1].isdigit():
             host, port, user = parts[0], parts[1], parts[2]
             pw = ":".join(parts[3:])
-            return {"server": f"http://{host}:{port}", "username": user, "password": pw}
+            return _enrich_id_proxy({"server": f"http://{host}:{port}", "username": user, "password": pw})
 
         raise ValueError(
             "Format proxy belum dikenali. Contoh yang valid:\n"
@@ -501,11 +512,15 @@ class CloudBrowserEngine:
             suffix = url[len("demo-portal"):] if url.startswith("demo-portal") else url[len("/demo-portal"):]
             return f"http://127.0.0.1:{self.internal_port}/demo-portal{suffix}"
         if not url.startswith(("http://", "https://", "about:")):
-            # Jika terlihat seperti domain, tambahkan https://; jika kalimat pencarian, arahkan ke DuckDuckGo HTML
+            # Jika terlihat seperti domain, tambahkan https://; jika kalimat pencarian, arahkan ke Yahoo Search
             if "." in url and " " not in url:
-                return f"https://{url}"
-            from urllib.parse import quote_plus
-            return f"https://search.yahoo.com/search?p={quote_plus(url)}"
+                url = f"https://{url}"
+            else:
+                from urllib.parse import quote_plus
+                return f"https://search.yahoo.com/search?p={quote_plus(url)}"
+        # Domain lama siskopatuh.kemenag.go.id sudah resmi pindah ke siskopatuh.haji.go.id/web/
+        if "siskopatuh.kemenag.go.id" in url.lower():
+            return "https://siskopatuh.haji.go.id/web/"
         return url
 
     def _display_url(self, url: str) -> str:
@@ -722,14 +737,37 @@ class CloudBrowserEngine:
                 f"atau memblokir IP server Cloud ({err_s[:80]})."
             )
 
+        dcl_timeout = 8500 if self.proxy_config else 4800
         try:
-            await self.page.wait_for_load_state("domcontentloaded", timeout=3800)
+            await self.page.wait_for_load_state("domcontentloaded", timeout=dcl_timeout)
         except Exception:
-            # Hentikan skrip iklan yang menggantung supaya halaman langsung siap diklik tanpa Timeout!
+            # Hentikan skrip iklan HANYA jika body halaman utama sudah muncul (jangan pernah memutus <head> SPA!)
             try:
-                await asyncio.wait_for(self.page.evaluate("() => window.stop()"), timeout=1.5)
+                has_body = await asyncio.wait_for(
+                    self.page.evaluate("() => Boolean(document.body && document.body.innerText && document.body.innerText.trim().length > 60)"),
+                    timeout=1.5,
+                )
+                if has_body:
+                    await asyncio.wait_for(self.page.evaluate("() => window.stop()"), timeout=1.5)
             except Exception:
                 pass
+
+        # Jika halaman berupa SPA modern (#__nuxt / #app / #root) yang sedang me-render form, beri waktu singkat sampai elemen muncul
+        try:
+            is_loading_spa = await asyncio.wait_for(
+                self.page.evaluate(
+                    "() => Boolean(document.querySelector('#__nuxt, #app, #root') && document.querySelectorAll('input, button, a[href]').length < 2)"
+                ),
+                timeout=1.5,
+            )
+            if is_loading_spa:
+                for _ in range(8):
+                    await asyncio.sleep(0.4)
+                    cnt = await self.page.locator("input, button").count()
+                    if cnt >= 2:
+                        break
+        except Exception:
+            pass
 
         if self.page.url.startswith("chrome-error://"):
             try:
@@ -1512,8 +1550,14 @@ class CloudBrowserEngine:
         except Exception:
             return []
 
-    async def fill_credential_fields(self, items: List[Dict[str, str]], click_login: bool = True) -> int:
-        """Mengisi kredensial langsung dari HP user ke DOM Playwright + otomatis klik tombol Login (100% privat, tidak lewat AI)."""
+    async def fill_credential_fields(
+        self,
+        items: List[Dict[str, str]],
+        click_login: bool = True,
+        captcha_solver: Optional[Callable[..., Any]] = None,
+        manual_captcha: str = "",
+    ) -> int:
+        """Mengisi kredensial langsung ke DOM Playwright + otomatis menyelesaikan CAPTCHA gambar/matematika + klik tombol Login."""
         if not self.page or not items:
             return 0
         filled = 0
@@ -1532,13 +1576,160 @@ class CloudBrowserEngine:
             except Exception:
                 continue
 
-        if filled > 0 and click_login:
-            await self._click_login_submit_dom(last_loc)
+        if filled > 0:
+            if captcha_solver is not None or manual_captcha:
+                try:
+                    await self.auto_solve_captcha(solver_fn=captcha_solver, manual_answer=manual_captcha)
+                except Exception:
+                    pass
+            if click_login:
+                await asyncio.sleep(0.25)
+                await self._click_login_submit_dom(last_loc)
 
         await asyncio.sleep(0.45)
         await self.save_state()
         await self.refresh_frame()
         return filled
+
+    async def auto_solve_captcha(
+        self,
+        solver_fn: Optional[Callable[..., Any]] = None,
+        manual_answer: str = "",
+    ) -> str:
+        """
+        Universal Auto-CAPTCHA Solver (berlaku untuk SEMUA website umum, portal kampus, e-gov, maupun VueCaptcha):
+        1) #VueCaptcha (canvas penjumlahan/kode + tombol pensil tersembunyi + auto-retry Refresh jika meleset)
+        2) CAPTCHA Soal Matematika Teks langsung di label/halaman (contoh: 'Berapa 8 + 7 ?')
+        3) CAPTCHA Gambar / Canvas umum pada form mana pun (img/canvas captcha + kolom input captcha)
+        """
+        if not self.page:
+            return ""
+        import re as _re
+
+        def _eval_math_str(txt: str) -> str:
+            m = _re.search(r"(\d{1,3})\s*([\+\-\*x×])\s*(\d{1,3})", txt or "")
+            if not m:
+                return ""
+            a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+            if op == "+":
+                return str(a + b)
+            if op == "-":
+                return str(a - b)
+            return str(a * b)
+
+        # --- TIPE 1: VueCaptcha (contoh: SISKOPATUH & portal berbasis Vue) ---
+        try:
+            vue_canv = self.page.locator("canvas.vue-captcha-img:visible").first
+            if await vue_canv.count() > 0:
+                if await self.page.locator(".content-ok:visible").count() > 0:
+                    return "CAPTCHA sudah terverifikasi hijau."
+                for attempt in range(2):
+                    ans = manual_answer.strip() if (attempt == 0 and manual_answer.strip()) else ""
+                    if not ans and solver_fn is not None:
+                        png_bytes = await vue_canv.screenshot(type="png", timeout=4000)
+                        ans = (await solver_fn(png_bytes, "image/png", "CAPTCHA matematika atau kode")) or ""
+                        ans = ans.strip()
+                    if not ans:
+                        break
+                    pencil = self.page.locator('button[title="Written"]:visible').first
+                    if await pencil.count() > 0:
+                        await pencil.click(timeout=2500)
+                        await asyncio.sleep(0.18)
+                    cap_inp = self.page.locator('input[placeholder="insert key..."]:visible').first
+                    if await cap_inp.count() > 0:
+                        await cap_inp.fill(ans, timeout=2500)
+                        await cap_inp.press("Enter")
+                        await asyncio.sleep(0.35)
+                    if await self.page.locator(".content-ok:visible").count() > 0:
+                        await self._refresh_if_watched()
+                        return f"CAPTCHA otomatis terisi & lolos verifikasi ('{ans}')"
+                    # Jika percobaan pertama belum tembus, klik tombol Refresh CAPTCHA lalu baca gambar baru!
+                    ref_btn = self.page.locator('button[title="Refresh"]:visible').first
+                    if attempt == 0 and await ref_btn.count() > 0:
+                        await ref_btn.click(timeout=2000)
+                        await asyncio.sleep(0.4)
+        except Exception:
+            pass
+
+        # --- TIPE 2 & 3: CAPTCHA Umum di Website Mana Saja (Gambar <img>/<canvas> atau Soal Hitungan Teks) ---
+        try:
+            cap_info = await self.page.evaluate(
+                """() => {
+                    const cssEsc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([ #;?%&,.+*~\\':"!^$[\\]()=>|/@])/g, '\\\\$1');
+                    const isVis = (el) => {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        const r = el.getBoundingClientRect();
+                        return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 8 && r.height > 8;
+                    };
+                    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="password"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])'));
+                    let targetInp = null;
+                    let nearText = '';
+
+                    for (const inp of inputs) {
+                        if (inp.disabled || !isVis(inp)) continue;
+                        const meta = [
+                            inp.name || '', inp.id || '', inp.placeholder || '',
+                            inp.getAttribute('aria-label') || '', inp.className || ''
+                        ].join(' ').toLowerCase();
+                        const box = inp.closest('form, .form-group, .v-input, tr, div') || inp.parentElement;
+                        const boxTxt = box ? (box.innerText || '').slice(0, 220) : '';
+                        if (/captcha|securimage|security.?code|verifikasi|kode.?aman|kode.?keamanan|insert key|hitung|berapa hasil/i.test(meta + ' ' + boxTxt)) {
+                            // Pastikan bukan kolom email/username utama
+                            if (/username|email|userid|login|telepon|phone|search|cari/i.test(meta) && !/captcha|kode/i.test(meta)) continue;
+                            targetInp = inp;
+                            nearText = boxTxt;
+                            break;
+                        }
+                    }
+                    if (!targetInp) return null;
+
+                    let inpSel = '';
+                    if (targetInp.id) inpSel = `#${cssEsc(targetInp.id)}`;
+                    else if (targetInp.name) inpSel = `input[name="${cssEsc(targetInp.name)}"]`;
+                    else if (targetInp.placeholder) inpSel = `input[placeholder="${cssEsc(targetInp.placeholder)}"]`;
+                    if (!inpSel) {
+                        targetInp.setAttribute('data-auto-cap-inp', '1');
+                        inpSel = 'input[data-auto-cap-inp="1"]';
+                    }
+
+                    // Cari elemen gambar / canvas CAPTCHA terdekat
+                    let imgSel = '';
+                    const scope = targetInp.closest('form') || document.body;
+                    const mediaEls = Array.from(scope.querySelectorAll('img, canvas, svg')).filter(isVis);
+                    for (const m of mediaEls) {
+                        const mMeta = [m.id || '', m.className || '', m.getAttribute('src') || '', m.getAttribute('alt') || ''].join(' ').toLowerCase();
+                        const r = m.getBoundingClientRect();
+                        if (/captcha|securimage|verifikasi|security|kode|math/i.test(mMeta) || (m.tagName === 'CANVAS' && r.width <= 360 && r.height <= 140)) {
+                            m.setAttribute('data-auto-cap-img', '1');
+                            imgSel = '[data-auto-cap-img="1"]';
+                            break;
+                        }
+                    }
+                    return { inpSel, imgSel, nearText };
+                }"""
+            )
+            if cap_info and cap_info.get("inpSel"):
+                ans = manual_answer.strip()
+                if not ans:
+                    # Cek dulu apakah soal hitungan tertulis langsung berupa teks di sebelahnya
+                    ans = _eval_math_str(cap_info.get("nearText", ""))
+                if not ans and cap_info.get("imgSel") and solver_fn is not None:
+                    img_loc = self.page.locator(cap_info["imgSel"]).first
+                    if await img_loc.count() > 0:
+                        png_bytes = await img_loc.screenshot(type="png", timeout=4000)
+                        ans = (await solver_fn(png_bytes, "image/png", cap_info.get("nearText", ""))) or ""
+                        ans = ans.strip()
+                if ans:
+                    inp_loc = self.page.locator(cap_info["inpSel"]).first
+                    await inp_loc.fill(ans, timeout=3000)
+                    await asyncio.sleep(0.2)
+                    await self._refresh_if_watched()
+                    return f"CAPTCHA otomatis terisi ('{ans}')"
+        except Exception:
+            pass
+
+        return ""
 
     async def _click_login_submit_dom(self, fallback_loc: Any = None) -> bool:
         """Klik tombol Login / Masuk / Sign In secara otomatis lewat DOM selector setelah user mengisi kredensial."""
@@ -1548,18 +1739,20 @@ class CloudBrowserEngine:
             '#login-button',
             '#identifierNext button',
             '#passwordNext button',
-            'button[type="submit"]',
-            'input[type="submit"]',
-            'button:has-text("Login")',
-            'button:has-text("Log in")',
-            'button:has-text("Sign in")',
-            'button:has-text("Masuk")',
-            'button:has-text("Berikutnya")',
-            'button:has-text("Selanjutnya")',
-            'button:has-text("Lanjut")',
-            'button:has-text("Next")',
-            'button:has-text("Verify")',
-            'button:has-text("Verifikasi")',
+            'button[type="submit"]:not([disabled])',
+            'input[type="submit"]:not([disabled])',
+            'button:has-text("LOGIN"):not([disabled])',
+            'button:has-text("Login"):not([disabled])',
+            'button:has-text("Log in"):not([disabled])',
+            'button:has-text("Sign in"):not([disabled])',
+            'button:has-text("MASUK"):not([disabled])',
+            'button:has-text("Masuk"):not([disabled])',
+            'button:has-text("Berikutnya"):not([disabled])',
+            'button:has-text("Selanjutnya"):not([disabled])',
+            'button:has-text("Lanjut"):not([disabled])',
+            'button:has-text("Next"):not([disabled])',
+            'button:has-text("Verify"):not([disabled])',
+            'button:has-text("Verifikasi"):not([disabled])',
         ]
         for sel in login_selectors:
             try:
@@ -1577,10 +1770,14 @@ class CloudBrowserEngine:
                 pass
         return False
 
-    async def smart_login_from_chat(self, raw_text: str) -> str:
+    async def smart_login_from_chat(
+        self,
+        raw_text: str,
+        captcha_solver: Optional[Callable[..., Any]] = None,
+    ) -> str:
         """
-        Memungkinkan user login cukup dengan membalas di chat Telegram (misal: `user | pass` atau langsung `kode_otp`),
-        tanpa perlu membuka halaman layar browser sama sekali!
+        Memungkinkan user login cukup dengan membalas di chat Telegram (misal: `user | pass` atau `user | pass | kode_captcha`),
+        Otomatis membaca & mengisi CAPTCHA gambar/matematika jika ada di halaman tanpa perlu buka layar browser!
         """
         clean = (raw_text or "").strip()
         if not clean or not self.page:
@@ -1593,20 +1790,21 @@ class CloudBrowserEngine:
 
         parts: List[str] = []
         if "|" in clean:
-            parts = [p.strip() for p in clean.split("|", 1)]
+            parts = [p.strip() for p in clean.split("|")]
         elif "\n" in clean:
             lines = [ln.strip() for ln in clean.splitlines() if ln.strip()]
             if len(lines) >= 2:
-                parts = [lines[0], lines[1]]
+                parts = lines
         elif " / " in clean:
-            parts = [p.strip() for p in clean.split(" / ", 1)]
+            parts = [p.strip() for p in clean.split(" / ")]
 
         # Bersihkan prefix opsional seperti "user: xxx" / "pass: yyy"
         import re as _re
 
         def _strip_prefix(v: str) -> str:
-            return _re.sub(r"^(?:username|user|email|id|password|pass|sandi|otp|kode)\s*[:=]\s*", "", v, flags=_re.I).strip()
+            return _re.sub(r"^(?:username|user|email|id|password|pass|sandi|otp|kode|captcha)\s*[:=]\s*", "", v, flags=_re.I).strip()
 
+        manual_cap = _strip_prefix(parts[2]) if len(parts) >= 3 else ""
         items_to_fill: List[Dict[str, str]] = []
         if len(parts) >= 2:
             u_val, p_val = _strip_prefix(parts[0]), _strip_prefix(parts[1])
@@ -1628,6 +1826,32 @@ class CloudBrowserEngine:
                 items_to_fill.append({"selector": pass_f["selector"], "value": single_val})
 
         if items_to_fill:
-            cnt = await self.fill_credential_fields(items_to_fill, click_login=True)
-            return f"Berhasil mengisi {cnt} kolom login & menekan tombol Masuk otomatis."
+            filled = 0
+            last_loc = None
+            for item in items_to_fill:
+                sel = (item.get("selector") or "").strip()
+                val = item.get("value")
+                if not sel or not val:
+                    continue
+                try:
+                    loc = self.page.locator(sel).first
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                    await loc.fill(str(val), timeout=3500)
+                    last_loc = loc
+                    filled += 1
+                except Exception:
+                    continue
+
+            cap_note = ""
+            if captcha_solver is not None or manual_cap:
+                cap_res = await self.auto_solve_captcha(solver_fn=captcha_solver, manual_answer=manual_cap)
+                if cap_res:
+                    cap_note = f" + {cap_res}"
+
+            await asyncio.sleep(0.25)
+            await self._click_login_submit_dom(last_loc)
+            await asyncio.sleep(0.5)
+            await self.save_state()
+            await self.refresh_frame()
+            return f"Berhasil mengisi {filled} kolom login{cap_note} & menekan tombol Masuk otomatis."
         return "Kolom login tidak ditemukan di halaman."

@@ -421,7 +421,10 @@ class TelegramBotBridge:
             # Langsung hapus pesan berisi password dari riwayat chat Telegram dalam <0.5 detik agar 100% aman & bersih!
             if msg_id:
                 asyncio.create_task(self._delete_msg(chat_id, msg_id))
-            login_res = await self.orchestrator.browser.smart_login_from_chat(text)
+            login_res = await self.orchestrator.browser.smart_login_from_chat(
+                text,
+                captcha_solver=self.orchestrator.brain.solve_captcha_image,
+            )
             await self.send_text(
                 chat_id,
                 f"🔐 {login_res}\n🧹 Pesan sandi barusan otomatis gua hapus dari chat biar aman. Lanjut kerjain tugas!",

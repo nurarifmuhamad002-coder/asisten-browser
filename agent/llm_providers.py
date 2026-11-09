@@ -191,7 +191,8 @@ DAFTAR ACTION YANG TERSEDIA (pilih TEPAT SATU action setiap langkah):
 - `{"name": "read_file", "filename": "profil_pengajuan.json"}` -> Baca isi file dari folder workspace (mendukung `.pdf`, `.docx`, `.xlsx`, `.csv`, `.json`, `.md`, `.txt`).
 - `{"name": "write_file", "filename": "hasil_riset.docx", "content": "..."}` -> Buat/timpa file di folder workspace. MENDUKUNG OTOMATIS format Word (`.docx`), Excel (`.xlsx`), PDF (`.pdf`), `.md`, dan `.csv`! (Gunakan format `# Judul`, `## Subjudul`, dan tabel pipa `| Kolom 1 | Kolom 2 |` di dalam `content` agar otomatis dikonversi menjadi dokumen Word/Excel/PDF rapi).
 - `{"name": "append_file", "filename": "catatan.md", "content": "..."}` -> Tambahkan teks ke file di workspace.
-- `{"name": "request_human_login", "reason": "Silakan login ke akun kamu terlebih dahulu di layar browser."}` -> Jeda agent & serahkan kontrol layar ke user untuk login/2FA/CAPTCHA.
+- `{"name": "solve_captcha"}` -> Baca, hitung, dan isi otomatis CAPTCHA gambar/matematika/teks yang ada di halaman saat ini menggunakan AI Vision! (Gunakan kapan saja ada CAPTCHA gambar/penjumlahan angka di formulir atau setelah mengisi username/password).
+- `{"name": "request_human_login", "reason": "Silakan login ke akun kamu terlebih dahulu di layar browser."}` -> Jeda agent & serahkan kontrol ke user untuk login akun pribadi / OTP.
 - `{"name": "ask_approval", "index": 9, "reason": "Konfirmasi pembayaran sebesar Rp ..."}` -> Minta izin user sebelum mengeksekusi elemen sensitif [index].
 - `{"name": "done", "summary": "Ringkasan lengkap hasil pekerjaan untuk user."}` -> Pekerjaan selesai.
 
@@ -433,6 +434,47 @@ class MultiLLMBrain:
             except Exception:
                 continue
         return "chat"
+
+    async def solve_captcha_image(self, raw_bytes: bytes, mime_type: str = "image/png", hint_text: str = "") -> str:
+        """Membaca & menghitung CAPTCHA gambar (angka penjumlahan, pengurangan, perkalian, atau kode huruf/angka) secara presisi."""
+        if not self.config.has_api_key or not raw_bytes:
+            return ""
+        import base64 as _b64
+
+        b64_img = _b64.b64encode(raw_bytes).decode("ascii")
+        prompt = (
+            "Baca gambar CAPTCHA ini dengan sangat teliti.\n"
+            "1. Jika gambar berisi soal operasi hitung matematika (contoh: '12 + 18', '25 - 6', '7 x 4', '9 + 5 = ?'), "
+            "HITUNG hasil matematikanya dengan benar dan kembalikan HANYA angka hasil akhirnya saja (contoh: '30').\n"
+            "2. Jika gambar berisi kode teks huruf/angka biasa (contoh: 'X8kP2' atau '73914'), kembalikan HANYA teks kodenya persis sesuai huruf besar/kecilnya tanpa spasi.\n"
+            f"{('Konteks tambahan di sekitar gambar: ' + hint_text[:120]) if hint_text else ''}\n"
+            'Balas HANYA JSON murni: {"expr": "teks asli di gambar", "answer": "jawaban_bersih"}'
+        )
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": mime_type, "data": b64_img}},
+                    ],
+                }
+            ],
+            "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
+        }
+        client = get_shared_http()
+        for m_name in ("gemini-3.1-flash-lite-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite"):
+            u = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}"
+            try:
+                r = await client.post(u, json=payload, timeout=7.5)
+                if r.status_code == 200:
+                    raw_t = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    ans = str(_extract_json(raw_t).get("answer") or "").strip()
+                    if ans:
+                        return ans
+            except Exception:
+                continue
+        return ""
 
     async def analyze_media(
         self,

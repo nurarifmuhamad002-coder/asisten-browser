@@ -536,6 +536,10 @@ class AgentOrchestrator:
         if act_name == "go_back":
             return await self.browser.go_back()
 
+        if act_name == "solve_captcha":
+            cap_res = await self.browser.auto_solve_captcha(solver_fn=self.brain.solve_captcha_image)
+            return cap_res or "Tidak ditemukan CAPTCHA gambar/hitungan yang perlu diisi di halaman ini."
+
         if act_name == "list_files":
             flist = self.file_manager.list_files()
             summary = ", ".join(f["name"] for f in flist) or "(kosong)"

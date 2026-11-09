@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+from pathlib import Path
 import re
 import secrets
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
@@ -736,31 +737,102 @@ class TelegramBotBridge:
             return
 
         if mode == "chat":
-            # Jangan tunggu roundtrip "typing" — langsung jalankan Gemini detik ke-0.000!
-            asyncio.create_task(self._send_chat_action(chat_id, "typing"))
+            # Deteksi format file yang diminta user (Word / Excel / PDF) secara fleksibel
+            req_fmt = ""
+            if re.search(r"\b(pdf|\.pdf)\b", low):
+                req_fmt = "pdf"
+            elif re.search(r"\b(excel|xlsx|\.xlsx|spreadsheet)\b", low):
+                req_fmt = "xlsx"
+            elif re.search(r"\b(word|docx|\.docx)\b", low):
+                req_fmt = "docx"
+
+            # KASUS A: User minta KONVERSI / KIRIM ULANG file yang barusan dibuat (contoh: "ke pdf", "jadiin excel", "mana pdf nama gua nya?")
+            is_followup_convert = bool(
+                req_fmt
+                and (
+                    len(low.split()) <= 6
+                    or any(
+                        p in low
+                        for p in (
+                            "ke pdf", "ke word", "ke excel", "jadi pdf", "jadi word", "jadi excel",
+                            "jadiin pdf", "jadiin word", "jadiin excel", "ubah ke", "konversi", "convert",
+                            "mana pdf", "mana word", "mana excel", "mana file", "kirim pdf", "kirim file",
+                            "versi pdf", "versi word", "versi excel",
+                        )
+                    )
+                )
+                and not any(
+                    new_w in low
+                    for new_w in ("bikinin surat", "buatkan surat", "buatkan makalah", "tulis artikel", "jelaskan ", "apa bedanya ")
+                )
+            )
+            if is_followup_convert:
+                asyncio.create_task(self._send_chat_action(chat_id, "upload_document"))
+                fm = self.orchestrator.file_manager
+                user_files = [
+                    f for f in fm.list_files()
+                    if f["name"] not in ("profil_pengajuan.json", "catatan_workspace.md")
+                ]
+                src_content = ""
+                stem_name = ""
+                # Cek apakah user menyebut nama file spesifik, atau ambil file terbaru di workspace
+                for uf in user_files:
+                    st = Path(uf["name"]).stem.lower()
+                    if st and st in low:
+                        stem_name = Path(uf["name"]).stem
+                        src_content = fm.read_file(uf["name"])
+                        break
+                if not src_content and user_files:
+                    latest_f = user_files[0]["name"]
+                    stem_name = Path(latest_f).stem
+                    if Path(latest_f).suffix.lower().lstrip(".") == req_fmt:
+                        fpath = fm.get_file_path(latest_f)
+                        await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 Ini file {fpath.name} lu bro!")
+                        return
+                    src_content = fm.read_file(latest_f)
+                if not src_content:
+                    src_content = self.last_output_text.get(chat_id) or ""
+                if not src_content and self.orchestrator.user_memories:
+                    src_content = "\n".join(self.orchestrator.user_memories)
+                    stem_name = "data_profil"
+
+                if src_content.strip():
+                    from datetime import datetime as _dt
+                    out_stem = stem_name or f"dokumen_{_dt.now().strftime('%H%M%S')}"
+                    saved = fm.export_formatted(out_stem, src_content, req_fmt)
+                    fpath = fm.get_file_path(saved["name"])
+                    await self.send_document(
+                        chat_id,
+                        fpath.name,
+                        fpath.read_bytes(),
+                        f"📄 Beres dikonversi jadi .{req_fmt.upper()} asli: {fpath.name}",
+                    )
+                    return
+
+            # KASUS B: Ngobrol biasa ATAU minta dibuatkan dokumen baru (Word / Excel / PDF)
+            asyncio.create_task(self._send_chat_action(chat_id, "upload_document" if req_fmt else "typing"))
             await self.orchestrator._push_chat("user", text)
+            prompt_for_ai = (
+                f"{text}\n\n(INSTRUKSI SISTEM: Tulis HANYA isi naskah/tabel dokumennya saja secara bersih dan lengkap tanpa kata pengantar obrolan dan TANPA link download palsu, karena sistem otomatis mengubah teks balasanmu menjadi file .{req_fmt.upper()} asli!)"
+                if req_fmt and not any(q in low for q in ("apa itu ", "bedanya ", "cara buka "))
+                else text
+            )
             reply = await self.orchestrator.brain.quick_chat(
-                text,
+                prompt_for_ai,
                 self.orchestrator.chat_messages[:-1],
                 user_memory_block=self.orchestrator.format_user_memory_block(),
             )
+            # Sapu bersih kalau-kalau AI masih menulis link halusinasi sandbox:/mnt/data/...
+            reply = re.sub(r"\[[^\]]*\]\(sandbox:[^\)]+\)", "", reply).strip()
             await self.orchestrator._push_chat("agent", reply)
             self.last_output_text[chat_id] = reply
 
-            # Jika user di mode Ngobrol minta langsung dibikinkan file Word / Excel / PDF
-            req_fmt = ""
-            if any(k in low for k in (".docx", "jadi word", "file word", "dokumen word", "format word")):
-                req_fmt = "docx"
-            elif any(k in low for k in (".xlsx", "jadi excel", "file excel", "tabel excel", "format excel")):
-                req_fmt = "xlsx"
-            elif any(k in low for k in (".pdf", "jadi pdf", "file pdf", "dokumen pdf", "format pdf")):
-                req_fmt = "pdf"
-
-            if req_fmt:
+            if req_fmt and not any(q in low for q in ("apa itu pdf", "apa itu excel", "apa itu word")):
                 from datetime import datetime as _dt
-                saved = self.orchestrator.file_manager.export_formatted(f"tugas_{_dt.now().strftime('%H%M%S')}", reply, req_fmt)
+                m_fn = re.search(r"([a-zA-Z0-9_\-]{2,40})\.(?:pdf|docx|xlsx)\b", text)
+                stem_new = m_fn.group(1) if m_fn else f"dokumen_{_dt.now().strftime('%H%M%S')}"
+                saved = self.orchestrator.file_manager.export_formatted(stem_new, reply, req_fmt)
                 fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
-                await self.send_text(chat_id, reply, reply_markup=MAIN_MENU_KB)
                 await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 File .{req_fmt.upper()} siap dipakai: {fpath.name}")
                 return
 

@@ -71,6 +71,11 @@ class TelegramBotBridge:
         self.chat_modes: Dict[int, str] = {}  # "chat" | "agent" | "open_web"
         self.last_output_text: Dict[int, str] = {}
         self._status_msg_ids: Dict[int, int] = {}
+        self._last_rendered_card: Dict[int, str] = {}
+        self._run_started_at: float = 0.0
+        self._last_step_num: int = 0
+        self._last_thought: str = ""
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._seen_update_ids: Set[int] = set()
         self._poll_task: Optional[asyncio.Task] = None
         self._offset: int = 0
@@ -321,7 +326,12 @@ class TelegramBotBridge:
                 await self._answer_cb(cb_id, "Dibatalkan.")
             elif data == "resume_login":
                 await self.orchestrator.resume_from_takeover()
+                self.start_progress_heartbeat()
                 await self._answer_cb(cb_id, "Melanjutkan pekerjaan...")
+            elif data == "stop_running":
+                await self.orchestrator.stop_goal()
+                await self._finalize_progress_cards("⏹️ PEKERJAAN DIHENTIKAN OLEH LU")
+                await self._answer_cb(cb_id, "Pekerjaan dihentikan.")
             elif data == "snap_screen":
                 await self._answer_cb(cb_id, "Mengambil foto layar...")
                 await self._send_screen_snapshot(chat_id)
@@ -431,7 +441,26 @@ class TelegramBotBridge:
                 reply_markup=MAIN_MENU_KB,
             )
             await self.orchestrator.resume_from_takeover()
+            self.start_progress_heartbeat()
             return
+
+        # PELINDUNG SAAT BOT SEDANG KERJA AKTIF: Jangan batalkan tugas kalau user cuma nanya kabar ("?", "udah belum", dll)!
+        if self.orchestrator.state == "RUNNING" and not menu_or_cmd:
+            check_phrases = (
+                "?", "udah", "belum", "gimana", "kok lama", "lama", "jalan gak", "lagi ngerjain",
+                "masih", "halo", "bro", "tes", "cek", "nyangkut", "aman",
+            )
+            if len(text) <= 32 and any(cp in low for cp in check_phrases):
+                import time as _t
+                el_s = max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1
+                await self.send_text(
+                    chat_id,
+                    f"🟢 Mesin masih jalan aktif bro (⏱️ {el_s} detik berjalan)!\n"
+                    f"📍 Lagi di: {self.orchestrator.live_status}\n\n"
+                    "Tenang aja, tugas lu nggak gua batalin. Tap 📸 Cek Layar kalau mau ngintip posisinya, atau ketik `stop` kalau beneran mau batalin!",
+                    reply_markup=MAIN_MENU_KB,
+                )
+                return
 
         # PENGATURAN AI & PROXY INDONESIA LANGSUNG DARI TELEGRAM (/setting, /apikey, /proxy)
         if low in ("/setting", "/settings", "setting"):
@@ -659,10 +688,21 @@ class TelegramBotBridge:
             return
 
         # Mode "agent" (Kerjain Tugas Web)
-        mid = await self.send_text(chat_id, f"⏳ Lagi gua kerjain di browser bro: {text}")
+        import time as _t
+        self._run_started_at = _t.monotonic()
+        self._last_step_num = 1
+        self._last_thought = "Memahami perintah & menyiapkan browser..."
+        init_card = (
+            "🟢 MESIN SEDANG BEKERJA AKTIF · ⏱️ 0 dtk\n"
+            f"🎯 Tugas: {text[:130]}\n"
+            "📍 Aktivitas: Memahami perintah & menyiapkan browser..."
+        )
+        mid = await self.send_text(chat_id, init_card, reply_markup=self._running_inline_kb())
         if mid:
             self._status_msg_ids[chat_id] = mid
+            self._last_rendered_card[chat_id] = init_card
         await self.orchestrator.start_goal(text)
+        self.start_progress_heartbeat()
 
     async def _detect_auto_route(self, chat_id: int, text: str, low: str) -> tuple[str, str]:
         """
@@ -901,13 +941,105 @@ class TelegramBotBridge:
         except Exception:
             pass
 
-    async def _edit_text(self, chat_id: int, message_id: int, text: str) -> None:
+    def _running_inline_kb(self) -> Dict[str, Any]:
+        rows: List[List[Dict[str, Any]]] = [
+            [
+                {"text": "📸 Intip Layar", "callback_data": "snap_screen"},
+                {"text": "⏹️ Hentikan", "callback_data": "stop_running"},
+            ]
+        ]
+        live_u = self.protected_web_url()
+        if live_u.startswith("https://"):
+            rows.append([{"text": "🖥️ Tonton Layar Live (CCTV)", "url": live_u}])
+        return {"inline_keyboard": rows}
+
+    def _build_progress_card_text(self, header_override: str = "", tick_idx: int = 0) -> str:
+        import time as _t
+        el_s = max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1
+        pulse = ("🟢", "⚡")[tick_idx % 2]
+        hdr = header_override or f"{pulse} MESIN SEDANG BEKERJA AKTIF · ⏱️ {el_s} dtk"
+
+        cur_u = ""
+        try:
+            if self.orchestrator and self.orchestrator.browser and self.orchestrator.browser.page:
+                raw_u = self.orchestrator.browser._display_url(self.orchestrator.browser.page.url)
+                if raw_u and raw_u != "about:blank":
+                    cur_u = raw_u[:75]
+        except Exception:
+            pass
+
+        plan = (self.orchestrator.current_plan if self.orchestrator else None) or []
+        plan_lines: List[str] = []
+        for idx, p in enumerate(plan[:6], 1):
+            st = (p.get("status") or "").lower()
+            if header_override.startswith("✅"):
+                icon = "✅"
+            else:
+                icon = "✅" if st == "completed" else ("🔄" if st == "in_progress" else "⬜")
+            plan_lines.append(f"{icon} {idx}. {(p.get('step') or '')[:62]}")
+        plan_block = ("\n\n🧭 Rencana Tahap Kerja:\n" + "\n".join(plan_lines)) if plan_lines else ""
+
+        act_txt = self._last_thought or (self.orchestrator.live_status if self.orchestrator else "Memproses...")
+        step_prefix = f"Langkah {self._last_step_num}: " if self._last_step_num > 0 else ""
+        url_line = f"\n🌐 Web: {cur_u}" if cur_u else ""
+        return f"{hdr}{url_line}\n📍 {step_prefix}{act_txt[:185]}{plan_block}"
+
+    def start_progress_heartbeat(self) -> None:
+        """Detak indikator live setiap 4 detik selama bot bekerja: 'sedang mengetik...' nonstop + stopwatch berjalan!"""
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            return
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        tick = 0
+        try:
+            while self.orchestrator and self.orchestrator.state == "RUNNING":
+                targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+                for cid in targets:
+                    asyncio.create_task(self._send_chat_action(cid, "typing"))
+                await asyncio.sleep(4.2)
+                if not self.orchestrator or self.orchestrator.state != "RUNNING":
+                    break
+                tick += 1
+                card_txt = self._build_progress_card_text(tick_idx=tick)
+                kb = self._running_inline_kb()
+                for cid in targets:
+                    mid = self._status_msg_ids.get(cid)
+                    if mid and self._last_rendered_card.get(cid) != card_txt:
+                        self._last_rendered_card[cid] = card_txt
+                        await self._edit_text(cid, mid, card_txt, reply_markup=kb)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def _finalize_progress_cards(self, header_label: str) -> None:
+        if not self.is_configured or not self.active_chat_ids:
+            return
+        card_txt = self._build_progress_card_text(header_override=header_label)
+        targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+        for cid in targets:
+            mid = self._status_msg_ids.get(cid)
+            if mid and self._last_rendered_card.get(cid) != card_txt:
+                self._last_rendered_card[cid] = card_txt
+                await self._edit_text(cid, mid, card_txt, reply_markup={"inline_keyboard": []})
+
+    async def _edit_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not self.token:
             return
+        payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text[:3900]}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         try:
             await get_shared_http().post(
                 f"https://api.telegram.org/bot{self.token}/editMessageText",
-                json={"chat_id": chat_id, "message_id": message_id, "text": text[:3900]},
+                json=payload,
                 timeout=8.0,
             )
         except Exception:
@@ -947,21 +1079,17 @@ class TelegramBotBridge:
     async def notify_step(self, step_num: int, thought: str, plan: Optional[List[Dict[str, Any]]] = None) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
-        short_thought = (thought or "").strip()
-        if len(short_thought) > 200:
-            short_thought = short_thought[:200] + "..."
-        plan_lines: List[str] = []
-        for idx, p in enumerate((plan or [])[:6], 1):
-            st = (p.get("status") or "").lower()
-            icon = "✅" if st == "completed" else ("🔄" if st == "in_progress" else "⬜")
-            plan_lines.append(f"{icon} {idx}. {(p.get('step') or '')[:65]}")
-        plan_block = ("🧭 Rencana Tahap Kerja:\n" + "\n".join(plan_lines) + "\n\n") if plan_lines else ""
-        new_txt = f"{plan_block}⏳ Langkah {step_num}:\n{short_thought}"
+        self._last_step_num = step_num
+        self._last_thought = (thought or "").strip()
+        card_txt = self._build_progress_card_text(tick_idx=step_num)
+        kb = self._running_inline_kb()
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
         for cid in targets:
+            asyncio.create_task(self._send_chat_action(cid, "typing"))
             mid = self._status_msg_ids.get(cid)
-            if mid:
-                await self._edit_text(cid, mid, new_txt)
+            if mid and self._last_rendered_card.get(cid) != card_txt:
+                self._last_rendered_card[cid] = card_txt
+                await self._edit_text(cid, mid, card_txt, reply_markup=kb)
 
     async def send_photo_b64(
         self,
@@ -1001,12 +1129,13 @@ class TelegramBotBridge:
     async def notify_takeover(self, reason: str, frame_b64: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
+        await self._finalize_progress_cards("⏸️ DIJEDA SEBENTAR — Menunggu Login Akun Lu")
         caption = (
             "🔐 Halaman Ini Butuh Login Bro!\n\n"
             "⚡ CARA PALING GAMPANG (Nggak Usah Buka Layar!):\n"
             "Langsung balas aja di chat ini:\n"
             "username_lu | password_lu\n"
-            "(atau kalau cuma diminta kode OTP / Password aja, ketik langsung kodenya)\n\n"
+            "(kalau di halaman ada CAPTCHA angka/kode, OTOMATIS dibaca & diisi bot!)\n\n"
             "🧹 Tenang: pesan balasan sandi lu bakal OTOMATIS DIHAPUS dalam 1 detik & nggak pernah masuk ke AI!"
         )
         rows: List[List[Dict[str, Any]]] = []
@@ -1025,6 +1154,7 @@ class TelegramBotBridge:
     async def notify_approval(self, sens_report: Dict[str, Any], frame_b64: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
+        await self._finalize_progress_cards("⏸️ DIJEDA SEBENTAR — Menunggu Persetujuan Lu")
         caption = (
             f"🛡️ Minta Izin Dulu Bro ({sens_report.get('category', '')})\n"
             f"Mau klik tombol: [{sens_report.get('target_label', '')}]\n"
@@ -1055,7 +1185,13 @@ class TelegramBotBridge:
     async def notify_done(self, summary: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
+        import time as _t
+        el_s = max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1
         clean = summary.replace("**", "").strip()
+        is_failure = clean.startswith("❌") or clean.startswith("⚠️") or clean.startswith("🚫") or "GAGAL Verifikasi" in clean or "BELUM SESUAI" in clean.upper()
+        await self._finalize_progress_cards(
+            f"⚠️ PEKERJAAN TERHENTI ({el_s} dtk)" if is_failure else f"✅ PEKERJAAN TUNTAS ({el_s} dtk)!"
+        )
         export_kb = {
             "inline_keyboard": [
                 [
@@ -1065,7 +1201,6 @@ class TelegramBotBridge:
                 ]
             ]
         }
-        is_failure = clean.startswith("❌") or "GAGAL Verifikasi" in clean or "BELUM SESUAI" in clean.upper()
         out_msg = clean if is_failure else f"✅ Beres!\n\n{clean}"
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
         for cid in targets:

@@ -1336,11 +1336,12 @@ class CloudBrowserEngine:
         except Exception:
             return []
 
-    async def fill_credential_fields(self, items: List[Dict[str, str]]) -> int:
-        """Mengisi kredensial langsung dari HP user ke DOM Playwright (100% privat, tidak pernah menyentuh AI)."""
+    async def fill_credential_fields(self, items: List[Dict[str, str]], click_login: bool = True) -> int:
+        """Mengisi kredensial langsung dari HP user ke DOM Playwright + otomatis klik tombol Login (100% privat, tidak lewat AI)."""
         if not self.page or not items:
             return 0
         filled = 0
+        last_loc = None
         for item in items:
             sel = (item.get("selector") or "").strip()
             val = item.get("value")
@@ -1350,10 +1351,103 @@ class CloudBrowserEngine:
                 loc = self.page.locator(sel).first
                 await loc.scroll_into_view_if_needed(timeout=2000)
                 await loc.fill(str(val), timeout=3500)
+                last_loc = loc
                 filled += 1
             except Exception:
                 continue
-        await asyncio.sleep(0.15)
+
+        if filled > 0 and click_login:
+            await self._click_login_submit_dom(last_loc)
+
+        await asyncio.sleep(0.45)
         await self.save_state()
         await self.refresh_frame()
         return filled
+
+    async def _click_login_submit_dom(self, fallback_loc: Any = None) -> bool:
+        """Klik tombol Login / Masuk / Sign In secara otomatis lewat DOM selector setelah user mengisi kredensial."""
+        if not self.page:
+            return False
+        login_selectors = [
+            '#login-button',
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Login")',
+            'button:has-text("Log in")',
+            'button:has-text("Sign in")',
+            'button:has-text("Masuk")',
+            'button:has-text("Lanjut")',
+            'button:has-text("Next")',
+            'button:has-text("Verify")',
+            'button:has-text("Verifikasi")',
+        ]
+        for sel in login_selectors:
+            try:
+                btn = self.page.locator(sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await self._dom_click_locator(btn)
+                    return True
+            except Exception:
+                continue
+        if fallback_loc is not None:
+            try:
+                await fallback_loc.press("Enter")
+                return True
+            except Exception:
+                pass
+        return False
+
+    async def smart_login_from_chat(self, raw_text: str) -> str:
+        """
+        Memungkinkan user login cukup dengan membalas di chat Telegram (misal: `user | pass` atau langsung `kode_otp`),
+        tanpa perlu membuka halaman layar browser sama sekali!
+        """
+        clean = (raw_text or "").strip()
+        if not clean or not self.page:
+            return "Tidak ada input."
+
+        fields = await self.get_credential_fields()
+        user_f = next((f for f in fields if f["kind"] == "user"), None)
+        pass_f = next((f for f in fields if f["kind"] == "password"), None)
+        otp_f = next((f for f in fields if f["kind"] == "otp"), None)
+
+        parts: List[str] = []
+        if "|" in clean:
+            parts = [p.strip() for p in clean.split("|", 1)]
+        elif "\n" in clean:
+            lines = [ln.strip() for ln in clean.splitlines() if ln.strip()]
+            if len(lines) >= 2:
+                parts = [lines[0], lines[1]]
+        elif " / " in clean:
+            parts = [p.strip() for p in clean.split(" / ", 1)]
+
+        # Bersihkan prefix opsional seperti "user: xxx" / "pass: yyy"
+        import re as _re
+
+        def _strip_prefix(v: str) -> str:
+            return _re.sub(r"^(?:username|user|email|id|password|pass|sandi|otp|kode)\s*[:=]\s*", "", v, flags=_re.I).strip()
+
+        items_to_fill: List[Dict[str, str]] = []
+        if len(parts) >= 2:
+            u_val, p_val = _strip_prefix(parts[0]), _strip_prefix(parts[1])
+            if user_f and u_val:
+                items_to_fill.append({"selector": user_f["selector"], "value": u_val})
+            if pass_f and p_val:
+                items_to_fill.append({"selector": pass_f["selector"], "value": p_val})
+            elif otp_f and p_val:
+                items_to_fill.append({"selector": otp_f["selector"], "value": p_val})
+        else:
+            single_val = _strip_prefix(clean)
+            if otp_f:
+                items_to_fill.append({"selector": otp_f["selector"], "value": single_val})
+            elif pass_f and (not user_f or user_f.get("has_existing_value")):
+                items_to_fill.append({"selector": pass_f["selector"], "value": single_val})
+            elif user_f and not pass_f:
+                items_to_fill.append({"selector": user_f["selector"], "value": single_val})
+            elif pass_f:
+                items_to_fill.append({"selector": pass_f["selector"], "value": single_val})
+
+        if items_to_fill:
+            cnt = await self.fill_credential_fields(items_to_fill, click_login=True)
+            return f"Berhasil mengisi {cnt} kolom login & menekan tombol Masuk otomatis."
+        return "Kolom login tidak ditemukan di halaman."

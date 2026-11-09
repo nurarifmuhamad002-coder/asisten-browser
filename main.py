@@ -183,11 +183,16 @@ async def private_owner_lock_middleware(request: Request, call_next):
     # Endpoint publik yang tetap dibuka untuk webhook Telegram, static CSS/JS, portal lokal, & healthcheck
     public_paths = ("/api/health", "/api/telegram/webhook", "/demo-portal")
     if path.startswith("/static") or path in public_paths:
-        return await call_next(request)
+        resp = await call_next(request)
+        if path.startswith("/static"):
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
 
     # Izinkan konfigurasi awal sebelum bot dikunci
     if not telegram_bridge.is_locked:
-        return await call_next(request)
+        resp = await call_next(request)
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp
 
     if not _is_web_authorized(request):
         if path.startswith("/api/"):
@@ -195,6 +200,7 @@ async def private_owner_lock_middleware(request: Request, call_next):
         return HTMLResponse(LOCKED_PAGE_HTML, status_code=401)
 
     response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     q_key = (request.query_params.get("k") or "").strip()
     if q_key and q_key == telegram_bridge.web_access_key:
         response.set_cookie(

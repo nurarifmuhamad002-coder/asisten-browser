@@ -416,6 +416,25 @@ class TelegramBotBridge:
             return
 
         low = text.lower().strip()
+        msg_id = msg.get("message_id")
+
+        # LOGIN SUPER SIMPEL LANGSUNG LEWAT BALASAN CHAT TELEGRAM (Tanpa perlu buka layar web!)
+        menu_or_cmd = text in (
+            "💬 Ngobrol AI", "📝 Kerjain Tugas Web", "🌐 Buka Web", "📸 Cek Layar",
+            "📂 Daftar File", "🔒 Keamanan", "⏹️ Stop / Menu",
+        ) or low.startswith("/") or low in ("stop", "batal", "menu", "kunci")
+        if self.orchestrator.state == "WAITING_HUMAN_TAKEOVER" and not menu_or_cmd:
+            # Langsung hapus pesan berisi password dari riwayat chat Telegram dalam <0.5 detik agar 100% aman & bersih!
+            if msg_id:
+                asyncio.create_task(self._delete_msg(chat_id, msg_id))
+            login_res = await self.orchestrator.browser.smart_login_from_chat(text)
+            await self.send_text(
+                chat_id,
+                f"🔐 {login_res}\n🧹 Pesan sandi barusan otomatis gua hapus dari chat biar aman. Lanjut kerjain tugas!",
+                reply_markup=MAIN_MENU_KB,
+            )
+            await self.orchestrator.resume_from_takeover()
+            return
 
         # PENGATURAN AI LANGSUNG DARI TELEGRAM (/setting & /apikey)
         if low in ("/setting", "/settings", "setting"):
@@ -565,6 +584,13 @@ class TelegramBotBridge:
                 else:
                     mode = "agent"
                     self.chat_modes[chat_id] = "agent"
+
+        # Jika user terlanjur menekan tombol "🌐 Buka Web", tapi ternyata mengetik instruksi tugas panjang ("lalu isi...", "klik...", "cari...", dll), otomatis alihkan ke Agent!
+        if mode == "open_web" and any(
+            w in low for w in (" lalu ", " isi ", "first name", "submit", "verifikasi", "rangkum", "simpan ke", "klik ", "cari ")
+        ):
+            mode = "agent"
+            self.chat_modes[chat_id] = "agent"
 
         if mode == "open_web":
             wait_mid = await self.send_text(chat_id, f"🌐 Lagi ngebukain web '{text}'...")
@@ -874,14 +900,33 @@ class TelegramBotBridge:
         files = {"document": (filename, file_bytes)}
         await get_shared_http().post(f"https://api.telegram.org/bot{self.token}/sendDocument", data=data, files=files, timeout=22.0)
 
+    async def _delete_msg(self, chat_id: int, message_id: int) -> None:
+        if not self.token or not message_id:
+            return
+        try:
+            await get_shared_http().post(
+                f"https://api.telegram.org/bot{self.token}/deleteMessage",
+                json={"chat_id": chat_id, "message_id": message_id},
+                timeout=6.0,
+            )
+        except Exception:
+            pass
+
     async def notify_takeover(self, reason: str, frame_b64: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
-        caption = f"🔐 Butuh Login Lu Bro\n{reason}"
+        caption = (
+            "🔐 Halaman Ini Butuh Login Bro!\n\n"
+            "⚡ CARA PALING GAMPANG (Nggak Usah Buka Layar!):\n"
+            "Langsung balas aja di chat ini:\n"
+            "username_lu | password_lu\n"
+            "(atau kalau cuma diminta kode OTP / Password aja, ketik langsung kodenya)\n\n"
+            "🧹 Tenang: pesan balasan sandi lu bakal OTOMATIS DIHAPUS dalam 1 detik & nggak pernah masuk ke AI!"
+        )
         rows: List[List[Dict[str, Any]]] = []
         live_u = self.protected_web_url()
         if live_u.startswith("https://"):
-            rows.append([{"text": "🔑 Buka Layar & Ketik Password Aman", "url": live_u}])
+            rows.append([{"text": "📱 Atau Isi Lewat Form HP Simpel", "url": live_u}])
         rows.append([{"text": "✅ Udah Login — Lanjut Kerjain", "callback_data": "resume_login"}])
         markup = {"inline_keyboard": rows}
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)

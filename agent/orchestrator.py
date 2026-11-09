@@ -276,7 +276,19 @@ class AgentOrchestrator:
 
                 # HUMAN LOGIN / CAPTCHA / 2FA TAKEOVER?
                 if act_name == "request_human_login":
-                    reason = action.get("reason") or "Halaman ini butuh login akun. Silakan masuk sendiri biar password lu aman."
+                    goal_l = self.current_goal.lower()
+                    has_explicit_creds_in_goal = (
+                        any(k in goal_l for k in ("password:", "password ", "pass:", "sandi:", "secret_sauce"))
+                        and not any(h.get("action_name") == "auto_cred_hint" for h in self.history)
+                    )
+                    if has_explicit_creds_in_goal:
+                        self.history.append({
+                            "step": step_num,
+                            "action_name": "auto_cred_hint",
+                            "result": "User SUDAH menuliskan Username & Password secara eksplisit di dalam instruksinya! Jangan panggil request_human_login — langsung isikan dengan action 'type' lalu klik tombol Login.",
+                        })
+                        continue
+                    reason = action.get("reason") or "Halaman ini butuh login akun. Tinggal balas 'username | password' langsung di chat ini!"
                     await self._wait_for_human_takeover(reason)
                     self.history.append({"step": step_num, "action_name": "request_human_login", "result": "User selesai login."})
                     continue
@@ -369,17 +381,16 @@ class AgentOrchestrator:
             idx = int(action.get("index", -1))
             target_el = next((e for e in elements if e["index"] == idx), None)
             if is_credential_element(target_el):
-                cur_url = dom_state.get("url", "")
                 typed_val = str(action.get("text", "")).strip()
-                # Hanya izinkan isi otomatis jika ini situs latihan/sandbox publik DAN nilai dummy memang ditulis langsung oleh user di perintahnya
-                is_explicit_dummy = (
-                    is_practice_sandbox_url(cur_url)
-                    and bool(typed_val)
+                # Izinkan isi otomatis HANYA bila nilai password tersebut memang ditulis langsung oleh user di dalam perintahnya!
+                is_user_supplied_in_prompt = (
+                    bool(typed_val)
+                    and len(typed_val) >= 3
                     and typed_val.lower() in self.current_goal.lower()
                 )
-                if not is_explicit_dummy:
+                if not is_user_supplied_in_prompt:
                     await self._wait_for_human_takeover(
-                        "Ketemu kolom Password/OTP. Isi langsung di kotak praktis di atas layar HP lu (nggak perlu tap gambar kecil!)."
+                        "Ketemu kolom Password/OTP. Balas langsung di chat 'username | password' (otomatis dihapus 1 detik) atau isi di form simpel!"
                     )
                     return "User mengisi kredensial sendiri."
 

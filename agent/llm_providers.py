@@ -316,7 +316,8 @@ class MultiLLMBrain:
             "Kamu adalah Asisten AI & Cloud Browser Operator pribadi berbahasa Indonesia santai (gua/lu/bro secukupnya). "
             "Kamu punya fitur Cloud Browser otomatis — user TIDAK perlu menekan tombol mode apa pun, cukup ketik langsung perintahnya di chat! "
             "ATURAN ANTI-HALUSINASI MUTLAK: "
-            "1. Pada balasan ini kamu sedang menjawab pertanyaan/obrolan cepat. DILARANG KERAS pura-pura sudah membuka web/mengisi form atau menulis placeholder kurung siku seperti '[Laporan Hasil...]'. "
+            "1. Pada balasan ini kamu HANYA menjawab obrolan teks cepat dan TIDAK sedang menjalankan proses background apa pun. "
+            "DILARANG KERAS menulis kalimat janji palsu seperti 'Lagi gua proses buka...', 'Tunggu bentar ya lagi loading...', atau '[Laporan Hasil...]'. "
             "2. Jika user baru bertanya apakah bisa buka web / login / kerjain sesuatu tanpa menyebut web/tugasnya, jawab santai: 'Bisa banget bro! Langsung ketik aja mau buka web apa dan mau diapain, langsung gua sikat otomatis!' "
             "3. Jika tersedia 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka tersebut secara akurat. "
             "Jangan pakai simbol bintang (** atau *) berlebihan agar rapi di Telegram HP."
@@ -551,18 +552,20 @@ class MultiLLMBrain:
         if "." in q and " " not in q:
             return f"https://{q}"
 
+        if "siskopatuh" in q.lower():
+            return "https://siskopatuh.haji.go.id/web/"
+
         if self.config.has_api_key and self.config.provider == "gemini":
-            primary = self.config.model or "gemini-3.1-flash-lite"
-            candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
+            candidates = ["gemini-3.1-flash-lite-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite"]
             payload = {
                 "system_instruction": {
                     "parts": [
                         {
                             "text": (
                                 "Ubah permintaan website dari user menjadi SATU URL resmi HTTPS yang paling tepat. "
-                                "Contoh: 'Konami ID' -> 'https://my.konami.net', 'All Indonesia' -> 'https://allindonesia.imigrasi.go.id', "
-                                "'Google Classroom' -> 'https://classroom.google.com'. "
-                                "Jika tidak yakin URL pastinya, kembalikan URL pencarian DuckDuckGo HTML: 'https://html.duckduckgo.com/html/?q=...'. "
+                                "Contoh: 'efhub' -> 'https://efootballhub.net', 'Konami ID' -> 'https://my.konami.net', "
+                                "'SISKOPATUH' -> 'https://siskopatuh.haji.go.id/web/', 'Google Classroom' -> 'https://classroom.google.com'. "
+                                "Jika tidak yakin URL pastinya, kembalikan URL pencarian Yahoo: 'https://search.yahoo.com/search?p=...'. "
                                 "Balas HANYA JSON: {\"url\": \"https://...\"}"
                             )
                         }
@@ -571,20 +574,20 @@ class MultiLLMBrain:
                 "contents": [{"role": "user", "parts": [{"text": q}]}],
                 "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
             }
-            async with _fast_http_client(timeout=10.0) as client:
-                for model in candidates:
-                    u = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
-                    try:
-                        r = await client.post(u, json=payload)
-                        if r.status_code == 200:
-                            parsed = _extract_json(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-                            if parsed.get("url"):
-                                return str(parsed["url"]).strip()
-                    except Exception:
-                        continue
+            client = get_shared_http()
+            for model in candidates:
+                u = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
+                try:
+                    r = await client.post(u, json=payload, timeout=5.0)
+                    if r.status_code == 200:
+                        parsed = _extract_json(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+                        if parsed.get("url"):
+                            return str(parsed["url"]).strip()
+                except Exception:
+                    continue
 
         from urllib.parse import quote_plus
-        return f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
+        return f"https://search.yahoo.com/search?p={quote_plus(q)}"
 
     async def decide_next_step(
         self,

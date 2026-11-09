@@ -630,19 +630,31 @@ class TelegramBotBridge:
         text = routed_text
 
         if mode == "open_web":
-            wait_mid = await self.send_text(chat_id, f"🌐 Lagi ngebukain web '{text}'...")
+            import time as _t
+            t_open = _t.monotonic()
+            asyncio.create_task(self._send_chat_action(chat_id, "typing"))
+            wait_mid = await self.send_text(
+                chat_id,
+                f"🟢 MESIN SEDANG MEMBUKA WEB · ⏱️ 0 dtk\n🎯 Tujuan: {text}\n📍 Aktivitas: Mencari alamat resmi & memuat halaman...",
+            )
             target_url = await self.orchestrator.brain.resolve_website_url(text)
+            asyncio.create_task(self._send_chat_action(chat_id, "upload_photo"))
             nav_msg = await self.orchestrator.browser.navigate(target_url)
             b64 = await self.orchestrator.browser.refresh_frame()
             self.chat_modes[chat_id] = "auto"
+            el_open = max(1, int(_t.monotonic() - t_open))
             if wait_mid:
-                await self._edit_text(chat_id, wait_mid, f"🌐 {nav_msg}")
+                await self._edit_text(
+                    chat_id,
+                    wait_mid,
+                    f"✅ SELESAI DIBUKA ({el_open} dtk)!\n🌐 {nav_msg}",
+                )
             if b64:
                 await self.send_photo_b64(
                     chat_id,
                     b64,
                     f"🖥️ {nav_msg}\n\n"
-                    "Tinggal ketik aja langsung di chat kalau mau nyuruh gua klik/isi/rangkum sesuatu di halaman ini!",
+                    "Tinggal ketik aja langsung di chat kalau mau nyuruh gua klik/isi/cari/rangkum sesuatu di halaman ini!",
                     reply_markup=self._live_browser_inline_kb(include_task_btn=False),
                 )
             return
@@ -739,10 +751,10 @@ class TelegramBotBridge:
 
         # 3. Jelas Tugas Multi-Langkah Browser (0ms — langsung jalan tanpa delay!)
         known_sites = (
-            "wikipedia", "classroom", "google drive", "youtube", "github", "konami", "shopee",
-            "tokopedia", "traveloka", "tiket", "demoqa", "saucedemo", "testpages", "toscrape",
-            "kompas", "detik", "cnbc", "elearning", "e-learning", "kampus", "portal", "gmail",
-            "instagram", "linkedin",
+            "wikipedia", "classroom", "google drive", "youtube", "github", "konami", "efhub", "efootball",
+            "pesdb", "futbin", "siskopatuh", "shopee", "tokopedia", "traveloka", "tiket", "demoqa",
+            "saucedemo", "testpages", "toscrape", "kompas", "detik", "cnbc", "elearning", "e-learning",
+            "kampus", "portal", "gmail", "instagram", "linkedin",
         )
         mentions_site = has_url or any(ks in low for ks in known_sites) or any(
             w in low for w in ("di web ", "ke web ", "di situs ", "ke situs ", "dari web ", "dari situs ")
@@ -752,36 +764,66 @@ class TelegramBotBridge:
             "masuk ke web", "ke web nya", "ke webnya", "isi form", "formulir",
         )
 
+        # Deteksi frasa perintah buka website walaupun diawali kata santai ("coba buka efhub bro", "tolong bukain ...", "bro buka ...")
+        non_web_buka = ("buka puasa", "buka bersama", "bukber", "buka rekening", "buka usaha", "buka toko", "jam buka")
+        open_match = (
+            None
+            if any(nw in low for nw in non_web_buka) or any(q in low for q in ("cara buka ", "gimana cara buka ", "syarat buka "))
+            else re.match(
+                r"^(?:halo\s+|eh\s+|bro\s+|bang\s+|tolong\s+|coba\s+|bantu\s+|bisa\s+|gas\s+)*"
+                r"(?:buka(?:in|kan)?|masuk(?:\s+ke)?|kunjungi)\s+(?:web\s+|website\s+|situs\s+|link\s+|halaman\s+)?(.+)$",
+                text.strip(),
+                flags=re.I,
+            )
+        )
+
         if (mentions_site and (has_task_verb or any(w in low for w in ("cari ", "cek ", "baca ", "lihat ", "liat ", "rekap")))) or any(
             dp in low for dp in direct_page_actions
         ):
             return ("agent", text)
 
+        if open_match and (has_task_verb or any(w in low for w in (" lalu ", " terus ", " cari ", " cek ", " baca ", " rangkum"))):
+            return ("agent", text)
+
         if any(low.startswith(p) for p in ("klik ", "pencet ", "isi ", "ketik ", "scroll ", "geser ", "pilih ")):
             return ("agent", text)
 
-        # 4. Cuma minta bukain 1 alamat web / situs pendek tanpa tugas lanjutan (contoh: "buka youtube.com", "bukain konami id")
+        # 4. Minta bukain 1 website/layanan apa saja tanpa tugas lanjutan (contoh: "coba buka efhub bro", "buka youtube.com")
         words = low.split()
-        starts_open = any(low.startswith(p) for p in ("buka ", "bukain ", "masuk ke ", "masuk "))
         is_finance_word = any(fw in low for fw in ("saham", "harga", "etf", "kurs", "bitcoin", "btc", "kripto", "crypto", "ihsg", "emas"))
 
+        def _clean_site_target(raw_t: str) -> str:
+            t = re.sub(
+                r"^(?:halo\s+|eh\s+|bro\s+|bang\s+|tolong\s+|coba\s+|bantu\s+|bisa\s+|gas\s+)*"
+                r"(?:buka(?:in|kan)?|masuk(?:\s+ke)?|kunjungi)\s*(?:web\s+|website\s+|situs\s+|link\s+|halaman\s+)?",
+                "",
+                raw_t.strip(),
+                flags=re.I,
+            ).strip()
+            t = re.sub(r"\s+(?:bro|bang|dong|ya|yah|nih|deh|plis|please|sekarang|dulu|aja)+[\?\!\.]*$", "", t, flags=re.I).strip()
+            return t
+
         if not is_finance_word and not has_task_verb:
-            if has_url and len(words) <= 4:
-                clean_u = re.sub(r"^(?:tolong\s+|coba\s+)?(?:buka(?:in)?(?:\s+web|\s+situs|\s+link)?|masuk(?:\s+ke)?(?:\s+web)?)\s*", "", text, flags=re.I).strip()
+            if has_url and len(words) <= 5:
+                clean_u = _clean_site_target(text)
                 return ("open_web", clean_u or text)
-            if starts_open and len(words) <= 5 and any(ks in low or "web" in low or "situs" in low for ks in known_sites):
-                clean_u = re.sub(r"^(?:tolong\s+|coba\s+)?(?:buka(?:in)?(?:\s+web|\s+situs|\s+link)?|masuk(?:\s+ke)?(?:\s+web)?)\s*", "", text, flags=re.I).strip()
-                if clean_u and clean_u.lower() not in ("bro", "dong", "ya"):
+            if open_match and len(words) <= 7:
+                clean_u = _clean_site_target(text)
+                if clean_u and clean_u.lower() not in ("bro", "dong", "ya", "ini", "itu"):
                     return ("open_web", clean_u)
 
         # 5. Jelas Ngobrol / Harga Saham & Kripto / Soal / Bikin Surat Tanpa Buka Website (0ms!)
+        browser_hint_words = (
+            "web", "situs", "browser", "link", "url", "akun ", "halaman",
+            "buka", "bukain", "masuk", "cariin", "cekin", "liatin", "login",
+        )
         obvious_chat = (
             is_finance_word
             or (
                 not mentions_site
-                and not starts_open
+                and not open_match
                 and not has_task_verb
-                and not any(w in low for w in ("web", "situs", "browser", "link", "url", "akun ", "halaman"))
+                and not any(w in low for w in browser_hint_words)
             )
         )
         if obvious_chat:
@@ -800,7 +842,7 @@ class TelegramBotBridge:
             recent_chat=self.orchestrator.chat_messages[-4:],
         )
         if ai_route == "open_web":
-            clean_u = re.sub(r"^(?:tolong\s+|coba\s+)?(?:buka(?:in)?(?:\s+web|\s+situs|\s+link)?|masuk(?:\s+ke)?(?:\s+web)?)\s*", "", text, flags=re.I).strip()
+            clean_u = _clean_site_target(text)
             return ("open_web", clean_u or text)
         return (ai_route, text)
 

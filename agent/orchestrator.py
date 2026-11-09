@@ -224,7 +224,12 @@ class AgentOrchestrator:
                         await asyncio.sleep(1.0)
 
                 if decision is None or dom_state is None:
-                    raise RuntimeError(str(last_step_err) or "Gagal membaca respons langkah AI")
+                    err_detail = (
+                        f"{type(last_step_err).__name__}: {last_step_err}".strip(": ")
+                        if last_step_err is not None
+                        else "Gangguan pembacaan langkah"
+                    )
+                    raise RuntimeError(err_detail)
 
                 thought = decision.get("thought", "")
                 if decision.get("plan") and isinstance(decision["plan"], list):
@@ -326,6 +331,25 @@ class AgentOrchestrator:
                         pass
                     result_text = f"Kendala ringan pada aksi {act_name} ({err_label[:80]}), halaman sudah disegarkan."
                 self.history.append({"step": step_num, "action_name": act_name, "result": result_text})
+
+                # Jika situs utama yang diminta user memblokir IP Cloud / down (misal portal .go.id tertentu),
+                # langsung hentikan dalam 9 detik dan beri penjelasan jernih tanpa muter berulang-ulang!
+                if isinstance(result_text, str) and result_text.startswith("[UNREACHABLE_SITE]"):
+                    from urllib.parse import urlparse as _up
+                    req_host = _up(action.get("url") or "").netloc.lower()
+                    if req_host and req_host in self.current_goal.lower():
+                        self.state = "IDLE"
+                        self.live_status = "Situs tujuan menolak koneksi Cloud"
+                        await self._sync_state()
+                        clean_unreach = (
+                            f"🚫 Situs `{req_host}` menolak atau tidak merespons koneksi dari server Cloud Singapore dalam 9 detik.\n\n"
+                            "Ini biasa terjadi pada sebagian web pemerintah (`.go.id`) yang dikunci khusus jaringan provider lokal Indonesia (Telkomsel/IndiHome/Biznet). "
+                            "Browser lu tetap aman & segar 100% buat lanjut ke situs lain!"
+                        )
+                        await self._push_chat("agent", clean_unreach)
+                        if self.telegram:
+                            await self.telegram.notify_done(clean_unreach)
+                        return
 
                 await asyncio.sleep(0.08)
 

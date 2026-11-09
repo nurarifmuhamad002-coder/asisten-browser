@@ -80,8 +80,12 @@ class CloudBrowserEngine:
 
     async def start(self, start_url: Optional[str] = None) -> None:
         self._touch()
-        if self._started:
-            return
+        async with self._lock:
+            if self._started and self.page and not self.page.is_closed():
+                return
+            await self._start_unlocked(start_url)
+
+    async def _start_unlocked(self, start_url: Optional[str] = None) -> None:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
 
         self._pw = await async_playwright().start()
@@ -183,32 +187,42 @@ class CloudBrowserEngine:
                 pass
 
     async def stop(self) -> None:
+        async with self._lock:
+            await self._stop_unlocked()
+
+    async def _stop_unlocked(self) -> None:
         self._started = False
         self._screencast_on = False
-        await self.save_state()
+        if self.context:
+            try:
+                self.profile_dir.mkdir(parents=True, exist_ok=True)
+                await asyncio.wait_for(self.context.storage_state(path=str(self.state_file)), timeout=1.5)
+            except Exception:
+                pass
         try:
             if self._cdp:
-                await self._cdp.detach()
+                await asyncio.wait_for(self._cdp.detach(), timeout=1.0)
         except Exception:
             pass
         try:
             if self.context:
-                await self.context.close()
+                await asyncio.wait_for(self.context.close(), timeout=2.0)
         except Exception:
             pass
         try:
             if self._browser:
-                await self._browser.close()
+                await asyncio.wait_for(self._browser.close(), timeout=2.5)
         except Exception:
             pass
         try:
             if self._pw:
-                await self._pw.stop()
+                await asyncio.wait_for(self._pw.stop(), timeout=2.0)
         except Exception:
             pass
         self._cdp = None
         self.context = None
         self._browser = None
+        self._pw = None
         self.page = None
 
     async def reset_session(self) -> None:
@@ -251,40 +265,49 @@ class CloudBrowserEngine:
         page.on("framenavigated", lambda frame: asyncio.create_task(self._on_navigated(frame)))
 
         if self._cdp:
-            try:
-                await self._cdp.detach()
-            except Exception:
-                pass
-
-        try:
-            self._cdp = await page.context.new_cdp_session(page)
-            self._cdp.on(
-                "Page.screencastFrame",
-                lambda event: asyncio.create_task(self._on_screencast_frame(event)),
-            )
-            self._screencast_on = False
-            if self._viewer_count > 0:
-                await self._start_screencast()
-        except Exception:
+            old_cdp = self._cdp
             self._cdp = None
+            self._screencast_on = False
+
+            async def _bg_detach(c: Any) -> None:
+                try:
+                    await asyncio.wait_for(c.detach(), timeout=1.2)
+                except Exception:
+                    pass
+
+            asyncio.create_task(_bg_detach(old_cdp))
+
+        # Hanya buka CDP session jika benar-benar ada penonton Live Web UI (_viewer_count > 0)!
+        if self._viewer_count > 0:
+            await self._start_screencast()
 
     async def _start_screencast(self) -> None:
-        if not self._cdp or self._screencast_on:
+        if self._screencast_on or not self.page:
             return
         try:
-            await self._cdp.send(
-                "Page.startScreencast",
-                {
-                    "format": "jpeg",
-                    "quality": 50,
-                    "maxWidth": self.VIEWPORT_WIDTH,
-                    "maxHeight": self.VIEWPORT_HEIGHT,
-                    "everyNthFrame": 6,
-                },
+            if not self._cdp:
+                self._cdp = await asyncio.wait_for(self.page.context.new_cdp_session(self.page), timeout=2.5)
+                self._cdp.on(
+                    "Page.screencastFrame",
+                    lambda event: asyncio.create_task(self._on_screencast_frame(event)),
+                )
+            await asyncio.wait_for(
+                self._cdp.send(
+                    "Page.startScreencast",
+                    {
+                        "format": "jpeg",
+                        "quality": 50,
+                        "maxWidth": self.VIEWPORT_WIDTH,
+                        "maxHeight": self.VIEWPORT_HEIGHT,
+                        "everyNthFrame": 6,
+                    },
+                ),
+                timeout=2.5,
             )
             self._screencast_on = True
         except Exception:
-            pass
+            self._cdp = None
+            self._screencast_on = False
 
     async def _stop_screencast(self) -> None:
         if not self._cdp or not self._screencast_on:
@@ -416,18 +439,31 @@ class CloudBrowserEngine:
             await asyncio.wait_for(self._force_restart(), timeout=25.0)
 
     async def _force_restart(self) -> None:
+        import subprocess as _sp
+        async with self._lock:
+            try:
+                await self._stop_unlocked()
+            except Exception:
+                self._started = False
+            # Sapu bersih proses zombie Chromium di level OS agar RAM 512 MB tidak pernah penuh!
+            try:
+                _sp.run(["pkill", "-9", "-f", "headless_shell"], timeout=2, check=False)
+            except Exception:
+                pass
+            for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                lock_file = self.profile_dir / lock_name
+                if lock_file.exists() or lock_file.is_symlink():
+                    try:
+                        lock_file.unlink()
+                    except Exception:
+                        pass
+            await self._start_unlocked("about:blank")
+
+    async def _safe_close_page(self, p: Page) -> None:
         try:
-            await asyncio.wait_for(self.stop(), timeout=5.0)
+            await asyncio.wait_for(p.close(), timeout=2.5)
         except Exception:
-            self._started = False
-        for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-            lock_file = self.profile_dir / lock_name
-            if lock_file.exists() or lock_file.is_symlink():
-                try:
-                    lock_file.unlink()
-                except Exception:
-                    pass
-        await self.start("about:blank")
+            pass
 
     async def refresh_frame(self) -> str:
         """Mengambil screenshot terbaru secara eksplisit dan mengirimkannya ke semua klien UI."""
@@ -540,15 +576,32 @@ class CloudBrowserEngine:
 
         status_code = None
         try:
-            resp = await self.page.goto(target, wait_until="commit", timeout=10000)
+            resp = await self.page.goto(target, wait_until="commit", timeout=9000)
             status_code = resp.status if resp else None
         except Exception as exc:
-            err_s = str(exc)
-            if any(k in err_s for k in ("ERR_HTTP2", "ERR_CONNECTION", "ERR_NAME_NOT_RESOLVED", "ERR_CERT")):
-                return f"Gagal membuka {target}: Situs menolak koneksi dari server cloud atau alamat web salah ({err_s[:90]})."
-            await self._force_restart()
-            resp = await self.page.goto(target, wait_until="commit", timeout=10000)
-            status_code = resp.status if resp else None
+            err_s = str(exc) or type(exc).__name__
+            # JANGAN restart seluruh Chromium hanya karena 1 situs timeout / menolak koneksi cloud!
+            # Cukup ganti tab bersih supaya proses Chromium tetap ringan & sehat 100%.
+            if self.context:
+                try:
+                    self._switching_tab = True
+                    hung_p = self.page
+                    fresh_p = await asyncio.wait_for(self.context.new_page(), timeout=3.0)
+                    self.page = fresh_p
+                    await self._attach_page(fresh_p)
+                    if hung_p and not hung_p.is_closed():
+                        asyncio.create_task(self._safe_close_page(hung_p))
+                except Exception:
+                    await self._force_restart()
+                finally:
+                    self._switching_tab = False
+            else:
+                await self._force_restart()
+
+            return (
+                f"[UNREACHABLE_SITE] Gagal membuka {target}: Server website tidak merespons dalam 9 detik "
+                f"atau memblokir IP server Cloud ({err_s[:80]})."
+            )
 
         try:
             await self.page.wait_for_load_state("domcontentloaded", timeout=3800)

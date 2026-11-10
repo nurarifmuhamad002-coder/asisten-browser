@@ -486,15 +486,18 @@ async def websocket_endpoint(websocket: WebSocket):
     ws_clients.add(websocket)
     await browser_engine.set_viewer_count(len(ws_clients))
 
-    if not browser_engine.latest_frame_b64 and browser_engine.page:
-        await browser_engine.refresh_frame()
+    # Selalu ambil tangkapan layar paling segar saat user membuka Live CCTV (jangan pernah kirim frame lama yang masih kosong!)
+    if browser_engine._started and browser_engine.page and not browser_engine.page.is_closed():
+        cur_u = browser_engine.page.url or ""
+        if cur_u and cur_u != "about:blank":
+            await browser_engine.refresh_frame()
 
     await websocket.send_text(
         json.dumps(
             {
                 "type": "init",
                 "snapshot": orchestrator.snapshot_state(),
-                "frame": browser_engine.latest_frame_b64,
+                "frame": browser_engine.latest_frame_b64 or browser_engine.last_real_frame_b64,
             },
             ensure_ascii=False,
         )

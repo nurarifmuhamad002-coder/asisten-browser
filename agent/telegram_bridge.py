@@ -1107,13 +1107,24 @@ class TelegramBotBridge:
             await self.send_text(chat_id, f"⚠️ Gagal memproses file '{fname}': {exc}", reply_markup=MAIN_MENU_KB)
 
     async def _send_screen_snapshot(self, chat_id: int) -> None:
-        b64 = await self.orchestrator.browser.refresh_frame()
+        br = self.orchestrator.browser
+        # Jika browser sedang tidur hemat RAM setelah tugas selesai, tampilkan tangkapan layar asli terakhir (bukan putih kosong about:blank!)
+        if (not br._started or not br.page or br.page.is_closed() or br.page.url in ("", "about:blank")) and br.last_real_frame_b64:
+            await self.send_photo_b64(
+                chat_id,
+                br.last_real_frame_b64,
+                f"🖥️ Tangkapan layar terakhir:\n{br.last_real_url or '(halaman terakhir)'}",
+                reply_markup=self._live_browser_inline_kb(),
+            )
+            return
+
+        b64 = await br.refresh_frame()
         if b64:
-            cur_url = self.orchestrator.browser.page.url if self.orchestrator.browser.page else ""
+            cur_url = br._display_url(br.page.url) if br.page else (br.last_real_url or "")
             if cur_url.startswith("chrome-error://"):
-                await self.orchestrator.browser.navigate("https://id.wikipedia.org")
-                b64 = await self.orchestrator.browser.refresh_frame()
-                cur_url = self.orchestrator.browser.page.url if self.orchestrator.browser.page else ""
+                await br.navigate("https://id.wikipedia.org")
+                b64 = await br.refresh_frame()
+                cur_url = br._display_url(br.page.url) if br.page else ""
             await self.send_photo_b64(
                 chat_id,
                 b64,
@@ -1121,7 +1132,11 @@ class TelegramBotBridge:
                 reply_markup=self._live_browser_inline_kb(),
             )
         else:
-            await self.send_text(chat_id, "Browser sedang disiapkan...", reply_markup=MAIN_MENU_KB)
+            await self.send_text(
+                chat_id,
+                "🖥️ Browser saat ini belum membuka website apa pun (masih standby bersih). Ketik aja nama website atau tugas yang mau dikerjain bro!",
+                reply_markup=MAIN_MENU_KB,
+            )
 
     async def _send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         if not self.token:

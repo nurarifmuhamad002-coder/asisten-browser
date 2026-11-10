@@ -47,6 +47,11 @@ class CloudBrowserEngine:
         self._cdp: Optional[CDPSession] = None
 
         self.latest_frame_b64: str = ""
+        self.last_real_frame_b64: str = ""
+        self.last_real_url: str = ""
+        self._last_screen_file = self.profile_dir / "last_screen.b64"
+        self._last_url_file = self.profile_dir / "last_url.txt"
+        self._load_persisted_screen()
         self._cached_title: str = ""
         self.show_som_badges: bool = False
         self._lock = asyncio.Lock()
@@ -56,6 +61,32 @@ class CloudBrowserEngine:
         self._switching_tab: bool = False
         self._last_active: float = 0.0
         self._idle_task: Optional[asyncio.Task] = None
+
+    def _load_persisted_screen(self) -> None:
+        try:
+            if self._last_screen_file.exists():
+                b64 = self._last_screen_file.read_text(encoding="ascii").strip()
+                if b64:
+                    self.last_real_frame_b64 = b64
+                    self.latest_frame_b64 = b64
+            if self._last_url_file.exists():
+                u = self._last_url_file.read_text(encoding="utf-8").strip()
+                if u and u != "about:blank":
+                    self.last_real_url = u
+        except Exception:
+            pass
+
+    def _persist_last_screen(self, b64: str, url: str) -> None:
+        if not b64 or not url or url.startswith(("about:", "chrome-error://")):
+            return
+        self.last_real_frame_b64 = b64
+        self.last_real_url = url
+        try:
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            self._last_screen_file.write_text(b64, encoding="ascii")
+            self._last_url_file.write_text(url, encoding="utf-8")
+        except Exception:
+            pass
 
     def _touch(self) -> None:
         import time as _t
@@ -187,7 +218,15 @@ class CloudBrowserEngine:
         import time as _t
         while self._started:
             await asyncio.sleep(30)
-            if self._started and (_t.monotonic() - self._last_active > 300):
+            if self._started and self._viewer_count <= 0 and (_t.monotonic() - self._last_active > 900):
+                # Simpan tangkapan layar aktif terakhir sebelum tidur hemat RAM agar /layar tidak pernah putih kosong!
+                try:
+                    if self.page and not self.page.is_closed() and self.page.url != "about:blank":
+                        raw = await self.page.screenshot(type="jpeg", quality=65, timeout=4000, animations="disabled")
+                        b64 = base64.b64encode(raw).decode("ascii")
+                        self._persist_last_screen(b64, self._display_url(self.page.url))
+                except Exception:
+                    pass
                 try:
                     await self.stop()
                 except Exception:
@@ -599,29 +638,41 @@ class CloudBrowserEngine:
         except Exception:
             pass
 
-    async def refresh_frame(self) -> str:
+    async def refresh_frame(self, wake_if_sleeping: bool = True) -> str:
         """Mengambil screenshot terbaru secara eksplisit dan mengirimkannya ke semua klien UI."""
+        if not wake_if_sleeping and (not self._started or not self.page or self.page.is_closed()):
+            return self.last_real_frame_b64 or self.latest_frame_b64
+
         await self.ensure_alive()
         if not self.page:
-            return self.latest_frame_b64
+            return self.last_real_frame_b64 or self.latest_frame_b64
         try:
+            cur_u = self.page.url or ""
+            # Jangan timpa tangkapan layar asli terakhir dengan halaman putih kosong 'about:blank'!
+            if cur_u in ("", "about:blank") and self.last_real_frame_b64:
+                self.latest_frame_b64 = self.last_real_frame_b64
+                return self.last_real_frame_b64
+
             if self.show_som_badges:
                 await inspect_page(self.page, show_badges=True)
             else:
                 await clear_som_badges(self.page)
             raw = await self.page.screenshot(type="jpeg", quality=68, timeout=6000, animations="disabled")
             self.latest_frame_b64 = base64.b64encode(raw).decode("ascii")
+            disp_u = self._display_url(cur_u)
+            if cur_u and not cur_u.startswith(("about:", "chrome-error://")):
+                self._persist_last_screen(self.latest_frame_b64, disp_u)
             await self.broadcast(
                 {
                     "type": "frame",
                     "data": self.latest_frame_b64,
-                    "url": self._display_url(self.page.url),
+                    "url": disp_u,
                     "title": await self._safe_title(),
                 }
             )
         except Exception:
             pass
-        return self.latest_frame_b64
+        return self.latest_frame_b64 or self.last_real_frame_b64
 
     async def set_som_badges(self, enabled: bool) -> None:
         self.show_som_badges = enabled
@@ -630,7 +681,7 @@ class CloudBrowserEngine:
     async def observe(self, annotated_screenshot: bool = True) -> Dict[str, Any]:
         """
         Membaca kondisi halaman secara menyeluruh (DOM + elemen interaktif + screenshot Vision)
-        dengan batas waktu ketat agar TIDAK PERNAH nyangkut di web berat.
+        TANPA mereset/menghapus form yang sedang diisi jika skrip iklan web sempat lambat.
         """
         await self.ensure_alive()
         if not self.page:
@@ -638,20 +689,45 @@ class CloudBrowserEngine:
         try:
             dom_state = await asyncio.wait_for(
                 inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges)),
-                timeout=6.5,
+                timeout=7.5,
             )
         except Exception:
-            await self._force_restart()
-            dom_state = await asyncio.wait_for(
-                inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges)),
-                timeout=6.5,
-            )
+            # JANGAN langsung _force_restart() karena itu akan menghapus isi form ke about:blank!
+            # Hentikan dulu loading skrip berat di halaman yang SAMA, lalu coba inspect ulang.
+            page_alive = False
+            try:
+                if self.page and not self.page.is_closed():
+                    await asyncio.wait_for(self.page.evaluate("() => { try { window.stop(); } catch(e) {} return 1; }"), timeout=2.5)
+                    page_alive = True
+            except Exception:
+                page_alive = False
+
+            if page_alive:
+                dom_state = await asyncio.wait_for(
+                    inspect_page(self.page, show_badges=False),
+                    timeout=7.5,
+                )
+            else:
+                restore_u = self.last_real_url
+                await self._force_restart()
+                if restore_u and not restore_u.startswith("about:"):
+                    try:
+                        await self.navigate(restore_u)
+                    except Exception:
+                        pass
+                dom_state = await asyncio.wait_for(
+                    inspect_page(self.page, show_badges=(annotated_screenshot or self.show_som_badges)),
+                    timeout=7.5,
+                )
 
         screenshot_b64 = ""
         try:
-            raw = await self.page.screenshot(type="jpeg", quality=46, timeout=5000, animations="disabled")
+            raw = await self.page.screenshot(type="jpeg", quality=48, timeout=5000, animations="disabled")
             screenshot_b64 = base64.b64encode(raw).decode("ascii")
             self.latest_frame_b64 = screenshot_b64
+            cur_u = self.page.url or ""
+            if cur_u and not cur_u.startswith(("about:", "chrome-error://")):
+                self._persist_last_screen(screenshot_b64, self._display_url(cur_u))
         except Exception:
             screenshot_b64 = self.latest_frame_b64
 
@@ -1100,6 +1176,12 @@ class CloudBrowserEngine:
         if not meta.get("valid", True) and meta.get("validationMsg"):
             problems.append(f"validasi HTML menolak nilai: {meta['validationMsg']}")
 
+        if expected_text.strip() and not actual.strip():
+            return (
+                f"❌ GAGAL KETIK pada field '{fname}' ({sel_info}): kolom di layar masih KOSONG ('') setelah diketik! "
+                "Pastikan klik fokus ke input yang benar atau pilih opsi yang tersedia."
+            )
+
         if actual != expected_text and not max_len and "date" not in ident:
             if actual.strip() != expected_text.strip():
                 problems.append(f"nilai aktual di DOM ('{actual}') berbeda dari yang diketik ('{expected_text}')")
@@ -1361,11 +1443,44 @@ class CloudBrowserEngine:
                 except Exception:
                     await locator.press("Control+A")
                     await locator.press("Backspace")
-                    await locator.press_sequentially(text, delay=15)
+                    await locator.press_sequentially(text, delay=18)
             else:
-                await locator.press_sequentially(text, delay=15)
+                await locator.press_sequentially(text, delay=18)
 
-        await asyncio.sleep(0.06)
+            # Sinkronkan state React / Vue / Angular / Formik (_valueTracker + event input & change)
+            # agar nilai TIDAK PERNAH kereset jadi kosong saat pindah fokus (blur) ke kolom berikutnya!
+            try:
+                survived = await locator.evaluate(
+                    """(el) => {
+                        if (el.value !== undefined) {
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            return String(el.value || '');
+                        }
+                        return String(el.innerText || el.textContent || '');
+                    }"""
+                )
+            except Exception:
+                survived = ""
+
+            # Jika teks sudah diisi via .fill() tetapi di layar/DOM masih kosong (mis. input bermasker / komponen custom SPA),
+            # ketik ulang karakter-per-karakter memakai simulasi tombol fisik!
+            if text and not survived.strip():
+                try:
+                    await self._dom_click_locator(locator)
+                    await locator.press("Control+A")
+                    await locator.press("Backspace")
+                    await locator.press_sequentially(text, delay=22)
+                    await locator.evaluate(
+                        """(el) => {
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }"""
+                    )
+                except Exception:
+                    pass
+
+        await asyncio.sleep(0.08)
         val_report = await self._validate_input_dom(locator, text, target_el)
 
         if press_enter and not is_date_picker:
@@ -1375,7 +1490,24 @@ class CloudBrowserEngine:
             except Exception:
                 pass
 
-        await self._refresh_if_watched()
+        # Selalu segarkan frame terbaru setelah mengetik supaya saat user klik Cek Layar / buka CCTV tidak pernah tampil layar lama yang masih kosong!
+        try:
+            raw_after = await self.page.screenshot(type="jpeg", quality=58, timeout=3500, animations="disabled")
+            self.latest_frame_b64 = base64.b64encode(raw_after).decode("ascii")
+            cur_u = self.page.url or ""
+            if cur_u and not cur_u.startswith(("about:", "chrome-error://")):
+                self._persist_last_screen(self.latest_frame_b64, self._display_url(cur_u))
+            if self._viewer_count > 0:
+                await self.broadcast(
+                    {
+                        "type": "frame",
+                        "data": self.latest_frame_b64,
+                        "url": self._display_url(cur_u),
+                        "title": self._cached_title,
+                    }
+                )
+        except Exception:
+            await self._refresh_if_watched()
         return val_report + (" (Enter ditekan)" if press_enter else "")
 
     async def select_dropdown(self, index: int, option_value_or_text: str, elements: List[Dict[str, Any]]) -> str:

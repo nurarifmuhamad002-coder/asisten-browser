@@ -1173,10 +1173,15 @@ class TelegramBotBridge:
             plan_lines.append(f"{icon} {idx}. {(p.get('step') or '')[:62]}")
         plan_block = ("\n\n🧭 Rencana Tahap Kerja:\n" + "\n".join(plan_lines)) if plan_lines else ""
 
-        act_txt = self._last_thought or (self.orchestrator.live_status if self.orchestrator else "Memproses...")
-        step_prefix = f"Langkah {self._last_step_num}: " if self._last_step_num > 0 else ""
+        if header_override.startswith("✅"):
+            total_st = len(self.orchestrator.history) if self.orchestrator else self._last_step_num
+            pos_line = f"📍 Status Akhir: Seluruh {total_st} langkah selesai dijalankan."
+        else:
+            act_txt = self._last_thought or (self.orchestrator.live_status if self.orchestrator else "Memproses...")
+            step_prefix = f"Langkah {self._last_step_num}: " if self._last_step_num > 0 else ""
+            pos_line = f"📍 {step_prefix}{act_txt[:185]}"
         url_line = f"\n🌐 Web: {cur_u}" if cur_u else ""
-        return f"{hdr}{url_line}\n📍 {step_prefix}{act_txt[:185]}{plan_block}"
+        return f"{hdr}{url_line}\n{pos_line}{plan_block}"
 
     def start_progress_heartbeat(self) -> None:
         """Detak indikator live setiap 4 detik selama bot bekerja: 'sedang mengetik...' nonstop + stopwatch berjalan!"""
@@ -1376,15 +1381,23 @@ class TelegramBotBridge:
         for cid in targets:
             await self.send_document(cid, filename, file_bytes, f"📄 File selesai dibuat: {filename}")
 
-    async def notify_done(self, summary: str) -> None:
+    async def notify_done(
+        self,
+        summary: str,
+        elapsed_sec: Optional[int] = None,
+        total_steps: Optional[int] = None,
+        proof_frame_b64: str = "",
+    ) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
         import time as _t
-        el_s = max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1
+        el_s = elapsed_sec or (max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1)
+        st_cnt = total_steps if total_steps is not None else (len(self.orchestrator.history) if self.orchestrator else 0)
+        step_lbl = f" · {st_cnt} langkah" if st_cnt > 0 else ""
         clean = summary.replace("**", "").strip()
         is_failure = clean.startswith("❌") or clean.startswith("⚠️") or clean.startswith("🚫") or "GAGAL Verifikasi" in clean or "BELUM SESUAI" in clean.upper()
         await self._finalize_progress_cards(
-            f"⚠️ PEKERJAAN TERHENTI ({el_s} dtk)" if is_failure else f"✅ PEKERJAAN TUNTAS ({el_s} dtk)!"
+            f"⚠️ PEKERJAAN TERHENTI ({el_s} dtk{step_lbl})" if is_failure else f"✅ PEKERJAAN TUNTAS ({el_s} dtk{step_lbl})!"
         )
         export_kb = {
             "inline_keyboard": [
@@ -1399,6 +1412,8 @@ class TelegramBotBridge:
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
         for cid in targets:
             self.last_output_text[cid] = summary
+            if proof_frame_b64 and not is_failure:
+                await self.send_photo_b64(cid, proof_frame_b64, "📸 Bukti layar hasil eksekusi akhir:")
             await self.send_text(cid, out_msg, reply_markup=(MAIN_MENU_KB if is_failure else export_kb))
 
     async def send_to_all(self, message: str) -> None:

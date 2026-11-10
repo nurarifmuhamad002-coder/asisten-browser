@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
@@ -47,8 +48,11 @@ class AgentOrchestrator:
         self._user_mem_file = self.browser.profile_dir / "user_memory.json"
         self.user_memories: List[str] = self._load_user_memories()
         self._form_touched: bool = False
+        self._goal_started_mono: float = 0.0
         self._expected_fields: Dict[str, str] = {}
+        self._goal_expectations: Dict[str, str] = {}
         self._field_warnings: Dict[str, str] = {}
+        self._recorded_issues: List[str] = []
         self._last_submit_verification: Optional[Dict[str, Any]] = None
         self._verify_retry_used: bool = False
         self._pre_submit_blocked_once: bool = False
@@ -172,6 +176,45 @@ class AgentOrchestrator:
             f"{joined}\n"
         )
 
+    @staticmethod
+    def _parse_goal_kv_expectations(goal_text: str) -> Dict[str, str]:
+        """Mengekstrak pasangan '- Label: Nilai' dari instruksi user agar verifikasi akhir membandingkan dengan permintaan asli user!"""
+        out: Dict[str, str] = {}
+        skip_keys = {"instruksi", "catatan", "penting", "aturan", "url", "website", "link", "target", "tugas", "data"}
+        for raw_ln in (goal_text or "").splitlines():
+            ln = re.sub(r"^[\s\-\*•\d\.\)]+", "", raw_ln).strip()
+            if ":" not in ln or "http://" in ln.lower() or "https://" in ln.lower():
+                continue
+            k, v = ln.split(":", 1)
+            k_clean = k.strip().lower()
+            v_clean = v.strip()
+            if not k_clean or not v_clean or len(k_clean) > 32 or k_clean in skip_keys:
+                continue
+            if k_clean.startswith("http") or v_clean.startswith(("http://", "https://")):
+                continue
+            out[k_clean] = v_clean
+        return out
+
+    def _record_issue(self, msg: str, field_key: str = "", prefer_replace: bool = False) -> None:
+        clean = (msg or "").strip().rstrip(".")
+        if clean.endswith(")") and clean.count(")") > clean.count("("):
+            clean = clean[:-1].strip()
+        if not clean:
+            return
+        canon = re.sub(r"[^a-z0-9]", "", (field_key or clean.split(":", 1)[0]).lower())
+        for prefix in ("field", "digits", "10digits"):
+            canon = canon.replace(prefix, "")
+        for idx, existing in enumerate(self._recorded_issues):
+            ex_canon = re.sub(r"[^a-z0-9]", "", existing.split(":", 1)[0].lower())
+            for prefix in ("field", "digits", "10digits"):
+                ex_canon = ex_canon.replace(prefix, "")
+            if canon and ex_canon and (canon == ex_canon or canon in ex_canon or ex_canon in canon):
+                if prefer_replace or len(clean) > len(existing):
+                    self._recorded_issues[idx] = clean
+                return
+        if clean not in self._recorded_issues:
+            self._recorded_issues.append(clean)
+
     async def start_goal(self, goal: str) -> None:
         clean_goal = (goal or "").strip()
         if not clean_goal:
@@ -191,8 +234,11 @@ class AgentOrchestrator:
         self.manual_takeover = False
         self._stop_requested = False
         self._form_touched = False
+        self._goal_started_mono = time.monotonic()
         self._expected_fields = {}
+        self._goal_expectations = self._parse_goal_kv_expectations(clean_goal)
         self._field_warnings = {}
+        self._recorded_issues = []
         self._last_submit_verification = None
         self._verify_retry_used = False
         self._pre_submit_blocked_once = False
@@ -361,10 +407,66 @@ class AgentOrchestrator:
                     self.state = "IDLE"
                     self.live_status = "Online · Siap disuruh apa aja"
                     await self._sync_state()
-                    summary_msg = action.get("summary") or thought or "Pekerjaan beres dijalankan!"
+
+                    total_steps = len(self.history)
+                    elapsed_sec = max(1, int(time.monotonic() - self._goal_started_mono)) if self._goal_started_mono else 1
+                    raw_summary = (action.get("summary") or thought or "Pekerjaan beres dijalankan!").strip()
+
+                    asks_metrics = any(
+                        k in goal_low
+                        for k in ("jumlah langkah", "waktu pengerjaan", "kesalahan", "hasil akhir")
+                    )
+                    ver_rows = (self._last_submit_verification or {}).get("rows") or []
+
+                    if self._form_touched or asks_metrics:
+                        # Jika terdapat kendala/pemotongan karakter nyata, koreksi klaim palsu "Tidak ada kesalahan" dari LLM!
+                        if self._recorded_issues:
+                            raw_summary = re.sub(
+                                r"tidak ada (?:kesalahan|kendala|error)[^.\n]*\.?",
+                                "",
+                                raw_summary,
+                                flags=re.I,
+                            ).strip()
+                        # Koreksi klaim jumlah langkah melenceng di dalam paragraf ringkasan LLM
+                        raw_summary = re.sub(
+                            r"\bdalam\s+\d+\s+langkah\b",
+                            f"dalam {total_steps} langkah",
+                            raw_summary,
+                            flags=re.I,
+                        )
+
+                        audit_parts: List[str] = [
+                            f"📊 Rekap Eksekusi Akurat:\n• Jumlah Langkah: {total_steps} langkah\n• Waktu Pengerjaan: {elapsed_sec} detik"
+                        ]
+                        if self._recorded_issues:
+                            iss_bullets = "\n".join(f"• {it}" for it in self._recorded_issues)
+                            audit_parts.append(f"⚠️ Kendala / Penyesuaian Validasi Form:\n{iss_bullets}")
+                        elif asks_metrics or self._form_touched:
+                            audit_parts.append("✅ Kendala / Kesalahan: Tidak ditemukan kesalahan maupun pemotongan data.")
+
+                        if ver_rows:
+                            tbl_bullets = "\n".join(f"• {r['label']}: {r['value'] or '(kosong)'}" for r in ver_rows)
+                            audit_parts.append(f"📋 Tabel Hasil Terverifikasi di Layar:\n{tbl_bullets}")
+
+                        summary_msg = f"{raw_summary}\n\n" + "\n\n".join(audit_parts)
+                    else:
+                        summary_msg = raw_summary
+
+                    proof_b64 = ""
+                    if self._form_touched:
+                        try:
+                            proof_b64 = await self.browser.refresh_frame()
+                        except Exception:
+                            proof_b64 = self.browser.latest_frame_b64
+
                     await self._push_chat("agent", summary_msg)
                     if self.telegram:
-                        await self.telegram.notify_done(summary_msg)
+                        await self.telegram.notify_done(
+                            summary_msg,
+                            elapsed_sec=elapsed_sec,
+                            total_steps=total_steps,
+                            proof_frame_b64=proof_b64,
+                        )
                     return
 
                 # HUMAN LOGIN / CAPTCHA / 2FA TAKEOVER?
@@ -579,9 +681,13 @@ class AgentOrchestrator:
                 fkey = (target_el.get("label") or target_el.get("placeholder") or target_el.get("name") or target_el.get("el_id") or f"field_{idx}").strip()
                 if res.startswith("❌"):
                     self._field_warnings[fkey] = res
+                    self._record_issue(f"Field '{fkey}': {res.replace('❌ ', '')}")
                 else:
                     self._field_warnings.pop(fkey, None)
                     self._expected_fields[fkey] = val_txt
+                    if "⚠️" in res:
+                        note_part = res.split("⚠️", 1)[1].strip().rstrip(".")
+                        self._record_issue(f"Field '{fkey}': {note_part}")
             return res
 
         if act_name == "select":
@@ -598,9 +704,13 @@ class AgentOrchestrator:
                 fkey = (target_el.get("label") or target_el.get("name") or target_el.get("el_id") or f"select_{idx}").strip()
                 if res.startswith("❌"):
                     self._field_warnings[fkey] = res
+                    self._record_issue(f"Field '{fkey}': {res.replace('❌ ', '')}")
                 else:
                     self._field_warnings.pop(fkey, None)
                     self._expected_fields[fkey] = opt_txt
+                    if "⚠️" in res:
+                        note_part = res.split("⚠️", 1)[1].strip().rstrip(".")
+                        self._record_issue(f"Field '{fkey}': {note_part}")
             return res
 
         if act_name == "scroll":
@@ -810,11 +920,56 @@ class AgentOrchestrator:
             # Cek setiap item (mis. multi-subject dipisah koma) ada di dalam nilai tabel hasil
             sub_parts = [p.strip() for p in _re.split(r"[,;]+", exp_v) if p.strip()]
             for sp in sub_parts:
-                if sp.lower() not in tbl_val.lower():
-                    problems.append(
-                        f"Field '{tbl_label}' ({exp_k}): tertulis '{tbl_val}' di tabel hasil, tidak sesuai dengan yang diminta '{exp_v}'"
+                tv_clean = tbl_val.strip()
+                if sp.lower() in tv_clean.lower():
+                    continue
+                # Kasus 1: Pemotongan resmi maxlength HTML (mis. '081234567890' -> '0812345678')
+                if len(sp) > len(tv_clean) >= 6 and sp.lower().startswith(tv_clean.lower()):
+                    self._record_issue(
+                        f"Field '{tbl_label.title()}': diminta '{sp}' ({len(sp)} karakter), namun website membatasi panjang maksimal {len(tv_clean)} karakter (maxlength={len(tv_clean)}) sehingga tersimpan '{tv_clean}'",
+                        field_key=tbl_label,
+                        prefer_replace=True,
                     )
-                    break
+                    continue
+                # Kasus 2: Penyesuaian label opsi resmi website (mis. 'Mathematics' -> 'Maths')
+                if len(sp) >= 4 and len(tv_clean) >= 4 and tv_clean[:4].lower() == sp[:4].lower():
+                    self._record_issue(
+                        f"Field '{tbl_label.title()}': diminta '{sp}', disesuaikan ke opsi resmi website menjadi '{tv_clean}'",
+                        field_key=tbl_label,
+                        prefer_replace=True,
+                    )
+                    continue
+                problems.append(
+                    f"Field '{tbl_label}' ({exp_k}): tertulis '{tbl_val}' di tabel hasil, tidak sesuai dengan yang diminta '{exp_v}'"
+                )
+                break
+
+        # Bandingkan juga langsung terhadap permintaan asli user di prompt (_goal_expectations)
+        # agar pemotongan maxlength (mis. Mobile 081234567890 -> 0812345678) atau penyesuaian label selalu tercatat jujur
+        # bahkan jika LLM sudah memendekkan teks sebelum mengetik!
+        for gk, gv in self._goal_expectations.items():
+            if not gv or "date" in gk or "birth" in gk or "tanggal" in gk:
+                continue
+            matched_goal_row = _find_table_val(gk)
+            if matched_goal_row is None:
+                continue
+            g_lbl, g_val = matched_goal_row
+            g_val_s = (g_val or "").strip()
+            if not g_val_s:
+                msg_empty = f"Field '{g_lbl}' ({gk}): kosong di tabel hasil, padahal user meminta '{gv}'"
+                if msg_empty not in problems:
+                    problems.append(msg_empty)
+                continue
+            if len(gv) > len(g_val_s) >= 6 and gv.lower().startswith(g_val_s.lower()):
+                self._record_issue(
+                    f"Field '{g_lbl.title()}': diminta '{gv}' ({len(gv)} karakter), namun website membatasi panjang maksimal {len(g_val_s)} karakter (maxlength={len(g_val_s)}) sehingga tersimpan '{g_val_s}'",
+                    field_key=g_lbl,
+                )
+            elif "subject" in gk and g_val_s.lower() != gv.lower() and g_val_s[:4].lower() == gv[:4].lower():
+                self._record_issue(
+                    f"Field '{g_lbl.title()}': diminta '{gv}', disesuaikan ke opsi resmi website menjadi '{g_val_s}'",
+                    field_key=g_lbl,
+                )
 
         if "subject" in goal_low and "subjects" in table_map and not table_map["subjects"].strip():
             problems.append("Field 'Subjects': kosong di tabel hasil karena opsi autocomplete belum terpilih")

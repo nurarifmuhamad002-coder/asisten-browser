@@ -634,9 +634,11 @@ class MultiLLMBrain:
     ) -> str:
         files_str = ", ".join(f"{f['name']} ({f['size']}B)" for f in workspace_files) or "(kosong)"
         hist_lines = []
-        for idx, h in enumerate(history[-12:], start=1):
-            hist_lines.append(f"{idx}. Action={h.get('action_name')} | Hasil={h.get('result')}")
+        for idx, h in enumerate(history[-14:], start=1):
+            real_step = h.get("step", idx)
+            hist_lines.append(f"Langkah #{real_step}: Action={h.get('action_name')} | Hasil={h.get('result')}")
         hist_str = "\n".join(hist_lines) if hist_lines else "(Belum ada langkah sebelumnya)"
+        stats_line = f"TOTAL LANGKAH AKSI YANG SUDAH DIEKSEKUSI: {len(history)} langkah.\n"
 
         chat_str = ""
         if recent_chat:
@@ -659,7 +661,7 @@ class MultiLLMBrain:
             f"PERINTAH USER SAAT INI: {goal}\n\n"
             f"FILE DI WORKSPACE: {files_str}\n"
             f"{mem_str}\n"
-            f"=== RIWAYAT LANGKAH SEBELUMNYA ===\n{hist_str}\n\n"
+            f"=== RIWAYAT LANGKAH SEBELUMNYA ({stats_line.strip()}) ===\n{hist_str}\n\n"
             f"=== OBSERVASI HALAMAN SAAT INI ===\n{format_dom_for_llm(dom_state)}\n\n"
             "Berikan keputusan langkah selanjutnya dalam JSON sesuai skema."
         )

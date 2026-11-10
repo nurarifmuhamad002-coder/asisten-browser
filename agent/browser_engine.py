@@ -926,13 +926,31 @@ class CloudBrowserEngine:
                     break
                 await asyncio.sleep(0.1)
 
+            # Jika kata penuh (mis. 'Mathematics') tidak memunculkan opsi karena website memakai singkatan ('Maths'),
+            # coba ulang dengan 4 huruf awalnya ('Math') agar opsi resmi tetap tertangkap di percobaan pertama!
+            used_stem_fallback = False
+            if not appeared and len(item) >= 5:
+                try:
+                    await locator.fill("", timeout=1500)
+                    await locator.press_sequentially(item[:4], delay=35)
+                    for _ in range(15):
+                        if await opts.count() > 0:
+                            appeared = True
+                            used_stem_fallback = True
+                            break
+                        await asyncio.sleep(0.1)
+                except Exception:
+                    pass
+
             picked_text = ""
             if appeared:
                 cnt = await opts.count()
                 exact_idx = -1
                 prefix_idx = -1
                 contains_idx = -1
+                stem_idx = -1
                 item_low = item.lower()
+                stem_low = item[:4].lower()
 
                 for i in range(min(cnt, 25)):
                     cand = opts.nth(i)
@@ -950,17 +968,23 @@ class CloudBrowserEngine:
                     elif tl.startswith(item_low) and prefix_idx < 0:
                         prefix_idx = i
                         picked_text = t
-                    elif item_low in tl and contains_idx < 0:
+                    elif (item_low in tl or tl in item_low) and contains_idx < 0:
                         contains_idx = i
                         picked_text = t
+                    elif len(stem_low) >= 4 and tl.startswith(stem_low) and stem_idx < 0:
+                        stem_idx = i
+                        picked_text = t
 
-                best_idx = exact_idx if exact_idx >= 0 else (prefix_idx if prefix_idx >= 0 else contains_idx)
+                best_idx = (
+                    exact_idx if exact_idx >= 0
+                    else (prefix_idx if prefix_idx >= 0 else (contains_idx if contains_idx >= 0 else stem_idx))
+                )
                 if best_idx >= 0:
                     chosen_opt = opts.nth(best_idx)
                     picked_text = (await chosen_opt.inner_text()).strip()
                     await self._dom_click_locator(chosen_opt)
                     await asyncio.sleep(0.12)
-                    chosen_labels.append(picked_text)
+                    chosen_labels.append((item, picked_text, used_stem_fallback or (picked_text.lower() != item_low)))
                 else:
                     # Bersihkan teks mentah yang tidak cocok agar tidak memicu salah validasi
                     try:
@@ -997,9 +1021,16 @@ class CloudBrowserEngine:
                 f"❌ PERINGATAN AUTOCOMPLETE pada field '{fname}' ({sel_info}): "
                 f"gagal memilih {', '.join(failed_items)}. Nilai tersimpan saat ini: '{verified_dom_val or '(kosong)'}'."
             )
+        alias_notes = [
+            f"input '{orig}' disesuaikan ke opsi resmi website '{picked}'"
+            for (orig, picked, is_alias) in chosen_labels
+            if is_alias
+        ]
+        alias_str = f" (⚠️ Catatan: {'; '.join(alias_notes)})" if alias_notes else ""
+        just_picked = ", ".join(p for (_, p, _) in chosen_labels)
         return (
             f"✅ Berhasil memilih autocomplete pada field '{fname}' ({sel_info}) -> "
-            f"Terpilih: '{verified_dom_val or ', '.join(chosen_labels)}'."
+            f"Terpilih: '{verified_dom_val or just_picked}'{alias_str}."
         )
 
     async def _validate_input_dom(
@@ -1037,10 +1068,16 @@ class CloudBrowserEngine:
         ident = f"{meta.get('id', '')} {meta.get('name', '')} {fname}".lower()
 
         problems: List[str] = []
+        truncation_note = ""
 
-        if max_len and len(expected_text) > max_len:
+        if max_len and len(expected_text) > max_len and actual == expected_text[:max_len]:
+            truncation_note = (
+                f"⚠️ BATAS KARAKTER WEBSITE pada field '{fname}': input '{expected_text}' ({len(expected_text)} karakter) "
+                f"melebihi atribut maxlength={max_len} pada website sehingga terpotong menjadi '{actual}' ({len(actual)} karakter)"
+            )
+        elif max_len and len(expected_text) > max_len:
             problems.append(
-                f"panjang input ({len(expected_text)} karakter) melebihi batas maxlength={max_len} sehingga terpotong menjadi '{actual}' ({len(actual)} karakter)"
+                f"panjang input ({len(expected_text)} karakter) melebihi batas maxlength={max_len} sehingga menjadi '{actual}'"
             )
         if min_len and len(actual) < min_len:
             problems.append(f"panjang input ({len(actual)} karakter) kurang dari batas minlength={min_len}")
@@ -1073,6 +1110,8 @@ class CloudBrowserEngine:
                 + "; ".join(problems)
                 + ". Wajib diperbaiki sebelum Submit!"
             )
+        if truncation_note:
+            return f"✅ Terisi '{actual}' pada field '{fname}' ({sel_info}) — {truncation_note}."
         return f"✅ Berhasil mengisi field '{fname}' ({sel_info}) = '{actual}' (panjang {len(actual)} karakter, format valid)."
 
     async def audit_form_state(self) -> Dict[str, Any]:

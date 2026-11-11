@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from xml.sax.saxutils import escape as xml_escape
 
+from agent.security import StorageUnavailableError
+
 
 def _parse_markdown_blocks(raw_text: str) -> Tuple[str, List[Dict[str, Any]]]:
     """Memecah teks AI/Markdown menjadi judul + blok terstruktur (heading, paragraf, list, tabel)."""
@@ -421,10 +423,20 @@ class WorkspaceFileManager:
     `.md`, `.csv`, `.json`, dan `.txt`.
     """
 
-    def __init__(self, base_dir: str = "/home/user/workspace_files"):
+    def __init__(self, base_dir: str = "/home/user/workspace_files", allow_writes: bool = True, write_block_reason: str = ""):
         self.base_dir = Path(base_dir).resolve()
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        self._seed_starter_files()
+        self.allow_writes = allow_writes
+        self.write_block_reason = (
+            write_block_reason
+            or "Penulisan workspace diblokir karena penyimpanan persisten tidak tersedia."
+        )
+        if self.allow_writes:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self._seed_starter_files()
+
+    def _require_writable(self) -> None:
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
 
     def _safe_path(self, filename: str) -> Path:
         raw = (filename or "").strip().replace("\\", "/").lstrip("/")
@@ -440,11 +452,14 @@ class WorkspaceFileManager:
         return target.resolve().relative_to(self.base_dir).as_posix()
 
     def make_dir(self, dir_path: str) -> Dict[str, Any]:
+        self._require_writable()
         target = self._safe_path(dir_path)
         target.mkdir(parents=True, exist_ok=True)
         return {"name": self._rel_name(target), "path": str(target), "is_dir": True}
 
     def list_top_dirs(self) -> List[str]:
+        if not self.allow_writes or not self.base_dir.exists():
+            return []
         out: List[str] = []
         for entry in sorted(self.base_dir.iterdir(), key=lambda p: p.name):
             if entry.is_dir() and not entry.name.startswith(".") and entry.name != "__pycache__":
@@ -486,6 +501,7 @@ class WorkspaceFileManager:
         return "\n".join(lines)
 
     def zip_directory(self, rel_dir: str) -> Dict[str, Any]:
+        self._require_writable()
         import zipfile
 
         folder = self._safe_path(rel_dir)
@@ -539,6 +555,8 @@ class WorkspaceFileManager:
             )
 
     def list_files(self) -> List[Dict[str, Any]]:
+        if not self.allow_writes or not self.base_dir.exists():
+            return []
         files = []
         all_files: List[Path] = []
         for cur_root, dirs, fnames in os.walk(str(self.base_dir)):
@@ -617,6 +635,7 @@ class WorkspaceFileManager:
         return content
 
     def write_file(self, filename: str, content: str) -> Dict[str, Any]:
+        self._require_writable()
         target = self._safe_path(filename)
         target.parent.mkdir(parents=True, exist_ok=True)
         ext = target.suffix.lower()
@@ -638,6 +657,7 @@ class WorkspaceFileManager:
         }
 
     def export_formatted(self, stem: str, content: str, fmt: str) -> Dict[str, Any]:
+        self._require_writable()
         clean_stem = re.sub(r"[^a-zA-Z0-9_\-]", "_", (stem or "hasil_tugas").strip()).strip("_") or "hasil_tugas"
         clean_fmt = fmt.lower().lstrip(".")
         if clean_fmt not in ("docx", "xlsx", "pdf", "md"):
@@ -645,6 +665,7 @@ class WorkspaceFileManager:
         return self.write_file(f"{clean_stem}.{clean_fmt}", content)
 
     def append_file(self, filename: str, content: str) -> Dict[str, Any]:
+        self._require_writable()
         target = self._safe_path(filename)
         target.parent.mkdir(parents=True, exist_ok=True)
         rel_nm = self._rel_name(target)
@@ -661,6 +682,7 @@ class WorkspaceFileManager:
         }
 
     def save_bytes(self, filename: str, data: bytes) -> Dict[str, Any]:
+        self._require_writable()
         target = self._safe_path(filename)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
@@ -671,6 +693,7 @@ class WorkspaceFileManager:
         }
 
     def delete_file(self, filename: str) -> bool:
+        self._require_writable()
         target = self._safe_path(filename)
         if target.exists():
             target.unlink()

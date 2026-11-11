@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Set
@@ -18,11 +19,20 @@ from agent.github_publisher import GitHubPublisher
 from agent.hf_deployer import HuggingFaceDeployer
 from agent.llm_providers import LLMConfig, get_shared_http
 from agent.orchestrator import AgentOrchestrator
+from agent.security import redact_secrets, resolve_storage_config
 from agent.telegram_bridge import TelegramBotBridge
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 PORT = int(os.getenv("PORT", "8000"))
+
+STORAGE_STATUS: Dict[str, Any] = resolve_storage_config(BASE_DIR)
+if not STORAGE_STATUS["ok"]:
+    print(
+        f"[CRITICAL STORAGE ERROR] {redact_secrets(STORAGE_STATUS.get('error', ''))}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 ws_clients: Set[WebSocket] = set()
 
@@ -41,16 +51,26 @@ async def broadcast_event(payload: Dict[str, Any]) -> None:
         ws_clients.discard(dead)
 
 
-file_manager = WorkspaceFileManager(os.getenv("WORKSPACE_DIR", str(BASE_DIR / "workspace_files")))
+file_manager = WorkspaceFileManager(
+    STORAGE_STATUS["workspace_dir"],
+    allow_writes=bool(STORAGE_STATUS["allow_writes"]),
+    write_block_reason=STORAGE_STATUS.get("error", ""),
+)
 llm_config = LLMConfig()
-telegram_bridge = TelegramBotBridge()
+telegram_bridge = TelegramBotBridge(
+    state_dir=STORAGE_STATUS["profile_dir"],
+    allow_writes=bool(STORAGE_STATUS["allow_writes"]),
+    write_block_reason=STORAGE_STATUS.get("error", ""),
+)
 github_publisher = GitHubPublisher(repo_dir=str(BASE_DIR), broadcast_cb=broadcast_event)
 hf_deployer = HuggingFaceDeployer(base_dir=str(BASE_DIR))
 browser_engine = CloudBrowserEngine(
     file_manager=file_manager,
     broadcast_cb=broadcast_event,
-    profile_dir=os.getenv("BROWSER_PROFILE_DIR", "/tmp/nusa_operator_profile"),
+    profile_dir=STORAGE_STATUS["profile_dir"],
     internal_port=PORT,
+    allow_writes=bool(STORAGE_STATUS["allow_writes"]),
+    write_block_reason=STORAGE_STATUS.get("error", ""),
 )
 orchestrator = AgentOrchestrator(
     browser=browser_engine,
@@ -58,6 +78,8 @@ orchestrator = AgentOrchestrator(
     llm_config=llm_config,
     broadcast_cb=broadcast_event,
     telegram=telegram_bridge,
+    allow_writes=bool(STORAGE_STATUS["allow_writes"]),
+    write_block_reason=STORAGE_STATUS.get("error", ""),
 )
 telegram_bridge.attach_orchestrator(orchestrator)
 
@@ -188,6 +210,24 @@ async def private_owner_lock_middleware(request: Request, call_next):
             resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
+    if not STORAGE_STATUS.get("ok"):
+        err_msg = redact_secrets(
+            STORAGE_STATUS.get("error")
+            or "Penyimpanan persisten tidak tersedia; penulisan data penting diblokir."
+        )
+        if path.startswith("/api/"):
+            return JSONResponse(
+                {"ok": False, "storage_ok": False, "error": err_msg},
+                status_code=503,
+            )
+        return HTMLResponse(
+            f"<!doctype html><html><head><meta charset='utf-8'><title>Storage Error</title></head>"
+            f"<body style='font-family:sans-serif;background:#090d16;color:#f1f5f9;padding:32px'>"
+            f"<h2>❌ Penyimpanan Persisten Tidak Tersedia</h2><p>{err_msg}</p>"
+            f"<p>Penulisan state penting ke filesystem sementara diblokir.</p></body></html>",
+            status_code=503,
+        )
+
     # Izinkan konfigurasi awal sebelum bot dikunci
     if not telegram_bridge.is_locked:
         resp = await call_next(request)
@@ -215,12 +255,20 @@ async def private_owner_lock_middleware(request: Request, call_next):
 
 @app.get("/api/health")
 async def health_check():
-    return {
-        "ok": True,
+    storage_ok = bool(STORAGE_STATUS.get("ok"))
+    payload = {
+        "ok": storage_ok,
+        "storage_ok": storage_ok,
+        "storage_persistent": bool(STORAGE_STATUS.get("storage_persistent")) if storage_ok else False,
+        "storage_mode": STORAGE_STATUS.get("storage_mode", "error"),
+        "storage_error": "" if storage_ok else redact_secrets(STORAGE_STATUS.get("error", "")),
         "telegram_configured": telegram_bridge.is_configured,
         "llm_configured": llm_config.has_api_key,
         "locked": telegram_bridge.is_locked,
     }
+    if not storage_ok:
+        return JSONResponse(payload, status_code=503)
+    return payload
 
 
 class GitHubPushPayload(BaseModel):
@@ -482,7 +530,7 @@ async def telegram_webhook_endpoint(request: Request):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    if not _is_web_authorized(websocket):
+    if not STORAGE_STATUS.get("ok") or not _is_web_authorized(websocket):
         await websocket.close(code=1008)
         return
     await websocket.accept()

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent.security import redact_secrets, redact_structure
+from agent.security import StorageUnavailableError, redact_secrets, redact_structure
 
 VALID_FINAL_STATUSES = (
     "BERHASIL",
@@ -79,16 +79,26 @@ class TaskStateStore:
 
     MAX_STORED_TASKS = 40
 
-    def __init__(self, state_dir: str):
+    def __init__(self, state_dir: str, allow_writes: bool = True, write_block_reason: str = ""):
         self.state_dir = Path(state_dir).resolve()
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.allow_writes = allow_writes
+        self.write_block_reason = (
+            write_block_reason
+            or "Penulisan task_state diblokir karena penyimpanan persisten tidak tersedia."
+        )
         self.main_file = self.state_dir / "tasks_state.json"
         self.bak_file = self.state_dir / "tasks_state.json.bak"
         self.lock_file = self.state_dir / ".tasks_state.lock"
         self._rlock = threading.RLock()
-        self._recover_interrupted_on_boot()
+        if self.allow_writes:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self._recover_interrupted_on_boot()
 
     def _with_file_lock(self, write: bool, fn):
+        if write and not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
+        if not write and not self.allow_writes:
+            return fn()
         with self._rlock:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             with open(self.lock_file, "a+", encoding="utf-8") as lf:
@@ -100,6 +110,8 @@ class TaskStateStore:
                     fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
     def _read_unlocked(self) -> Dict[str, Any]:
+        if not self.allow_writes:
+            return {"active_task_id": None, "tasks": []}
         for candidate in (self.main_file, self.bak_file):
             if candidate.exists():
                 try:
@@ -112,6 +124,8 @@ class TaskStateStore:
         return {"active_task_id": None, "tasks": []}
 
     def _write_unlocked(self, state: Dict[str, Any]) -> None:
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         safe_state = redact_structure(state)
         if len(safe_state.get("tasks", [])) > self.MAX_STORED_TASKS:
             safe_state["tasks"] = safe_state["tasks"][-self.MAX_STORED_TASKS:]

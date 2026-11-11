@@ -17,7 +17,7 @@ from agent.guardrails import (
 from agent.llm_providers import LLMConfig, MultiLLMBrain
 from agent.recovery_engine import ErrorRecoveryEngine
 from agent.reporting import compute_step_metrics, format_execution_report
-from agent.security import redact_secrets, register_runtime_secret
+from agent.security import StorageUnavailableError, redact_secrets, register_runtime_secret
 from agent.task_store import TaskStateStore, compute_side_effect_fingerprint
 from agent.telegram_bridge import TelegramBotBridge
 
@@ -38,6 +38,8 @@ class AgentOrchestrator:
         llm_config: LLMConfig,
         broadcast_cb: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]],
         telegram: Optional[TelegramBotBridge] = None,
+        allow_writes: Optional[bool] = None,
+        write_block_reason: str = "",
     ):
         self.browser = browser
         self.file_manager = file_manager
@@ -45,9 +47,21 @@ class AgentOrchestrator:
         self.brain = MultiLLMBrain(llm_config)
         self.broadcast = broadcast_cb
         self.telegram = telegram
+        if allow_writes is None:
+            allow_writes = bool(getattr(browser, "allow_writes", True) and getattr(file_manager, "allow_writes", True))
+        self.allow_writes = bool(allow_writes)
+        self.write_block_reason = (
+            write_block_reason
+            or getattr(browser, "write_block_reason", "")
+            or "Penulisan state diblokir karena penyimpanan persisten tidak tersedia."
+        )
 
         self.state: str = "IDLE"  # IDLE | RUNNING | WAITING_HUMAN_TAKEOVER | WAITING_APPROVAL
-        self.live_status: str = "Online · Siap disuruh apa aja"
+        self.live_status: str = (
+            "Online · Siap disuruh apa aja"
+            if self.allow_writes
+            else f"Error Penyimpanan: {self.write_block_reason}"
+        )
         self.manual_takeover: bool = False
         self.current_goal: str = ""
         self.current_plan: List[Dict[str, str]] = []
@@ -56,7 +70,11 @@ class AgentOrchestrator:
         self.persistent_notes: Dict[str, str] = {}
         self._user_mem_file = self.browser.profile_dir / "user_memory.json"
         self.user_memories: List[str] = self._load_user_memories()
-        self.task_store = TaskStateStore(str(self.browser.profile_dir / "task_state"))
+        self.task_store = TaskStateStore(
+            str(self.browser.profile_dir / "task_state"),
+            allow_writes=self.allow_writes,
+            write_block_reason=self.write_block_reason,
+        )
         self.recovery = ErrorRecoveryEngine()
         self._active_task_id: str = ""
         self._browser_actions_count: int = 0
@@ -126,19 +144,22 @@ class AgentOrchestrator:
         )
 
     def _load_user_memories(self) -> List[str]:
-        try:
-            if self._user_mem_file.exists():
-                arr = json.loads(self._user_mem_file.read_text(encoding="utf-8"))
-                if isinstance(arr, list):
-                    return [str(x).strip() for x in arr if str(x).strip()]
-        except Exception:
-            pass
+        if self.allow_writes:
+            try:
+                if self._user_mem_file.exists():
+                    arr = json.loads(self._user_mem_file.read_text(encoding="utf-8"))
+                    if isinstance(arr, list):
+                        return [str(x).strip() for x in arr if str(x).strip()]
+            except Exception:
+                pass
         env_mem = os.getenv("USER_MEMORY_INIT", "").strip()
         if env_mem:
             return [ln.strip() for ln in env_mem.splitlines() if ln.strip()]
         return []
 
     def _save_user_memories(self) -> None:
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         try:
             self.browser.profile_dir.mkdir(parents=True, exist_ok=True)
             self._user_mem_file.write_text(json.dumps(self.user_memories, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -147,6 +168,8 @@ class AgentOrchestrator:
 
     def add_user_memories(self, raw_text: str) -> List[str]:
         """Menyimpan 1 atau beberapa baris fakta profil/gaya kerja user (otomatis update jika labelnya sama)."""
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         lines = [
             re.sub(r"^[\-\*•\d\.\)\s]+", "", ln).strip()
             for ln in (raw_text or "").splitlines()
@@ -172,6 +195,8 @@ class AgentOrchestrator:
         return added
 
     def remove_user_memory(self, idx_1based: int) -> Optional[str]:
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         if 1 <= idx_1based <= len(self.user_memories):
             removed = self.user_memories.pop(idx_1based - 1)
             self._save_user_memories()
@@ -179,6 +204,8 @@ class AgentOrchestrator:
         return None
 
     def clear_user_memories(self) -> None:
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         self.user_memories.clear()
         self._save_user_memories()
 
@@ -231,6 +258,8 @@ class AgentOrchestrator:
             self._recorded_issues.append(clean)
 
     async def start_goal(self, goal: str) -> None:
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         clean_goal = (goal or "").strip()
         if not clean_goal:
             return

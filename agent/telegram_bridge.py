@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 import httpx
 
 from agent.llm_providers import get_shared_http
-from agent.security import PersistentSecurityState, redact_secrets, register_runtime_secret
+from agent.security import (
+    PersistentSecurityState,
+    StorageUnavailableError,
+    redact_secrets,
+    register_runtime_secret,
+    resolve_storage_config,
+)
 
 if TYPE_CHECKING:
     from agent.orchestrator import AgentOrchestrator
@@ -47,13 +53,38 @@ class TelegramBotBridge:
     4. 🔒 Keamanan (Private Lock) — Kunci bot & layar web live khusus pemilik tunggal
     """
 
-    def __init__(self, state_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        state_dir: Optional[str] = None,
+        allow_writes: Optional[bool] = None,
+        write_block_reason: str = "",
+    ) -> None:
         self.token: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         register_runtime_secret(self.token)
         self.orchestrator: Optional["AgentOrchestrator"] = None
 
-        sec_dir = Path(state_dir or os.getenv("BROWSER_PROFILE_DIR", "/tmp/nusa_operator_profile"))
-        self._sec_store = PersistentSecurityState(sec_dir)
+        if state_dir is None:
+            st = resolve_storage_config()
+            sec_dir = Path(st["profile_dir"])
+            if allow_writes is None:
+                allow_writes = bool(st["allow_writes"])
+            if not write_block_reason:
+                write_block_reason = st.get("error", "")
+        else:
+            sec_dir = Path(state_dir)
+            if allow_writes is None:
+                allow_writes = True
+
+        self.allow_writes: bool = bool(allow_writes)
+        self.write_block_reason: str = (
+            write_block_reason
+            or "Penulisan security_state diblokir karena penyimpanan persisten tidak tersedia."
+        )
+        self._sec_store = PersistentSecurityState(
+            sec_dir,
+            allow_writes=self.allow_writes,
+            write_block_reason=self.write_block_reason,
+        )
         saved_sec = self._sec_store.load()
 
         render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
@@ -94,7 +125,8 @@ class TelegramBotBridge:
         self._webhook_secret_registered: bool = False
         register_runtime_secret(self.web_access_key)
         register_runtime_secret(self.webhook_secret)
-        self._persist_security()
+        if self.allow_writes:
+            self._persist_security()
 
         self.active_chat_ids: Set[int] = {self.owner_id} if self.owner_id else set()
         self.chat_modes: Dict[int, str] = {}  # "chat" | "agent" | "open_web"
@@ -111,6 +143,8 @@ class TelegramBotBridge:
         self.bot_username: str = ""
 
     def _persist_security(self) -> None:
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         try:
             self._sec_store.save(
                 owner_id=self.owner_id,
@@ -118,6 +152,8 @@ class TelegramBotBridge:
                 web_access_key=self.web_access_key,
                 webhook_secret=self.webhook_secret,
             )
+        except StorageUnavailableError:
+            raise
         except Exception:
             pass
 
@@ -206,13 +242,20 @@ class TelegramBotBridge:
             await client.post(f"https://api.telegram.org/bot{clean}/deleteWebhook", timeout=10.0)
             self._poll_task = asyncio.create_task(self._poll_loop())
 
-        self._persist_security()
+        if self.allow_writes:
+            self._persist_security()
         return self.public_dict()
 
     async def start_if_env_set(self) -> None:
         if self.token:
             try:
                 await self.configure(self.token, self.public_web_url)
+                if not self.allow_writes and self.owner_id:
+                    await self.send_text(
+                        self.owner_id,
+                        f"❌ ERROR PENYIMPANAN PERSISTEN RAILWAY:\n{self.write_block_reason}\n\n"
+                        "Penulisan data penting ke filesystem sementara diblokir. Pastikan Railway Volume (/data) terpasang dan writable.",
+                    )
             except Exception:
                 pass
 
@@ -349,6 +392,18 @@ class TelegramBotBridge:
                 return
 
             # PRIVATE LOCK GUARD
+            if not self.allow_writes:
+                if self.owner_id is not None and sender_id == self.owner_id:
+                    await self._answer_cb(cb_id, "❌ Penyimpanan persisten bermasalah.")
+                    await self.send_text(
+                        chat_id,
+                        f"❌ ERROR KONFIGURASI PENYIMPANAN PERSISTEN:\n{self.write_block_reason}\n\n"
+                        "Penulisan state penting ke lokasi sementara diblokir.",
+                    )
+                else:
+                    await self._answer_cb(cb_id, "🚫 Sistem dikunci karena penyimpanan persisten tidak tersedia.")
+                return
+
             if self.is_locked and sender_id != self.owner_id:
                 await self._answer_cb(cb_id, "🚫 Akses Ditolak! Bot ini dikunci pemiliknya.")
                 return
@@ -482,6 +537,20 @@ class TelegramBotBridge:
             return
 
         # PRIVATE LOCK GUARD — Tolak siapa pun selain pemilik tunggal!
+        if not self.allow_writes:
+            if self.owner_id is not None and sender_id == self.owner_id:
+                await self.send_text(
+                    chat_id,
+                    f"❌ ERROR KONFIGURASI PENYIMPANAN PERSISTEN:\n{self.write_block_reason}\n\n"
+                    "Penulisan data penting ke filesystem sementara diblokir.",
+                )
+            else:
+                await self.send_text(
+                    chat_id,
+                    "🚫 Sistem dikunci sementara karena penyimpanan persisten tidak tersedia.",
+                )
+            return
+
         if self.is_locked and sender_id != self.owner_id:
             await self.send_text(
                 chat_id,

@@ -9,7 +9,12 @@ from playwright.async_api import Browser, BrowserContext, CDPSession, Download, 
 
 from agent.dom_inspector import clear_som_badges, inspect_page
 from agent.file_manager import WorkspaceFileManager
-from agent.security import redact_secrets, register_runtime_secret
+from agent.security import (
+    StorageUnavailableError,
+    redact_secrets,
+    register_runtime_secret,
+    resolve_storage_config,
+)
 
 
 class CloudBrowserEngine:
@@ -30,12 +35,31 @@ class CloudBrowserEngine:
         self,
         file_manager: WorkspaceFileManager,
         broadcast_cb: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]],
-        profile_dir: str = "/tmp/nusa_operator_profile",
+        profile_dir: Optional[str] = None,
         internal_port: int = 8000,
+        allow_writes: Optional[bool] = None,
+        write_block_reason: str = "",
     ):
         self.file_manager = file_manager
         self.broadcast = broadcast_cb
-        self.profile_dir = Path(profile_dir)
+        if profile_dir is None:
+            st = resolve_storage_config()
+            resolved_profile = st["profile_dir"]
+            if allow_writes is None:
+                allow_writes = bool(st["allow_writes"])
+            if not write_block_reason:
+                write_block_reason = st.get("error", "")
+        else:
+            resolved_profile = profile_dir
+            if allow_writes is None:
+                allow_writes = True
+
+        self.allow_writes = bool(allow_writes)
+        self.write_block_reason = (
+            write_block_reason
+            or "Penulisan profil browser diblokir karena penyimpanan persisten tidak tersedia."
+        )
+        self.profile_dir = Path(resolved_profile)
         self.state_file = self.profile_dir / "storage_state.json"
         self.proxy_file = self.profile_dir / "proxy_config.json"
         self.internal_port = internal_port
@@ -64,6 +88,8 @@ class CloudBrowserEngine:
         self._idle_task: Optional[asyncio.Task] = None
 
     def _load_persisted_screen(self) -> None:
+        if not self.allow_writes:
+            return
         try:
             if self._last_screen_file.exists():
                 b64 = self._last_screen_file.read_text(encoding="ascii").strip()
@@ -78,6 +104,8 @@ class CloudBrowserEngine:
             pass
 
     def _persist_last_screen(self, b64: str, url: str) -> None:
+        if not self.allow_writes:
+            return
         if not b64 or not url or url.startswith(("about:", "chrome-error://")):
             return
         self.last_real_frame_b64 = b64
@@ -155,7 +183,7 @@ class CloudBrowserEngine:
 
     def _load_saved_proxy(self) -> Optional[Dict[str, str]]:
         try:
-            if self.proxy_file.exists():
+            if self.allow_writes and self.proxy_file.exists():
                 data = json.loads(self.proxy_file.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and data.get("server"):
                     return data
@@ -178,6 +206,8 @@ class CloudBrowserEngine:
 
     async def configure_proxy(self, raw_proxy: str) -> Dict[str, Any]:
         """Pasang atau matikan Proxy Browser secara live + langsung cek lokasi IP keluarnya."""
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         clean = (raw_proxy or "").strip()
         if clean.lower() in ("off", "mati", "hapus", "none", "reset", "matikan"):
             self.proxy_config = None
@@ -236,6 +266,8 @@ class CloudBrowserEngine:
 
     async def save_state(self) -> None:
         """Simpan cookies & sesi login ke JSON super ringan (tanpa beban database Chrome penuh)."""
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         if self.context:
             try:
                 self.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -251,6 +283,8 @@ class CloudBrowserEngine:
             await self._start_unlocked(start_url)
 
     async def _start_unlocked(self, start_url: Optional[str] = None) -> None:
+        if not self.allow_writes:
+            raise StorageUnavailableError(self.write_block_reason)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
 
         self._pw = await async_playwright().start()

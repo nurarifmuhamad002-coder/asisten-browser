@@ -5,8 +5,6 @@ WORKDIR /app
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV HOME=/tmp
 ENV PORT=8000
-ENV BROWSER_PROFILE_DIR=/tmp/nusa_operator_profile
-ENV WORKSPACE_DIR=/app/workspace_files
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
@@ -14,8 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && chmod -R 755 /ms-playwright
 
 COPY . .
-RUN mkdir -p /app/workspace_files /tmp/nusa_operator_profile \
-    && chmod -R 777 /app/workspace_files /tmp
+RUN chmod 1777 /tmp
 
 EXPOSE 8000
 

@@ -599,6 +599,234 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         assert orch_r2.task_store.check_idempotency(orch_r2._active_task_id, fp_submit) is not None
         record(11, "Post-Restart Recovery & Idempotent Continuation Test", True, "Pemulihan pasca-restart menandai TERHENTI, mewariskan URL terakhir & idempotency ledger saat 'lanjut'.")
 
+        # =====================================================================
+        # 12. RAILWAY VOLUME /data MOUNT PROOF, PRODUCTION FAIL-CLOSED & NON-DESTRUCTIVE PROBE TEST
+        # =====================================================================
+        import hashlib
+        from fastapi.testclient import TestClient
+        import main as main_mod
+        from agent.security import (
+            StorageUnavailableError,
+            resolve_storage_config,
+            verify_persistent_volume_mount,
+        )
+
+        # (A) Simulasi Volume Persisten Valid (RAILWAY_VOLUME_MOUNT_PATH + mountinfo ext4 rw)
+        sim_vol_holder = Path(tempfile.mkdtemp(prefix=".vol_sim_", dir=str(ROOT))).resolve()
+        try:
+            sim_vol = (sim_vol_holder / "data").resolve()
+            sim_vol.mkdir(parents=True, exist_ok=True)
+            valid_mountinfo = (
+                "20 1 254:0 / / rw,relatime - overlay overlay rw\n"
+                f"99 20 259:1 / {sim_vol} rw,relatime - ext4 /dev/nvme1n1 rw\n"
+            )
+            # Pastikan bila RAILWAY_VOLUME_MOUNT_PATH mengarah ke /tmp, selalu ditolak!
+            v_bad_tmp, _, _ = verify_persistent_volume_mount(
+                {"RAILWAY_VOLUME_MOUNT_PATH": str(tmp_dir / "bad_tmp_vol")},
+                mountinfo_text=valid_mountinfo,
+            )
+            assert v_bad_tmp is False
+
+            prod_valid = resolve_storage_config(
+                ROOT,
+                env={
+                    "RAILWAY_ENVIRONMENT": "production",
+                    "RAILWAY_VOLUME_MOUNT_PATH": str(sim_vol),
+                },
+                mountinfo_text=valid_mountinfo,
+                ismount_fn=lambda p: Path(p).resolve() == sim_vol,
+            )
+            assert prod_valid["ok"] is True and prod_valid["allow_writes"] is True, f"prod_valid failed: {prod_valid}"
+            assert prod_valid["storage_persistent"] is True and prod_valid["storage_mode"] == "railway_volume"
+            assert prod_valid["profile_dir"] == str(sim_vol / "nusa_operator_profile")
+            assert prod_valid["workspace_dir"] == str(sim_vol / "workspace_files")
+            assert (sim_vol / "nusa_operator_profile").is_dir() and (sim_vol / "workspace_files").is_dir()
+
+            # (B) Syarat #3: Validasi TIDAK mengubah/menghapus/menimpa data existing & file probe unik bersih 100%
+            existing_files = {
+                sim_vol / "nusa_operator_profile" / "security_state.json": '{"owner_id": 777111, "web_access_key": "999111"}',
+                sim_vol / "nusa_operator_profile" / "storage_state.json": '{"cookies": [{"name": "sid", "value": "tetap_utuh"}]}',
+                sim_vol / "nusa_operator_profile" / "user_memory.json": '["Nama: Budi"]',
+                sim_vol / "workspace_files" / "dokumen_penting.md": "# Dokumen Asli Tidak Boleh Tersentuh\nBaris penting.",
+            }
+            before_hashes: Dict[Path, str] = {}
+            for fp_ex, content_ex in existing_files.items():
+                fp_ex.write_text(content_ex, encoding="utf-8")
+                before_hashes[fp_ex] = hashlib.sha256(fp_ex.read_bytes()).hexdigest()
+
+            for _ in range(3):
+                re_check = resolve_storage_config(
+                    ROOT,
+                    env={
+                        "RAILWAY_ENVIRONMENT": "production",
+                        "RAILWAY_VOLUME_MOUNT_PATH": str(sim_vol),
+                    },
+                    mountinfo_text=valid_mountinfo,
+                    ismount_fn=lambda p: Path(p).resolve() == sim_vol,
+                )
+                assert re_check["ok"] is True and re_check["storage_persistent"] is True
+
+            for fp_ex, digest_before in before_hashes.items():
+                assert fp_ex.exists(), f"File existing hilang: {fp_ex}"
+                assert hashlib.sha256(fp_ex.read_bytes()).hexdigest() == digest_before, f"File existing berubah: {fp_ex}"
+
+            leftover_probes = list(sim_vol.rglob(".nusa_storage_probe_*"))
+            assert len(leftover_probes) == 0, f"Ditemukan file probe tersisa: {leftover_probes}"
+
+            # (C) Syarat #2: Direktori biasa (mkdir) TANPA bukti mount kernel TIDAK BOLEH dianggap storage_persistent=True
+            fake_data_dir = (sim_vol_holder / "fake_unmounted_data").resolve()
+            fake_data_dir.mkdir(parents=True, exist_ok=True)
+            root_only_mountinfo = "20 1 254:0 / / rw,relatime - overlay overlay rw\n"
+
+            # Lokal tanpa RAILWAY_VOLUME_MOUNT_PATH walau folder ada -> storage_persistent WAJIB False
+            local_plain = resolve_storage_config(
+                tmp_dir / "local_base",
+                env={"BROWSER_PROFILE_DIR": str(fake_data_dir / "prof"), "WORKSPACE_DIR": str(fake_data_dir / "ws")},
+                mountinfo_text=root_only_mountinfo,
+                ismount_fn=lambda _: False,
+            )
+            assert local_plain["ok"] is True and local_plain["storage_persistent"] is False
+
+            # RAILWAY_VOLUME_MOUNT_PATH diset tapi direktori bukan mount point -> ditolak!
+            v_ok_unmounted, _, _ = verify_persistent_volume_mount(
+                {"RAILWAY_VOLUME_MOUNT_PATH": str(fake_data_dir)},
+                mountinfo_text=root_only_mountinfo,
+                ismount_fn=lambda _: False,
+            )
+            assert v_ok_unmounted is False
+
+            # RAILWAY_VOLUME_MOUNT_PATH diset tapi fstype tmpfs (ephemeral) atau ro -> ditolak!
+            tmpfs_mountinfo = (
+                "20 1 254:0 / / rw,relatime - overlay overlay rw\n"
+                f"100 20 0:44 / {fake_data_dir} rw,nosuid - tmpfs tmpfs rw\n"
+            )
+            v_ok_tmpfs, _, _ = verify_persistent_volume_mount(
+                {"RAILWAY_VOLUME_MOUNT_PATH": str(fake_data_dir)},
+                mountinfo_text=tmpfs_mountinfo,
+            )
+            assert v_ok_tmpfs is False
+
+            ro_mountinfo = (
+                "20 1 254:0 / / rw,relatime - overlay overlay rw\n"
+                f"101 20 259:2 / {fake_data_dir} ro,relatime - ext4 /dev/nvme2n1 ro\n"
+            )
+            v_ok_ro, _, _ = verify_persistent_volume_mount(
+                {"RAILWAY_VOLUME_MOUNT_PATH": str(fake_data_dir)},
+                mountinfo_text=ro_mountinfo,
+            )
+            assert v_ok_ro is False
+
+            # (D) Syarat #1: Di Railway/Production, jika Volume tidak tersedia / salah path -> FAIL-CLOSED!
+            # TIDAK BOLEH dialihkan diam-diam ke /tmp, dan seluruh penulisan state penting DIBLOKIR!
+            prod_no_vol = resolve_storage_config(
+                ROOT,
+                env={"RAILWAY_ENVIRONMENT": "production"},
+                mountinfo_text=root_only_mountinfo,
+                ismount_fn=lambda _: False,
+            )
+            assert prod_no_vol["ok"] is False and prod_no_vol["allow_writes"] is False
+            assert prod_no_vol["storage_persistent"] is False
+            assert not prod_no_vol["profile_dir"].startswith("/tmp")
+            assert not prod_no_vol["workspace_dir"].startswith("/tmp")
+            assert prod_no_vol["error"]
+
+            prod_outside_vol = resolve_storage_config(
+                ROOT,
+                env={
+                    "RAILWAY_ENVIRONMENT": "production",
+                    "RAILWAY_VOLUME_MOUNT_PATH": str(sim_vol),
+                    "BROWSER_PROFILE_DIR": "/tmp/illegal_ephemeral_prof",
+                },
+                mountinfo_text=valid_mountinfo,
+                ismount_fn=lambda p: Path(p).resolve() == sim_vol,
+            )
+            assert prod_outside_vol["ok"] is False and prod_outside_vol["allow_writes"] is False
+            assert prod_outside_vol["storage_persistent"] is False
+            assert not Path("/tmp/illegal_ephemeral_prof").exists()
+
+            # Simulasi Volume ter-mount tetapi gagal ditulis (PermissionError / I/O error saat probe) -> wajib fail-closed!
+            import agent.security as sec_mod
+            orig_probe = sec_mod._probe_directory_non_destructive
+            try:
+                def _failing_probe(_p: Path) -> None:
+                    raise PermissionError("Simulated Volume read-only / permission denied")
+
+                sec_mod._probe_directory_non_destructive = _failing_probe  # type: ignore
+                prod_unwritable = resolve_storage_config(
+                    ROOT,
+                    env={
+                        "RAILWAY_ENVIRONMENT": "production",
+                        "RAILWAY_VOLUME_MOUNT_PATH": str(sim_vol),
+                    },
+                    mountinfo_text=valid_mountinfo,
+                    ismount_fn=lambda p: Path(p).resolve() == sim_vol,
+                )
+                assert prod_unwritable["ok"] is False and prod_unwritable["allow_writes"] is False
+                assert prod_unwritable["storage_persistent"] is False
+                assert not prod_unwritable["profile_dir"].startswith("/tmp")
+                assert "tidak writable" in prod_unwritable["error"]
+            finally:
+                sec_mod._probe_directory_non_destructive = orig_probe  # type: ignore
+        finally:
+            shutil.rmtree(sim_vol_holder, ignore_errors=True)
+
+        # Pastikan seluruh komponen memblokir penulisan (0 direktori/file dibuat) saat allow_writes=False
+        blocked_root = tmp_dir / "blocked_should_never_exist"
+        fm_blk = WorkspaceFileManager(str(blocked_root / "ws"), allow_writes=False, write_block_reason=prod_no_vol["error"])
+        tg_blk = TelegramBotBridge(state_dir=str(blocked_root / "prof"), allow_writes=False, write_block_reason=prod_no_vol["error"])
+        be_blk = CloudBrowserEngine(fm_blk, _capture_ev, profile_dir=str(blocked_root / "prof"), allow_writes=False, write_block_reason=prod_no_vol["error"])
+        orch_blk = AgentOrchestrator(be_blk, fm_blk, LLMConfig(), _capture_ev, tg_blk, allow_writes=False, write_block_reason=prod_no_vol["error"])
+
+        assert not blocked_root.exists(), "Direktori tidak boleh dibuat saat allow_writes=False!"
+
+        for blocked_call in (
+            lambda: fm_blk.write_file("tes.md", "isi"),
+            lambda: fm_blk.save_bytes("tes.bin", b"123"),
+            lambda: fm_blk.make_dir("sub"),
+            lambda: orch_blk.task_store.create_task("Tugas terlarang di ephemeral"),
+            lambda: tg_blk._persist_security(),
+            lambda: orch_blk.add_user_memories("Kunci: Nilai"),
+        ):
+            raised = False
+            try:
+                blocked_call()
+            except StorageUnavailableError:
+                raised = True
+            assert raised, "Operasi tulis wajib melempar StorageUnavailableError saat allow_writes=False"
+
+        for blocked_async in (
+            lambda: orch_blk.start_goal("Jalankan sesuatu"),
+            lambda: be_blk.configure_proxy("1.2.3.4:8080"),
+            lambda: be_blk.save_state(),
+        ):
+            raised_a = False
+            try:
+                await blocked_async()
+            except StorageUnavailableError:
+                raised_a = True
+            assert raised_a, "Operasi async tulis wajib melempar StorageUnavailableError saat allow_writes=False"
+
+        assert not blocked_root.exists(), "Tidak boleh ada 1 byte pun ditulis ke lokasi sementara saat diblokir!"
+
+        # Verifikasi endpoint /api/health & middleware fail-closed (HTTP 503) ketika STORAGE_STATUS gagal
+        orig_storage_status = dict(main_mod.STORAGE_STATUS)
+        try:
+            main_mod.STORAGE_STATUS.clear()
+            main_mod.STORAGE_STATUS.update(prod_no_vol)
+            with TestClient(main_mod.app) as tc:
+                r_health_err = tc.get("/api/health")
+                assert r_health_err.status_code == 503
+                body_err = r_health_err.json()
+                assert body_err["ok"] is False and body_err["storage_ok"] is False and body_err["storage_persistent"] is False
+                assert body_err["storage_error"]
+                r_stat_err = tc.get("/api/status")
+                assert r_stat_err.status_code == 503
+        finally:
+            main_mod.STORAGE_STATUS.clear()
+            main_mod.STORAGE_STATUS.update(orig_storage_status)
+
+        record(12, "Railway Volume Mount Proof, Production Fail-Closed & Non-Destructive Probe", True, "Mount kernel & RAILWAY_VOLUME_MOUNT_PATH tervalidasi, fail-closed 503 memblokir 100% tulis ke /tmp, & data lama utuh.")
+
     finally:
         if browser is not None:
             await browser.stop()

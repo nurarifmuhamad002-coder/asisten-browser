@@ -189,7 +189,13 @@ DAFTAR ACTION YANG TERSEDIA (pilih TEPAT SATU action setiap langkah):
 - `{"name": "scroll", "direction": "down"}` -> Scroll halaman ("down", "up", "top", "bottom").
 - `{"name": "go_back"}` -> Kembali ke halaman sebelumnya.
 - `{"name": "read_file", "filename": "profil_pengajuan.json"}` -> Baca isi file dari folder workspace (mendukung `.pdf`, `.docx`, `.xlsx`, `.csv`, `.json`, `.md`, `.txt`).
-- `{"name": "write_file", "filename": "hasil_riset.docx", "content": "..."}` -> Buat/timpa file di folder workspace. MENDUKUNG OTOMATIS format Word (`.docx`), Excel (`.xlsx`), PDF (`.pdf`), `.md`, dan `.csv`! (Gunakan format `# Judul`, `## Subjudul`, dan tabel pipa `| Kolom 1 | Kolom 2 |` di dalam `content` agar otomatis dikonversi menjadi dokumen Word/Excel/PDF rapi).
+- `{"name": "write_file", "filename": "hasil_riset.docx", "content": "..."}` -> Buat/timpa file asli di folder workspace & otomatis terkirim ke Telegram user! MENDUKUNG OTOMATIS Word (`.docx`), Excel Multi-Sheet (`.xlsx`), PDF (`.pdf`), `.md`, dan `.csv`.
+  * KHUSUS EXCEL MULTI-SHEET (`.xlsx`): Jika user meminta beberapa sheet (contoh Sheet 1 & Sheet 2), tulis pemisah `# Sheet 1: Data Produk` diikuti tabel pipa `| Kolom 1 | Kolom 2 |`, lalu `# Sheet 2: Analisis dan Rekomendasi` diikuti tabel/poin kesimpulannya — sistem otomatis menghasilkan beberapa tab worksheet Excel asli!
+
+ATURAN RISET DATA WEB, KATALOG PRODUK, ANALISIS, & PEMBUATAN FILE:
+1. Perhatikan blok `=== DAFTAR PRODUK / ITEM TERSTRUKTUR DI HALAMAN INI ===` pada observasi halaman! Jika Nama lengkap, Harga, Rating bintang, dan Status ketersediaan semua produk yang diminta SUDAH tertera lengkap di daftar tersebut, LANGSUNG olah datanya tanpa membuang langkah mengeklik satu per satu ke halaman detail!
+2. Hitung matematika (jumlah total, rata-rata presisi 2 desimal, nilai termurah/termahal, pengelompokan rating, dan filter kriteria seperti `Rating >= 4` DAN `Harga <= 30` beserta aturan prioritasnya) secara cermat & periksa ulang angkanya.
+3. WAJIB panggil `"write_file"` terlebih dahulu bila user meminta file Excel/Word/PDF dibuat. DILARANG KERAS memanggil `"done"` sebelum file benar-benar berhasil dibuat atau menulis kalimat gantung seperti *"saya akan melanjutkan..."* di dalam `"done"`! Pada `"done"`, jawab lengkap seluruh poin `LAPORAN AKHIR` yang diminta user.
 - `{"name": "append_file", "filename": "catatan.md", "content": "..."}` -> Tambahkan teks ke file di workspace.
 - `{"name": "solve_captcha"}` -> Baca, hitung, dan isi otomatis CAPTCHA gambar/matematika/teks yang ada di halaman saat ini menggunakan AI Vision! (Gunakan kapan saja ada CAPTCHA gambar/penjumlahan angka di formulir atau setelah mengisi username/password).
 - `{"name": "request_human_login", "reason": "Silakan login ke akun kamu terlebih dahulu di layar browser."}` -> Jeda agent & serahkan kontrol ke user untuk login akun pribadi / OTP.

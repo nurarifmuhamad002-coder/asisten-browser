@@ -338,6 +338,89 @@ INSPECT_DOM_JS = """
         ? ((modalRoot.querySelector('.modal-title, h1, h2, h3, h4') || {}).innerText || '').trim()
         : '';
 
+    // Ekstrak Katalog / Kartu Produk / Item Daftar secara Terstruktur di Seluruh Halaman (tanpa terpotong fold 600px!)
+    // Mendukung umum semua web e-commerce/katalog: rating via CSS class (One..Five / stars-4), aria-label, data-rating, & judul utuh via atribut title!
+    const catalogItems = [];
+    const wordRatingMap = { one: '1', two: '2', three: '3', four: '4', five: '5' };
+    const extractNodeRating = (root) => {
+        const rNodes = [root, ...Array.from(root.querySelectorAll('[class*="star" i], [class*="rating" i], [aria-label*="star" i], [aria-label*="bintang" i], [title*="star" i], [data-rating], [data-score]'))];
+        for (const rn of rNodes) {
+            const dr = rn.getAttribute && (rn.getAttribute('data-rating') || rn.getAttribute('data-score') || '');
+            if (dr && /^\\d+(\\.\\d+)?$/.test(dr.trim())) return `${dr.trim()} bintang`;
+            const aria = (rn.getAttribute && (rn.getAttribute('aria-label') || rn.getAttribute('title') || '')) || '';
+            const mAria = aria.match(/(\\d+(?:[.,]\\d+)?)\\s*(?:out of 5|\\/\\s*5|stars?|bintang)/i);
+            if (mAria) return `${mAria[1].replace(',', '.')} bintang`;
+            const cls = String(rn.className || '');
+            if (/star|rating/i.test(cls)) {
+                for (const tok of cls.split(/\\s+/)) {
+                    const tl = tok.toLowerCase();
+                    if (wordRatingMap[tl]) return `${wordRatingMap[tl]} bintang`;
+                    const mNum = tl.match(/^(?:stars?|rating)[-_]?(\\d(?:\\.\\d)?)$/);
+                    if (mNum) return `${mNum[1]} bintang`;
+                }
+            }
+        }
+        return '';
+    };
+
+    const cardSelector = 'article.product_pod, [data-component-type="s-search-result"], [data-testid*="product" i], .product-item, .product-card, .book-item, li.product, article, .card';
+    const rawCards = Array.from(document.querySelectorAll(cardSelector));
+    const seenCardEls = new Set();
+    for (const card of rawCards) {
+        if (catalogItems.length >= 30) break;
+        if (seenCardEls.has(card)) continue;
+        // Lewati wrapper induk yang membungkus kartu lain di dalamnya
+        if (card.querySelectorAll('article, .product_pod, .product-card, .product-item').length > 0) continue;
+        const st = window.getComputedStyle(card);
+        if (st.display === 'none' || st.visibility === 'hidden') continue;
+
+        // Cari judul utuh (prioritaskan atribut title pada link judul agar nama produk panjang tidak terpotong '...')
+        let itemTitle = '';
+        const titleLink = card.querySelector('h1 a[title], h2 a[title], h3 a[title], h4 a[title], a[title]');
+        if (titleLink && (titleLink.getAttribute('title') || '').trim()) {
+            itemTitle = titleLink.getAttribute('title').trim();
+        } else {
+            const hNode = card.querySelector('h1, h2, h3, h4, [class*="title" i], [class*="name" i]');
+            if (hNode && (hNode.innerText || '').trim()) {
+                itemTitle = hNode.innerText.trim().replace(/\\s+/g, ' ');
+            }
+        }
+        if (!itemTitle || itemTitle.length < 2) continue;
+
+        // Cari harga
+        let itemPrice = '';
+        const pNode = card.querySelector('.price_color, [class*="price" i], [data-testid*="price" i]');
+        if (pNode && (pNode.innerText || '').trim()) {
+            itemPrice = pNode.innerText.trim().replace(/\\s+/g, ' ');
+        } else {
+            const mPrice = (card.innerText || '').match(/(?:Rp\\.?\\s?[\\d.,]+|[£$€¥]\\s?\\d+(?:[.,]\\d+)?)/i);
+            if (mPrice) itemPrice = mPrice[0].trim();
+        }
+
+        const itemRating = extractNodeRating(card);
+
+        let itemStock = '';
+        const sNode = card.querySelector('.availability, [class*="avail" i], [class*="stock" i]');
+        if (sNode && (sNode.innerText || '').trim()) {
+            itemStock = sNode.innerText.trim().replace(/\\s+/g, ' ');
+        }
+
+        // Hanya masukkan sebagai item katalog jika memiliki minimal harga, rating, atau info stok
+        if (itemPrice || itemRating || itemStock) {
+            seenCardEls.add(card);
+            catalogItems.push({
+                pos: catalogItems.length + 1,
+                title: itemTitle.slice(0, 160),
+                price: itemPrice.slice(0, 50),
+                rating: itemRating,
+                stock: itemStock.slice(0, 60)
+            });
+        }
+    }
+
+    // Jika sedang berada di halaman detail 1 produk tunggal dan ada rating CSS/aria yang tidak terbaca innerText
+    const singlePageRating = catalogItems.length <= 1 ? extractNodeRating(document.body || document.documentElement) : '';
+
     // Extract clean visible page content
     const contentChunks = [];
     const textTargets = document.querySelectorAll('h1, h2, h3, h4, .modal-title, p, li, tr, article, [role="alert"], .card');
@@ -368,6 +451,8 @@ INSPECT_DOM_JS = """
         modal_title: modalTitle,
         was_validated: wasValidated,
         result_table: resultTable,
+        catalog_items: catalogItems,
+        single_page_rating: singlePageRating,
         scroll: {
             y: Math.round(window.scrollY),
             maxY: Math.max(0, Math.round(document.documentElement.scrollHeight - window.innerHeight)),
@@ -440,6 +525,70 @@ def format_dom_for_llm(dom_state: Dict[str, Any]) -> str:
         lines.append(f"\n=== TABEL HASIL SUBMIT TERDETEKSI ({m_title}) — WAJIB VERIFIKASI SATU PER SATU ===")
         for row in result_table:
             lines.append(f"- {row.get('label', '')}: '{row.get('value', '')}'")
+
+    # Tampilkan Daftar Item / Produk Katalog Terstruktur jika terdeteksi di halaman!
+    catalog_items: List[Dict[str, Any]] = dom_state.get("catalog_items") or []
+    if len(catalog_items) >= 2:
+        import re as _re
+        lines.append(
+            f"\n=== DAFTAR PRODUK / ITEM TERSTRUKTUR DI HALAMAN INI (Total terdeteksi: {len(catalog_items)} item berurutan dari atas) ==="
+        )
+        parsed_rows = []
+        for it in catalog_items[:25]:
+            parts_i = [f"Nama='{it.get('title', '')}'"]
+            p_raw = it.get("price") or ""
+            r_raw = it.get("rating") or ""
+            if p_raw:
+                parts_i.append(f"Harga={p_raw}")
+            if r_raw:
+                parts_i.append(f"Rating={r_raw}")
+            if it.get("stock"):
+                parts_i.append(f"Status='{it['stock']}'")
+            lines.append(f"#{it.get('pos')}. " + " | ".join(parts_i))
+
+            # Ekstrak angka harga & rating secara umum untuk kalkulator presisi Python (anti salah hitung desimal LLM!)
+            p_val = None
+            m_p = _re.search(r"(\d[\d.,]*)", p_raw.replace(" ", ""))
+            if m_p:
+                num_s = m_p.group(1)
+                if "," in num_s and "." not in num_s and len(num_s.split(",")[-1]) == 2:
+                    num_s = num_s.replace(",", ".")
+                else:
+                    num_s = num_s.replace(",", "")
+                try:
+                    p_val = float(num_s)
+                except Exception:
+                    p_val = None
+            r_val = None
+            m_r = _re.search(r"(\d+(?:\.\d+)?)", r_raw)
+            if m_r:
+                try:
+                    r_val = float(m_r.group(1))
+                except Exception:
+                    r_val = None
+            parsed_rows.append((it.get("pos"), it.get("title", ""), p_raw, p_val, r_val))
+
+        # Sediakan ringkasan kalkulasi matematika presisi Python (untuk 10 item pertama & seluruh item)
+        for subset_n in ([10, len(parsed_rows)] if len(parsed_rows) > 10 else [len(parsed_rows)]):
+            sub = parsed_rows[:subset_n]
+            valid_p = [(pos, t, pr, pv, rv) for (pos, t, pr, pv, rv) in sub if pv is not None]
+            if len(valid_p) >= 2:
+                total_p = round(sum(x[3] for x in valid_p), 2)
+                avg_p = round(total_p / len(valid_p), 2)
+                cheapest = min(valid_p, key=lambda x: x[3])
+                stat_line = (
+                    f"[Kalkulasi Presisi {len(valid_p)} Item Pertama] "
+                    f"Total Harga={total_p:.2f} | Rata-rata={avg_p:.2f} | "
+                    f"Termurah=#{cheapest[0]} '{cheapest[1]}' ({cheapest[2]})"
+                )
+                valid_r = [x for x in sub if x[4] is not None]
+                if valid_r:
+                    max_rv = max(x[4] for x in valid_r)
+                    top_rated = [f"#{x[0]} '{x[1]}' ({x[2]})" for x in valid_r if x[4] == max_rv]
+                    stat_line += f" | Rating Tertinggi ({max_rv:g} bintang): {', '.join(top_rated[:4])}"
+                lines.append(stat_line)
+    elif dom_state.get("single_page_rating"):
+        lines.append(f"Rating Terdeteksi di Halaman Ini: {dom_state['single_page_rating']}")
 
     lines.append("\n=== ELEMEN INTERAKTIF & FORMULIR [index] (berdasarkan DOM Selector & Label) ===")
     elements = dom_state.get("elements", [])

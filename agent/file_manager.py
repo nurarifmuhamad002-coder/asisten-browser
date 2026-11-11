@@ -121,33 +121,36 @@ def _build_docx_bytes(raw_text: str, fallback_title: str = "Dokumen Tugas") -> b
     return buf.getvalue()
 
 
-def _build_xlsx_bytes(raw_text: str, sheet_title: str = "Data") -> bytes:
-    import openpyxl
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = re.sub(r"[\[\]\*:/\\?]", "", sheet_title)[:28] or "Data"
-
-    _, blocks = _parse_markdown_blocks(raw_text)
-    rows_to_write: List[List[str]] = []
-
-    # 1. Jika ada blok tabel Markdown, gabungkan semua tabel
+def _blocks_to_sheet_rows(blocks: List[Dict[str, Any]], raw_chunk: str) -> List[List[Any]]:
+    """Mengubah daftar blok Markdown / CSV / Key-Value menjadi matriks baris Excel yang rapi."""
+    rows_to_write: List[List[Any]] = []
     tables = [b["rows"] for b in blocks if b["type"] == "table"]
     if tables:
-        for t_idx, t_rows in enumerate(tables):
-            if t_idx > 0:
-                rows_to_write.append([])
-            rows_to_write.extend([[c.replace("**", "") for c in r] for r in t_rows])
+        # Gabungkan tabel DAN sertakan teks/poin kesimpulan di bawah/di antara tabel jika ada!
+        for b in blocks:
+            btype = b["type"]
+            if btype == "table":
+                if rows_to_write and rows_to_write[-1] != []:
+                    rows_to_write.append([])
+                rows_to_write.extend([[c.replace("**", "").strip() for c in r] for r in b["rows"]])
+            elif btype == "heading":
+                if rows_to_write and rows_to_write[-1] != []:
+                    rows_to_write.append([])
+                rows_to_write.append([b["text"]])
+            else:
+                txt = b.get("text", "").replace("**", "").strip()
+                if txt:
+                    if ":" in txt and len(txt.split(":", 1)[0]) <= 45:
+                        k, v = txt.split(":", 1)
+                        rows_to_write.append([k.strip(), v.strip()])
+                    else:
+                        rows_to_write.append([txt])
     else:
-        # 2. Cek apakah format CSV murni (banyak koma konsisten)
-        non_empty = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
+        non_empty = [ln.strip() for ln in (raw_chunk or "").splitlines() if ln.strip()]
         if len(non_empty) >= 2 and all("," in ln for ln in non_empty[:3]):
             reader = csv.reader(io.StringIO("\n".join(non_empty)))
             rows_to_write = [list(r) for r in reader if any(r)]
         else:
-            # 3. Konversi poin / Key: Value / paragraf menjadi tabel rapi 3 kolom
             rows_to_write.append(["No", "Bagian / Topik", "Isi / Keterangan"])
             cur_section = "Umum"
             num = 1
@@ -156,42 +159,149 @@ def _build_xlsx_bytes(raw_text: str, sheet_title: str = "Data") -> bytes:
                     cur_section = b["text"]
                 else:
                     txt = b.get("text", "").replace("**", "").strip()
-                    if ":" in txt and len(txt.split(":", 1)[0]) <= 40:
+                    if ":" in txt and len(txt.split(":", 1)[0]) <= 45:
                         k, v = txt.split(":", 1)
-                        rows_to_write.append([str(num), k.strip(), v.strip()])
+                        rows_to_write.append([num, k.strip(), v.strip()])
                     else:
-                        rows_to_write.append([str(num), cur_section, txt])
+                        rows_to_write.append([num, cur_section, txt])
                     num += 1
-
     if not rows_to_write:
-        rows_to_write = [["Isi Dokumen"], [raw_text or ""]]
+        rows_to_write = [["Isi Dokumen"], [raw_chunk or ""]]
+    return rows_to_write
 
+
+def _coerce_excel_cell(val: Any, is_header: bool = False) -> Any:
+    if is_header or not isinstance(val, str):
+        return val
+    s = val.strip()
+    if re.fullmatch(r"-?\d+", s) and not (len(s) > 1 and s.startswith("0")):
+        try:
+            return int(s)
+        except Exception:
+            return val
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        try:
+            return float(s)
+        except Exception:
+            return val
+    return val
+
+
+def _split_multi_sheet_sections(raw_text: str, default_title: str) -> List[Tuple[str, str]]:
+    """
+    Mendeteksi pemisahan Multi-Sheet di dalam konten Markdown/JSON:
+    - JSON: {"sheets": [{"name": "Data Produk", "content": "..."}]}
+    - Markdown: '# Sheet 1: Data Produk', '## Sheet: Analisis dan Rekomendasi', '=== Sheet: ... ==='
+    """
+    txt = (raw_text or "").strip()
+    if txt.startswith("{"):
+        try:
+            obj = json.loads(txt)
+            if isinstance(obj, dict) and isinstance(obj.get("sheets"), list) and obj["sheets"]:
+                out_json: List[Tuple[str, str]] = []
+                for idx, sh in enumerate(obj["sheets"], 1):
+                    nm = str(sh.get("name") or sh.get("title") or f"Sheet {idx}")
+                    if isinstance(sh.get("rows"), list):
+                        lines = ["| " + " | ".join(str(c) for c in r) + " |" for r in sh["rows"]]
+                        out_json.append((nm, "\n".join(lines)))
+                    else:
+                        out_json.append((nm, str(sh.get("content") or "")))
+                return out_json
+        except Exception:
+            pass
+
+    sheet_hdr_re = re.compile(
+        r"^(?:#{1,3}\s*|===\s*)(?:sheet\s*\d*\s*[:\-–]\s*|tab\s*\d*\s*[:\-–]\s*)(.+?)(?:\s*===)?$",
+        flags=re.I,
+    )
+    sections: List[Tuple[str, List[str]]] = []
+    cur_name: str = ""
+    cur_lines: List[str] = []
+
+    for ln in (raw_text or "").splitlines():
+        m = sheet_hdr_re.match(ln.strip())
+        if m:
+            if cur_name or any(x.strip() for x in cur_lines):
+                if cur_name:
+                    sections.append((cur_name, cur_lines))
+                elif any("|" in x for x in cur_lines):
+                    sections.append((default_title, cur_lines))
+            raw_nm = m.group(1).strip().strip("*").rstrip(".")
+            cur_name = raw_nm or f"Sheet {len(sections) + 1}"
+            cur_lines = []
+        else:
+            cur_lines.append(ln)
+
+    if cur_name:
+        sections.append((cur_name, cur_lines))
+
+    if len(sections) >= 1:
+        return [(nm, "\n".join(lns).strip()) for nm, lns in sections if "\n".join(lns).strip()]
+    return [(default_title, raw_text or "")]
+
+
+def _build_xlsx_bytes(raw_text: str, sheet_title: str = "Data") -> bytes:
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
     header_fill = PatternFill("solid", fgColor="00695C")
-    zebra_fill = PatternFill("solid", fgColor="F1F8F6")
+    subhdr_fill = PatternFill("solid", fgColor="E0F2F1")
+    zebra_fill = PatternFill("solid", fgColor="F5FAF8")
     header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    subhdr_font = Font(name="Calibri", size=11, bold=True, color="004D40")
     body_font = Font(name="Calibri", size=11, color="111111")
     thin = Side(border_style="thin", color="CFD8DC")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    col_max: Dict[int, int] = {}
-    for r_idx, row in enumerate(rows_to_write, start=1):
-        ws.append(row)
-        for c_idx, val in enumerate(row, start=1):
-            s_val = str(val or "")
-            col_max[c_idx] = max(col_max.get(c_idx, 10), min(len(s_val) + 4, 58))
-            cell = ws.cell(row=r_idx, column=c_idx)
-            cell.border = border
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            if r_idx == 1:
-                cell.fill = header_fill
-                cell.font = header_font
-            else:
-                if r_idx % 2 == 1:
-                    cell.fill = zebra_fill
-                cell.font = body_font
+    sheet_sections = _split_multi_sheet_sections(raw_text, sheet_title)
+    used_names: set[str] = set()
 
-    for c_idx, width in col_max.items():
-        ws.column_dimensions[get_column_letter(c_idx)].width = width
+    for s_idx, (raw_sname, s_chunk) in enumerate(sheet_sections):
+        clean_sname = re.sub(r"[\[\]\*:/\\?]", " ", raw_sname).strip()[:31] or f"Sheet{s_idx + 1}"
+        if clean_sname.lower() in used_names:
+            clean_sname = f"{clean_sname[:27]}_{s_idx + 1}"
+        used_names.add(clean_sname.lower())
+
+        ws = wb.active if s_idx == 0 else wb.create_sheet(title=clean_sname)
+        ws.title = clean_sname
+
+        _, blocks = _parse_markdown_blocks(s_chunk)
+        rows_to_write = _blocks_to_sheet_rows(blocks, s_chunk)
+
+        col_max: Dict[int, int] = {}
+        prev_was_blank = True
+        for r_idx, row in enumerate(rows_to_write, start=1):
+            if not row or all(str(x).strip() == "" for x in row):
+                ws.append([])
+                prev_was_blank = True
+                continue
+            is_tbl_hdr = prev_was_blank and len(row) >= 2
+            is_sec_hdr = len(row) == 1 and prev_was_blank and len(rows_to_write) > r_idx
+            coerced_row = [_coerce_excel_cell(v, is_header=(is_tbl_hdr or is_sec_hdr)) for v in row]
+            ws.append(coerced_row)
+            prev_was_blank = False
+
+            for c_idx, val in enumerate(coerced_row, start=1):
+                s_val = str(val if val is not None else "")
+                col_max[c_idx] = max(col_max.get(c_idx, 10), min(len(s_val) + 4, 58))
+                cell = ws.cell(row=r_idx, column=c_idx)
+                cell.border = border
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                if is_tbl_hdr:
+                    cell.fill = header_fill
+                    cell.font = header_font
+                elif is_sec_hdr:
+                    cell.fill = subhdr_fill
+                    cell.font = subhdr_font
+                else:
+                    if r_idx % 2 == 1:
+                        cell.fill = zebra_fill
+                    cell.font = body_font
+
+        for c_idx, width in col_max.items():
+            ws.column_dimensions[get_column_letter(c_idx)].width = width
 
     buf = io.BytesIO()
     wb.save(buf)

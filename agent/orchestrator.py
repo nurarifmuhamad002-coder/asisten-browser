@@ -20,7 +20,7 @@ class AgentOrchestrator:
     secara otomatis ketika butuh Login user atau Persetujuan Tindakan Sensitif.
     """
 
-    MAX_STEPS = 26
+    MAX_STEPS = 32
 
     def __init__(
         self,
@@ -53,6 +53,7 @@ class AgentOrchestrator:
         self._goal_expectations: Dict[str, str] = {}
         self._field_warnings: Dict[str, str] = {}
         self._recorded_issues: List[str] = []
+        self._created_files_this_run: List[str] = []
         self._last_submit_verification: Optional[Dict[str, Any]] = None
         self._verify_retry_used: bool = False
         self._pre_submit_blocked_once: bool = False
@@ -239,6 +240,7 @@ class AgentOrchestrator:
         self._goal_expectations = self._parse_goal_kv_expectations(clean_goal)
         self._field_warnings = {}
         self._recorded_issues = []
+        self._created_files_this_run = []
         self._last_submit_verification = None
         self._verify_retry_used = False
         self._pre_submit_blocked_once = False
@@ -357,9 +359,90 @@ class AgentOrchestrator:
                 action = decision.get("action") or {"name": "done", "summary": "Selesai."}
                 act_name = (action.get("name") or "done").lower()
 
-                # SELESAI? (Gerbang Verifikasi Ketat Pasca-Submit — Ketentuan #7, #8, #9!)
+                # SELESAI? (Gerbang Verifikasi Ketat Pasca-Submit, Anti-Berhenti Tengah Jalan, & Wajib File Deliverable!)
                 if act_name == "done":
                     goal_low = self.current_goal.lower()
+                    cand_summary = (action.get("summary") or thought or "").strip()
+                    cand_low = cand_summary.lower()
+
+                    # 1. GERBANG ANTI-BERHENTI TENGAH JALAN ("saya akan melanjutkan..." padahal memilih action 'done'!)
+                    premature_phrases = (
+                        "saya akan melanjutkan",
+                        "akan saya lanjutkan",
+                        "akan melanjutkan dengan",
+                        "selanjutnya saya akan",
+                        "mari kita lanjutkan",
+                        "langkah selanjutnya adalah",
+                    )
+                    if any(pp in cand_low for pp in premature_phrases) and step_num <= self.MAX_STEPS - 3:
+                        self.history.append({
+                            "step": step_num,
+                            "action_name": "verify_gate",
+                            "result": (
+                                "⚠️ DITOLAK BERHENTI TENGAH JALAN: Kamu menulis bahwa kamu 'akan melanjutkan', tetapi memilih action 'done'! "
+                                "DILARANG memilih 'done' sebelum seluruh pengambilan data, perhitungan/analisis, pembuatan file, dan seluruh poin LAPORAN AKHIR benar-benar tuntas!"
+                            ),
+                        })
+                        continue
+
+                    # 2. GERBANG WAJIB FILE DELIVERABLE (Excel / Word / PDF / CSV jika diminta di instruksi!)
+                    req_file_ext = ""
+                    if re.search(r"\b(buat(?:kan)?\s+(?:file\s+|laporan\s+)?excel|file\s+excel|\.xlsx)\b", goal_low):
+                        req_file_ext = "xlsx"
+                    elif re.search(r"\b(buat(?:kan)?\s+(?:file\s+|dokumen\s+|laporan\s+)?word|file\s+word|\.docx)\b", goal_low):
+                        req_file_ext = "docx"
+                    elif re.search(r"\b(buat(?:kan)?\s+(?:file\s+|dokumen\s+|laporan\s+)?pdf|file\s+pdf|\.pdf)\b", goal_low):
+                        req_file_ext = "pdf"
+                    elif re.search(r"\b(buat(?:kan)?\s+(?:file\s+)?csv|\.csv)\b", goal_low):
+                        req_file_ext = "csv"
+
+                    if req_file_ext:
+                        matching_files = [
+                            fn for fn in self._created_files_this_run
+                            if fn.lower().endswith(f".{req_file_ext}")
+                        ]
+                        if not matching_files and step_num <= self.MAX_STEPS - 2:
+                            sheet_hint = (
+                                " Gunakan judul '# Sheet 1: Nama Sheet' lalu tabel pipa '|...|', kemudian '# Sheet 2: Nama Sheet' lalu tabel/analisisnya agar otomatis menjadi file Excel multi-sheet asli!"
+                                if req_file_ext == "xlsx" and any(s in goal_low for s in ("dua sheet", "2 sheet", "sheet 1", "multi sheet"))
+                                else ""
+                            )
+                            self.history.append({
+                                "step": step_num,
+                                "action_name": "verify_gate",
+                                "result": (
+                                    f"❌ DITOLAK SELESAI PREMATUR: Instruksi user mewajibkan pembuatan file .{req_file_ext.upper()}, "
+                                    f"tetapi kamu BELUM memanggil action 'write_file' untuk membuat file .{req_file_ext}!{sheet_hint} "
+                                    "Panggil 'write_file' sekarang juga, baru setelah file tersimpan panggil 'done' dengan laporan akhir lengkap!"
+                                ),
+                            })
+                            continue
+
+                        # Jika user meminta Excel 2 sheet / multi-sheet, pastikan file .xlsx benar-benar memiliki >=2 sheet!
+                        wants_two_sheets = req_file_ext == "xlsx" and any(
+                            s in goal_low for s in ("dua sheet", "2 sheet", "sheet 1", "sheet 2")
+                        )
+                        if wants_two_sheets and matching_files and step_num <= self.MAX_STEPS - 2:
+                            try:
+                                import openpyxl as _ox
+                                latest_xlsx = self.file_manager.get_file_path(matching_files[-1])
+                                wb_chk = _ox.load_workbook(str(latest_xlsx), read_only=True)
+                                s_names = list(wb_chk.sheetnames)
+                                wb_chk.close()
+                                if len(s_names) < 2:
+                                    self.history.append({
+                                        "step": step_num,
+                                        "action_name": "verify_gate",
+                                        "result": (
+                                            f"❌ FILE EXCEL BELUM MULTI-SHEET: File '{matching_files[-1]}' baru memiliki 1 sheet ({s_names}), "
+                                            "padahal instruksi mewajibkan 2 sheet! Panggil ulang 'write_file' pada file .xlsx tersebut dengan format:\n"
+                                            "# Sheet 1: Data Produk\n| ... |\n\n# Sheet 2: Analisis dan Rekomendasi\n| ... |"
+                                        ),
+                                    })
+                                    continue
+                            except Exception:
+                                pass
+
                     wants_submit = any(k in goal_low for k in ("submit", "kirim", "daftar", "simpan form", "isi form", "formulir", "practice-form"))
                     if self._form_touched and wants_submit:
                         # Jika belum pernah klik Submit padahal diminta submit -> tolak klaim selesai prematur!
@@ -451,6 +534,10 @@ class AgentOrchestrator:
                         summary_msg = f"{raw_summary}\n\n" + "\n\n".join(audit_parts)
                     else:
                         summary_msg = raw_summary
+                        if self._created_files_this_run:
+                            files_joined = ", ".join(dict.fromkeys(self._created_files_this_run))
+                            if files_joined not in summary_msg:
+                                summary_msg += f"\n\n📎 File Dibuat & Dikirim: {files_joined}"
 
                     proof_b64 = ""
                     if self._form_touched:
@@ -743,16 +830,29 @@ class AgentOrchestrator:
                 if act_name == "write_file"
                 else self.file_manager.append_file(fname, content)
             )
+            if saved["name"] not in self._created_files_this_run:
+                self._created_files_this_run.append(saved["name"])
+            self.memory_notes[f"file_dibuat_{saved['name']}"] = content[:2500]
             await self.broadcast({"type": "files_updated", "files": self.file_manager.list_files()})
             await self._push_chat(
                 "file",
                 f"File siap: {saved['name']}",
                 {"filename": saved["name"], "size": saved["size"]},
             )
+            fpath = self.file_manager.get_file_path(saved["name"])
             if self.telegram:
-                fpath = self.file_manager.get_file_path(saved["name"])
                 await self.telegram.notify_file(saved["name"], fpath.read_bytes())
-            return f"File '{saved['name']}' berhasil disimpan ({saved['size']} bytes)."
+
+            extra_sheet_info = ""
+            if saved["name"].lower().endswith(".xlsx"):
+                try:
+                    import openpyxl as _ox
+                    wb_i = _ox.load_workbook(str(fpath), read_only=True)
+                    extra_sheet_info = f" [Sheet tersedia: {', '.join(wb_i.sheetnames)}]"
+                    wb_i.close()
+                except Exception:
+                    pass
+            return f"✅ File '{saved['name']}' berhasil dibuat & dikirim ke user ({saved['size']} bytes){extra_sheet_info}."
 
         return f"Action '{act_name}' tidak dikenali."
 

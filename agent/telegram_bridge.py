@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -132,15 +133,72 @@ class TelegramBotBridge:
         self.chat_modes: Dict[int, str] = {}  # "chat" | "agent" | "open_web"
         self.last_output_text: Dict[int, str] = {}
         self._status_msg_ids: Dict[int, int] = {}
+        self._status_card_seq: Dict[int, int] = {}
         self._last_rendered_card: Dict[int, str] = {}
+        self._run_seq: int = 0
+        self._active_run_seq: int = 0
         self._run_started_at: float = 0.0
         self._last_step_num: int = 0
         self._last_thought: str = ""
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._seen_update_ids: Set[int] = set()
+        self._seen_update_order: deque[int] = deque()
+        self._max_seen_updates: int = 1000
+        self._chat_locks: Dict[int, asyncio.Lock] = {}
         self._poll_task: Optional[asyncio.Task] = None
         self._offset: int = 0
         self.bot_username: str = ""
+
+    def _get_chat_lock(self, chat_id: int) -> asyncio.Lock:
+        lk = self._chat_locks.get(chat_id)
+        if lk is None:
+            lk = asyncio.Lock()
+            self._chat_locks[chat_id] = lk
+        return lk
+
+    def _mark_update_seen(self, uid: Optional[int]) -> bool:
+        """Mengembalikan True jika update_id duplikat. Menggunakan antrean FIFO terbatas tanpa pernah menghapus seluruh set sekaligus."""
+        if uid is None:
+            return False
+        if uid in self._seen_update_ids:
+            return True
+        while len(self._seen_update_order) >= self._max_seen_updates:
+            oldest = self._seen_update_order.popleft()
+            self._seen_update_ids.discard(oldest)
+        self._seen_update_order.append(uid)
+        self._seen_update_ids.add(uid)
+        return False
+
+    async def _retire_active_cards(self, header_label: str = "⏹️ STATUS: TERHENTI") -> None:
+        """Menutup kartu progress aktif dan mencabut ikatan message_id agar task lama tidak menimpa kartu baru."""
+        if self._active_run_seq > 0:
+            await self._finalize_progress_cards(header_label, clear_after=True)
+        self._run_seq += 1
+        self._active_run_seq = 0
+        self._status_msg_ids.clear()
+        self._status_card_seq.clear()
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+
+    async def _begin_new_agent_card(
+        self,
+        chat_id: int,
+        card_text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Menghentikan task lama lebih dulu, mengisolasi token run baru, lalu mendaftarkan kartu progress baru."""
+        if self.orchestrator:
+            await self.orchestrator.stop_goal(silent=True)
+        await self._retire_active_cards("⏹️ TUGAS DIGANTIKAN PERINTAH BARU")
+        self._run_seq += 1
+        run_token = self._run_seq
+        self._active_run_seq = run_token
+        mid = await self.send_text(chat_id, card_text, reply_markup=reply_markup)
+        if mid:
+            self._status_msg_ids[chat_id] = mid
+            self._status_card_seq[chat_id] = run_token
+            self._last_rendered_card[chat_id] = card_text
+        return run_token
 
     def _persist_security(self) -> None:
         if not self.allow_writes:
@@ -373,12 +431,8 @@ class TelegramBotBridge:
             return
 
         uid = upd.get("update_id")
-        if uid is not None:
-            if uid in self._seen_update_ids:
-                return
-            self._seen_update_ids.add(uid)
-            if len(self._seen_update_ids) > 500:
-                self._seen_update_ids.clear()
+        if self._mark_update_seen(uid):
+            return
 
         # -------------------- INLINE BUTTON CALLBACKS --------------------
         if "callback_query" in upd:
@@ -443,6 +497,7 @@ class TelegramBotBridge:
                 self.start_progress_heartbeat()
                 await self._answer_cb(cb_id, "Melanjutkan pekerjaan...")
             elif data == "stop_running":
+                await self._retire_active_cards("⏹️ STATUS: TERHENTI (Dihentikan pengguna)")
                 await self.orchestrator.stop_goal(silent=False)
                 await self._answer_cb(cb_id, "Pekerjaan dihentikan.")
             elif data == "clear_user_mem":
@@ -462,14 +517,15 @@ class TelegramBotBridge:
                     reply_markup=MAIN_MENU_KB,
                 )
             elif data == "save_upload_md":
-                last_note = self.orchestrator.persistent_notes.get("hasil_baca_terakhir", "")
-                if not last_note:
-                    await self._answer_cb(cb_id, "Belum ada hasil baca foto/file.")
-                    return
-                saved = self.orchestrator.file_manager.write_file("hasil_baca_telegram.md", last_note)
-                fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
-                await self._answer_cb(cb_id, "Mengirim file...")
-                await self.send_document(chat_id, fpath.name, fpath.read_bytes(), "📄 Hasil baca berhasil disimpan!")
+                async with self._get_chat_lock(chat_id):
+                    last_note = self.orchestrator.persistent_notes.get("hasil_baca_terakhir", "")
+                    if not last_note:
+                        await self._answer_cb(cb_id, "Belum ada hasil baca foto/file.")
+                        return
+                    saved = self.orchestrator.file_manager.write_file("hasil_baca_telegram.md", last_note)
+                    fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
+                    await self._answer_cb(cb_id, "Mengirim file...")
+                    await self.send_document(chat_id, fpath.name, fpath.read_bytes(), "📄 Hasil baca berhasil disimpan!")
             elif data == "use_upload_web":
                 self.chat_modes[chat_id] = "agent"
                 await self._answer_cb(cb_id, "Siap dipakai di browser!")
@@ -483,16 +539,17 @@ class TelegramBotBridge:
                     reply_markup=MAIN_MENU_KB,
                 )
             elif data.startswith("exp:"):
-                fmt = data.split(":", 1)[1].lower()
-                src_txt = self.last_output_text.get(chat_id) or self.orchestrator.persistent_notes.get("hasil_baca_terakhir", "")
-                if not src_txt:
-                    await self._answer_cb(cb_id, "Belum ada isi teks untuk dijadikan file.")
-                    return
-                await self._answer_cb(cb_id, f"Menyiapkan file .{fmt.upper()}...")
-                from datetime import datetime as _dt
-                saved = self.orchestrator.file_manager.export_formatted(f"dokumen_{_dt.now().strftime('%H%M%S')}", src_txt, fmt)
-                fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
-                await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 Siap kumpul: {fpath.name}")
+                async with self._get_chat_lock(chat_id):
+                    fmt = data.split(":", 1)[1].lower()
+                    src_txt = self.last_output_text.get(chat_id) or self.orchestrator.persistent_notes.get("hasil_baca_terakhir", "")
+                    if not src_txt:
+                        await self._answer_cb(cb_id, "Belum ada isi teks untuk dijadikan file.")
+                        return
+                    await self._answer_cb(cb_id, f"Menyiapkan file .{fmt.upper()}...")
+                    from datetime import datetime as _dt
+                    saved = self.orchestrator.file_manager.export_formatted(f"dokumen_{_dt.now().strftime('%H%M%S')}", src_txt, fmt)
+                    fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
+                    await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 Siap kumpul: {fpath.name}")
             elif data.startswith("dl_file:"):
                 fname = data.split(":", 1)[1]
                 await self._answer_cb(cb_id, f"Mengirim {fname}...")
@@ -518,10 +575,11 @@ class TelegramBotBridge:
                     reply_markup=kb_confirm,
                 )
             elif data.startswith("confirm_rm:"):
-                fname = data.split(":", 1)[1]
-                self.orchestrator.file_manager.delete_file(fname)
-                await self._answer_cb(cb_id, f"🗑️ {fname} dihapus!")
-                await self.send_text(chat_id, f"🗑️ File '{fname}' berhasil dihapus dari Workspace.", reply_markup=MAIN_MENU_KB)
+                async with self._get_chat_lock(chat_id):
+                    fname = data.split(":", 1)[1]
+                    self.orchestrator.file_manager.delete_file(fname)
+                    await self._answer_cb(cb_id, f"🗑️ {fname} dihapus!")
+                    await self.send_text(chat_id, f"🗑️ File '{fname}' berhasil dihapus dari Workspace.", reply_markup=MAIN_MENU_KB)
             elif data == "cancel_rm":
                 await self._answer_cb(cb_id, "Penghapusan dibatalkan.")
                 await self.send_text(chat_id, "✅ Penghapusan file dibatalkan.", reply_markup=MAIN_MENU_KB)
@@ -560,6 +618,83 @@ class TelegramBotBridge:
 
         self.active_chat_ids.add(chat_id)
 
+        # JALUR CEPAT (FAST-PATH TANPA ANTRE LOCK) UNTUK KONTROL DARURAT:
+        # Stop, Cek Layar, Balasan Kredensial Takeover, & Tanya Kabar saat RUNNING tidak boleh terblokir request lain!
+        if not ("photo" in msg or "document" in msg or "voice" in msg or "audio" in msg):
+            fast_text = (msg.get("text") or "").strip()
+            fast_low = fast_text.lower().strip()
+            fast_mid = msg.get("message_id")
+            if fast_text:
+                if fast_text == "⏹️ Stop / Menu" or fast_low in ("/stop", "stop", "berhenti", "batal"):
+                    await self._retire_active_cards("⏹️ STATUS: TERHENTI (Dihentikan pengguna)")
+                    await self.orchestrator.stop_goal(silent=True)
+                    self.chat_modes[chat_id] = "auto"
+                    await self._send_main_menu(chat_id, "⏹️ Proses yang lagi jalan udah dihentikan.\n\n")
+                    return
+
+                if fast_text == "📸 Cek Layar" or fast_low in ("/layar", "/ss", "layar", "ss", "cek layar"):
+                    await self._send_screen_snapshot(chat_id)
+                    return
+
+                if fast_low in ("/lanjut", "udah login", "sudah login") or (
+                    fast_low == "lanjut" and self.orchestrator.state == "WAITING_HUMAN_TAKEOVER"
+                ):
+                    await self.orchestrator.resume_from_takeover()
+                    self.start_progress_heartbeat()
+                    await self.send_text(chat_id, "✅ Oke sip, gua lanjutin kerjanya!", reply_markup=MAIN_MENU_KB)
+                    return
+
+                menu_or_cmd_fast = fast_text in (
+                    "💬 Ngobrol AI", "📝 Kerjain Tugas Web", "🌐 Buka Web", "📸 Cek Layar",
+                    "📂 Daftar File", "🔒 Keamanan", "⏹️ Stop / Menu",
+                ) or fast_low.startswith("/") or fast_low in ("stop", "batal", "menu", "kunci")
+
+                if self.orchestrator.state == "WAITING_HUMAN_TAKEOVER" and not menu_or_cmd_fast:
+                    if fast_mid:
+                        asyncio.create_task(self._delete_msg(chat_id, fast_mid))
+                    login_res = await self.orchestrator.browser.smart_login_from_chat(
+                        fast_text,
+                        captcha_solver=self.orchestrator.brain.solve_captcha_image,
+                    )
+                    await self.send_text(
+                        chat_id,
+                        f"🔐 {login_res}\n🧹 Pesan sandi barusan otomatis gua hapus dari chat biar aman. Lanjut kerjain tugas!",
+                        reply_markup=MAIN_MENU_KB,
+                    )
+                    await self.orchestrator.resume_from_takeover()
+                    self.start_progress_heartbeat()
+                    return
+
+                if self.orchestrator.state == "RUNNING" and not menu_or_cmd_fast:
+                    check_phrases = (
+                        "?", "udah", "belum", "gimana", "kok lama", "lama", "jalan gak", "lagi ngerjain",
+                        "masih", "halo", "bro", "tes", "cek", "nyangkut", "aman",
+                    )
+                    if len(fast_text) <= 32 and any(cp in fast_low for cp in check_phrases):
+                        import time as _t
+                        el_s = max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1
+                        await self.send_text(
+                            chat_id,
+                            f"🟢 Mesin masih jalan aktif bro (⏱️ {el_s} detik berjalan)!\n"
+                            f"📍 Lagi di: {self.orchestrator.live_status}\n\n"
+                            "Tenang aja, tugas lu nggak gua batalin. Tap 📸 Cek Layar kalau mau ngintip posisinya, atau ketik `stop` kalau beneran mau batalin!",
+                            reply_markup=MAIN_MENU_KB,
+                        )
+                        return
+
+        # SERIALISASI PER-CHAT UNTUK PESAN REGULER, UPLOAD MEDIA, & PERINTAH TUGAS AGAR TIDAK SALING TABRAK!
+        async with self._get_chat_lock(chat_id):
+            await self._handle_locked_message(chat_id, sender_id, from_user, msg)
+
+    async def _handle_locked_message(
+        self,
+        chat_id: int,
+        sender_id: int,
+        from_user: Dict[str, Any],
+        msg: Dict[str, Any],
+    ) -> None:
+        assert self.orchestrator is not None
+
         # UPGRADE #2 + VOICE NOTE: HANDLE FOTO / GAMBAR / PDF / WORD / EXCEL / SUARA DARI TELEGRAM
         if "photo" in msg or "document" in msg or "voice" in msg or "audio" in msg:
             await self._handle_media_upload(chat_id, msg)
@@ -571,46 +706,6 @@ class TelegramBotBridge:
 
         low = text.lower().strip()
         msg_id = msg.get("message_id")
-
-        # LOGIN SUPER SIMPEL LANGSUNG LEWAT BALASAN CHAT TELEGRAM (Tanpa perlu buka layar web!)
-        menu_or_cmd = text in (
-            "💬 Ngobrol AI", "📝 Kerjain Tugas Web", "🌐 Buka Web", "📸 Cek Layar",
-            "📂 Daftar File", "🔒 Keamanan", "⏹️ Stop / Menu",
-        ) or low.startswith("/") or low in ("stop", "batal", "menu", "kunci")
-        if self.orchestrator.state == "WAITING_HUMAN_TAKEOVER" and not menu_or_cmd:
-            # Langsung hapus pesan berisi password dari riwayat chat Telegram dalam <0.5 detik agar 100% aman & bersih!
-            if msg_id:
-                asyncio.create_task(self._delete_msg(chat_id, msg_id))
-            login_res = await self.orchestrator.browser.smart_login_from_chat(
-                text,
-                captcha_solver=self.orchestrator.brain.solve_captcha_image,
-            )
-            await self.send_text(
-                chat_id,
-                f"🔐 {login_res}\n🧹 Pesan sandi barusan otomatis gua hapus dari chat biar aman. Lanjut kerjain tugas!",
-                reply_markup=MAIN_MENU_KB,
-            )
-            await self.orchestrator.resume_from_takeover()
-            self.start_progress_heartbeat()
-            return
-
-        # PELINDUNG SAAT BOT SEDANG KERJA AKTIF: Jangan batalkan tugas kalau user cuma nanya kabar ("?", "udah belum", dll)!
-        if self.orchestrator.state == "RUNNING" and not menu_or_cmd:
-            check_phrases = (
-                "?", "udah", "belum", "gimana", "kok lama", "lama", "jalan gak", "lagi ngerjain",
-                "masih", "halo", "bro", "tes", "cek", "nyangkut", "aman",
-            )
-            if len(text) <= 32 and any(cp in low for cp in check_phrases):
-                import time as _t
-                el_s = max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1
-                await self.send_text(
-                    chat_id,
-                    f"🟢 Mesin masih jalan aktif bro (⏱️ {el_s} detik berjalan)!\n"
-                    f"📍 Lagi di: {self.orchestrator.live_status}\n\n"
-                    "Tenang aja, tugas lu nggak gua batalin. Tap 📸 Cek Layar kalau mau ngintip posisinya, atau ketik `stop` kalau beneran mau batalin!",
-                    reply_markup=MAIN_MENU_KB,
-                )
-                return
 
         # PENGATURAN AI & PROXY INDONESIA LANGSUNG DARI TELEGRAM (/setting, /apikey, /proxy)
         if low in ("/setting", "/settings", "setting"):
@@ -865,6 +960,40 @@ class TelegramBotBridge:
             )
             return
 
+        # ==================== PENANGANAN JUJUR PERINTAH "LANJUT" ====================
+        resume_phrases = ("lanjut", "lanjut bro", "lanjutin", "terusin", "lanjutkan", "teruskan", "gas lanjut")
+        if low in resume_phrases:
+            res_ctx = self.orchestrator.task_store.get_resumable_context()
+            if not res_ctx:
+                latest_t = self.orchestrator.task_store.get_latest_task()
+                if latest_t and latest_t.get("status") == "BERHASIL":
+                    await self.send_text(
+                        chat_id,
+                        "✅ Tugas sebelumnya udah selesai tuntas bro! Langsung ketik aja perintah baru yang mau dikerjain.",
+                        reply_markup=MAIN_MENU_KB,
+                    )
+                else:
+                    await self.send_text(
+                        chat_id,
+                        "📋 Belum ada tugas terjeda yang bisa dilanjutin saat ini bro. Langsung ketik aja perintah baru yang mau dikerjain!",
+                        reply_markup=MAIN_MENU_KB,
+                    )
+                return
+            import time as _t
+            self._run_started_at = _t.monotonic()
+            self._last_step_num = 1
+            res_title = str(res_ctx.get("initial_instruction") or "tugas terakhir")[:110]
+            self._last_thought = "Melanjutkan dari checkpoint terverifikasi terakhir..."
+            init_card = (
+                "🟢 MELANJUTKAN TUGAS TERJEDA · ⏱️ 0 dtk\n"
+                f"🎯 Tugas: {res_title}\n"
+                "📍 Aktivitas: Melanjutkan dari checkpoint terverifikasi terakhir..."
+            )
+            await self._begin_new_agent_card(chat_id, init_card, reply_markup=self._running_inline_kb())
+            await self.orchestrator.start_goal("lanjut")
+            self.start_progress_heartbeat()
+            return
+
         # ==================== AUTO-ROUTER PINTAR (TANPA PENCET MODE DULU!) ====================
         mode, routed_text = await self._detect_auto_route(chat_id, text, low)
         text = routed_text
@@ -880,9 +1009,31 @@ class TelegramBotBridge:
             target_url = await self.orchestrator.brain.resolve_website_url(text)
             asyncio.create_task(self._send_chat_action(chat_id, "upload_photo"))
             nav_msg = await self.orchestrator.browser.navigate(target_url)
-            b64 = await self.orchestrator.browser.refresh_frame()
             self.chat_modes[chat_id] = "auto"
             el_open = max(1, int(_t.monotonic() - t_open))
+            nav_failed = (
+                nav_msg.startswith("[UNREACHABLE_SITE]")
+                or nav_msg.startswith("❌")
+                or "menolak koneksi" in nav_msg.lower()
+                or "tidak merespons" in nav_msg.lower()
+            )
+            if nav_failed:
+                clean_nav = nav_msg.replace("[UNREACHABLE_SITE]", "").strip()
+                if wait_mid:
+                    await self._edit_text(
+                        chat_id,
+                        wait_mid,
+                        f"❌ GAGAL MEMBUKA WEB ({el_open} dtk)\n🌐 {clean_nav}",
+                    )
+                else:
+                    await self.send_text(
+                        chat_id,
+                        f"❌ GAGAL MEMBUKA WEB ({el_open} dtk)\n🌐 {clean_nav}",
+                        reply_markup=MAIN_MENU_KB,
+                    )
+                return
+
+            b64 = await self.orchestrator.browser.refresh_frame()
             if wait_mid:
                 await self._edit_text(
                     chat_id,
@@ -926,7 +1077,7 @@ class TelegramBotBridge:
                 )
                 and not any(
                     new_w in low
-                    for new_w in ("bikinin surat", "buatkan surat", "buatkan makalah", "tulis artikel", "jelaskan ", "apa bedanya ")
+                    for new_w in ("bikinin ", "buatkan ", "bikin ", "buat ", "tulis ", "tuliskan ", "jelaskan ", "apa bedanya ")
                 )
             )
             if is_followup_convert:
@@ -938,24 +1089,31 @@ class TelegramBotBridge:
                 ]
                 src_content = ""
                 stem_name = ""
-                # Cek apakah user menyebut nama file spesifik, atau ambil file terbaru di workspace
+                # 1) Hanya ambil file di workspace bila namanya disebut eksplisit oleh user
                 for uf in user_files:
                     st = Path(uf["name"]).stem.lower()
-                    if st and st in low:
+                    if len(st) >= 3 and st in low:
                         stem_name = Path(uf["name"]).stem
+                        if Path(uf["name"]).suffix.lower().lstrip(".") == req_fmt:
+                            fpath = fm.get_file_path(uf["name"])
+                            await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 Ini file {fpath.name} lu bro!")
+                            return
                         src_content = fm.read_file(uf["name"])
                         break
-                if not src_content and user_files:
-                    latest_f = user_files[0]["name"]
-                    stem_name = Path(latest_f).stem
-                    if Path(latest_f).suffix.lower().lstrip(".") == req_fmt:
-                        fpath = fm.get_file_path(latest_f)
-                        await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 Ini file {fpath.name} lu bro!")
-                        return
-                    src_content = fm.read_file(latest_f)
+                # 2) Utamakan output teks valid terakhir di sesi chat ini
                 if not src_content:
                     src_content = self.last_output_text.get(chat_id) or ""
-                if not src_content and self.orchestrator.user_memories:
+                # 3) Atau file yang baru saja dibuat pada run terakhir sesi ini (bukan file lama acak!)
+                if not src_content and self.orchestrator._created_files_this_run:
+                    recent_f = self.orchestrator._created_files_this_run[-1]
+                    stem_name = Path(recent_f).stem
+                    if Path(recent_f).suffix.lower().lstrip(".") == req_fmt:
+                        fpath = fm.get_file_path(recent_f)
+                        await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 Ini file {fpath.name} lu bro!")
+                        return
+                    src_content = fm.read_file(recent_f)
+                # 4) Hanya gunakan memori profil jika user eksplisit menyebut profil/data diri
+                if not src_content and self.orchestrator.user_memories and any(pk in low for pk in ("profil", "data gua", "biodata")):
                     src_content = "\n".join(self.orchestrator.user_memories)
                     stem_name = "data_profil"
 
@@ -971,6 +1129,14 @@ class TelegramBotBridge:
                         f"📄 Beres dikonversi jadi .{req_fmt.upper()} asli: {fpath.name}",
                     )
                     return
+
+                await self.send_text(
+                    chat_id,
+                    f"📄 Belum ada teks atau hasil kerjaan terbaru di sesi ini buat dijadiin .{req_fmt.upper()} bro. "
+                    "Minta bikinin isinya dulu atau sebut nama file yang mau dikonversi ya!",
+                    reply_markup=MAIN_MENU_KB,
+                )
+                return
 
             # KASUS B: Ngobrol biasa ATAU minta dibuatkan dokumen baru (Word / Excel / PDF)
             asyncio.create_task(self._send_chat_action(chat_id, "upload_document" if req_fmt else "typing"))
@@ -988,6 +1154,13 @@ class TelegramBotBridge:
             # Sapu bersih kalau-kalau AI masih menulis link halusinasi sandbox:/mnt/data/...
             reply = re.sub(r"\[[^\]]*\]\(sandbox:[^\)]+\)", "", reply).strip()
             await self.orchestrator._push_chat("agent", reply)
+            chat_ok = bool(getattr(self.orchestrator.brain, "last_chat_ok", True))
+
+            if not chat_ok:
+                # JANGAN ekspor pesan error AI menjadi file PDF/Word/Excel & JANGAN timpa last_output_text!
+                await self.send_text(chat_id, reply, reply_markup=MAIN_MENU_KB)
+                return
+
             self.last_output_text[chat_id] = reply
 
             if req_fmt and not any(q in low for q in ("apa itu pdf", "apa itu excel", "apa itu word")):
@@ -1024,10 +1197,7 @@ class TelegramBotBridge:
             f"🎯 Tugas: {text[:130]}\n"
             "📍 Aktivitas: Memahami perintah & menyiapkan browser..."
         )
-        mid = await self.send_text(chat_id, init_card, reply_markup=self._running_inline_kb())
-        if mid:
-            self._status_msg_ids[chat_id] = mid
-            self._last_rendered_card[chat_id] = init_card
+        await self._begin_new_agent_card(chat_id, init_card, reply_markup=self._running_inline_kb())
         await self.orchestrator.start_goal(text)
         self.start_progress_heartbeat()
 
@@ -1036,12 +1206,11 @@ class TelegramBotBridge:
         Router otomatis pintar 2-lapis (0ms aturan pasti + <0.4s AI untuk kalimat abu-abu)
         supaya user CUKUP KETIK BEBAS tanpa perlu menekan tombol mode apa pun terlebih dahulu!
         """
-        # 1. Perintah "lanjut" / "terusin" dari pekerjaan browser sebelumnya
-        if low in ("lanjut", "lanjut bro", "lanjutin", "terusin", "lanjutkan", "gas lanjut") and self.orchestrator.current_goal:
-            return (
-                "agent",
-                f"Lanjutkan tugas ini sampai tuntas dari posisi halaman browser yang sedang terbuka sekarang: {self.orchestrator.current_goal}",
-            )
+        # 1. Perintah "lanjut" / "terusin" hanya meresume bila benar-benar ada checkpoint terjeda di TaskStateStore
+        if low in ("lanjut", "lanjut bro", "lanjutin", "terusin", "lanjutkan", "teruskan", "gas lanjut"):
+            if self.orchestrator and self.orchestrator.task_store.get_resumable_context():
+                return ("agent", "lanjut")
+            return ("chat", text)
 
         has_url = bool(
             re.search(
@@ -1256,14 +1425,22 @@ class TelegramBotBridge:
                 extracted_text=extracted_text,
             )
 
-            # Simpan ke ingatan permanen supaya bisa langsung dipakai di chat maupun di browser!
+            media_ok = bool(getattr(self.orchestrator.brain, "last_chat_ok", True))
+            await self.orchestrator._push_chat("user", f"[Kirim {saved_name}] {caption}".strip())
+            await self.orchestrator._push_chat("agent", analysis)
+
+            if not media_ok:
+                if wait_mid:
+                    await self._edit_text(chat_id, wait_mid, f"⚠️ File '{saved_name}' tersimpan di Workspace, namun analisis AI terkendala sementara.")
+                await self.send_text(chat_id, analysis, reply_markup=MAIN_MENU_KB)
+                return
+
+            # Simpan ke ingatan permanen HANYA jika analisis AI berhasil valid!
             combined_note = f"File: {saved_name}\nHasil Baca:\n{analysis}"
             if extracted_text:
                 combined_note += f"\n\nTeks Asli:\n{extracted_text[:4000]}"
             self.orchestrator.persistent_notes["hasil_baca_terakhir"] = combined_note
             self.last_output_text[chat_id] = analysis
-            await self.orchestrator._push_chat("user", f"[Kirim {saved_name}] {caption}".strip())
-            await self.orchestrator._push_chat("agent", analysis)
 
             if wait_mid:
                 await self._edit_text(chat_id, wait_mid, f"✅ File '{saved_name}' berhasil dibaca & disimpan ke Workspace!")
@@ -1274,12 +1451,19 @@ class TelegramBotBridge:
                 for kw in ("isiin ke web", "isi ke web", "masukin ke web", "isi form", "buka ", "kerjain di web")
             )
             if wants_web_exec:
-                mid = await self.send_text(chat_id, f"⏳ Lanjut ngerjain ke browser pakai data dari '{saved_name}'...")
-                if mid:
-                    self._status_msg_ids[chat_id] = mid
+                import time as _t
+                self._run_started_at = _t.monotonic()
+                self._last_step_num = 1
+                self._last_thought = f"Menjalankan instruksi web dari data '{saved_name}'..."
+                await self._begin_new_agent_card(
+                    chat_id,
+                    f"⏳ Lanjut ngerjain ke browser pakai data dari '{saved_name}'...",
+                    reply_markup=self._running_inline_kb(),
+                )
                 await self.orchestrator.start_goal(
                     f"{caption} (Gunakan data hasil baca dari file '{saved_name}' yang sudah ada di catatan memori)."
                 )
+                self.start_progress_heartbeat()
                 return
 
             kb = {
@@ -1397,20 +1581,21 @@ class TelegramBotBridge:
 
     async def _heartbeat_loop(self) -> None:
         tick = 0
+        bound_seq = self._active_run_seq
         try:
-            while self.orchestrator and self.orchestrator.state == "RUNNING":
+            while self.orchestrator and self.orchestrator.state == "RUNNING" and self._active_run_seq == bound_seq and bound_seq > 0:
                 targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
                 for cid in targets:
                     asyncio.create_task(self._send_chat_action(cid, "typing"))
                 await asyncio.sleep(4.2)
-                if not self.orchestrator or self.orchestrator.state != "RUNNING":
+                if not self.orchestrator or self.orchestrator.state != "RUNNING" or self._active_run_seq != bound_seq:
                     break
                 tick += 1
                 card_txt = self._build_progress_card_text(tick_idx=tick)
                 kb = self._running_inline_kb()
                 for cid in targets:
                     mid = self._status_msg_ids.get(cid)
-                    if mid and self._last_rendered_card.get(cid) != card_txt:
+                    if mid and self._status_card_seq.get(cid) == bound_seq and self._last_rendered_card.get(cid) != card_txt:
                         self._last_rendered_card[cid] = card_txt
                         await self._edit_text(cid, mid, card_txt, reply_markup=kb)
         except asyncio.CancelledError:
@@ -1418,16 +1603,24 @@ class TelegramBotBridge:
         except Exception:
             pass
 
-    async def _finalize_progress_cards(self, header_label: str) -> None:
-        if not self.is_configured or not self.active_chat_ids:
+    async def _finalize_progress_cards(self, header_label: str, clear_after: bool = False) -> None:
+        if not self.is_configured or not self.active_chat_ids or self._active_run_seq <= 0:
             return
+        expected_seq = self._active_run_seq
         card_txt = self._build_progress_card_text(header_override=header_label)
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
-        for cid in targets:
+        for cid in list(targets):
             mid = self._status_msg_ids.get(cid)
-            if mid and self._last_rendered_card.get(cid) != card_txt:
-                self._last_rendered_card[cid] = card_txt
-                await self._edit_text(cid, mid, card_txt, reply_markup={"inline_keyboard": []})
+            if mid and self._status_card_seq.get(cid) == expected_seq:
+                if self._last_rendered_card.get(cid) != card_txt:
+                    self._last_rendered_card[cid] = card_txt
+                    await self._edit_text(cid, mid, card_txt, reply_markup={"inline_keyboard": []})
+                if clear_after:
+                    self._status_msg_ids.pop(cid, None)
+                    self._status_card_seq.pop(cid, None)
+                    self._last_rendered_card.pop(cid, None)
+        if clear_after and self._active_run_seq == expected_seq:
+            self._active_run_seq = 0
 
     async def _edit_text(
         self,
@@ -1484,8 +1677,9 @@ class TelegramBotBridge:
         return None
 
     async def notify_step(self, step_num: int, thought: str, plan: Optional[List[Dict[str, Any]]] = None) -> None:
-        if not self.is_configured or not self.active_chat_ids:
+        if not self.is_configured or not self.active_chat_ids or self._active_run_seq <= 0:
             return
+        expected_seq = self._active_run_seq
         self._last_step_num = step_num
         self._last_thought = (thought or "").strip()
         card_txt = self._build_progress_card_text(tick_idx=step_num)
@@ -1494,7 +1688,7 @@ class TelegramBotBridge:
         for cid in targets:
             asyncio.create_task(self._send_chat_action(cid, "typing"))
             mid = self._status_msg_ids.get(cid)
-            if mid and self._last_rendered_card.get(cid) != card_txt:
+            if mid and self._status_card_seq.get(cid) == expected_seq and self._last_rendered_card.get(cid) != card_txt:
                 self._last_rendered_card[cid] = card_txt
                 await self._edit_text(cid, mid, card_txt, reply_markup=kb)
 
@@ -1617,7 +1811,10 @@ class TelegramBotBridge:
             "MENUNGGU PERSETUJUAN": f"🛡️ STATUS: MENUNGGU PERSETUJUAN ({el_s} dtk{step_lbl})",
             "TERHENTI": f"⏹️ STATUS: TERHENTI ({el_s} dtk{step_lbl})",
         }
-        await self._finalize_progress_cards(header_map.get(norm_st, f"📋 SELESAI ({el_s} dtk{step_lbl})"))
+        await self._finalize_progress_cards(
+            header_map.get(norm_st, f"📋 SELESAI ({el_s} dtk{step_lbl})"),
+            clear_after=True,
+        )
         export_kb = {
             "inline_keyboard": [
                 [
@@ -1631,7 +1828,8 @@ class TelegramBotBridge:
         out_msg = clean if (is_non_success or clean.startswith("✅")) else f"✅ Beres!\n\n{clean}"
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
         for cid in targets:
-            self.last_output_text[cid] = clean
+            if not is_non_success:
+                self.last_output_text[cid] = clean
             if proof_frame_b64:
                 cap_lbl = (
                     "📸 Bukti layar hasil eksekusi akhir:"

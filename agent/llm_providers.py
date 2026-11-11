@@ -2,11 +2,12 @@ import asyncio
 import html as _html
 import json
 import os
+import random
 import re
 import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -16,6 +17,93 @@ from agent.security import redact_secrets
 # Pool koneksi HTTP/1.1 Keep-Alive permanen (IPv4 murni) — memangkas waktu jabat-tangan TLS 400–900ms di setiap pesan!
 _SHARED_HTTP_POOL: Optional[httpx.AsyncClient] = None
 _LIVE_CACHE: Dict[str, Tuple[float, str]] = {}
+
+
+class LLMCallError(RuntimeError):
+    """Representasi terstruktur kegagalan koneksi/kuota/autentikasi AI setelah evaluasi retry."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "unknown",
+        status_code: int = 0,
+        retry_after: float = 0.0,
+        model_name: str = "",
+        exhausted_retry: bool = True,
+    ) -> None:
+        super().__init__(redact_secrets(message))
+        self.kind = kind
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.model_name = model_name
+        self.exhausted_retry = exhausted_retry
+
+
+def parse_retry_after_seconds(resp: httpx.Response, max_cap: float = 8.0) -> float:
+    hdr = (resp.headers.get("retry-after") or resp.headers.get("Retry-After") or "").strip()
+    if hdr:
+        try:
+            val = float(hdr)
+            if val > 0:
+                return min(max_cap, max(0.4, val))
+        except ValueError:
+            pass
+    try:
+        raw_txt = resp.text[:1500]
+        m = re.search(r'"retryDelay"\s*:\s*"([0-9]+(?:\.[0-9]+)?)s"', raw_txt)
+        if not m:
+            m = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", raw_txt, re.I)
+        if m:
+            return min(max_cap, max(0.4, float(m.group(1))))
+    except Exception:
+        pass
+    return 0.0
+
+
+def compute_backoff_delay(
+    attempt: int,
+    retry_after: float = 0.0,
+    base: float = 0.75,
+    cap: float = 6.0,
+) -> float:
+    exp = min(cap, base * (2 ** max(0, attempt)))
+    jitter = random.uniform(0.05, 0.30)
+    if retry_after > 0:
+        return min(cap, max(retry_after, exp * 0.6) + random.uniform(0.02, 0.20))
+    return min(cap, exp + jitter)
+
+
+def classify_http_failure(resp: httpx.Response) -> Tuple[str, str]:
+    code = resp.status_code
+    body_snip = ""
+    try:
+        body_snip = redact_secrets((resp.text or "").strip()[:260])
+    except Exception:
+        body_snip = ""
+    low_b = body_snip.lower()
+    if code == 429 or (code == 403 and any(k in low_b for k in ("quota", "rate limit", "rate_limit", "resource_exhausted"))):
+        return "rate_limit", f"Batas kuota/rate-limit AI tercapai (HTTP {code})."
+    if code in (401, 403):
+        return "auth_error", f"Autentikasi/izin API Key AI ditolak (HTTP {code})."
+    if code == 404:
+        return "model_not_found", f"Model AI tidak ditemukan/deprecated (HTTP 404)."
+    if code == 400:
+        return "bad_request", f"Parameter request AI ditolak (HTTP 400): {body_snip[:140]}"
+    if code in (408, 500, 502, 503, 504, 529):
+        return "server_overloaded", f"Server AI sedang sibuk/gangguan sementara (HTTP {code})."
+    return "http_error", f"HTTP {code}: {body_snip[:140]}"
+
+
+def reset_shared_http() -> None:
+    global _SHARED_HTTP_POOL
+    old = _SHARED_HTTP_POOL
+    _SHARED_HTTP_POOL = None
+    if old is not None and not old.is_closed:
+        try:
+            asyncio.create_task(old.aclose())
+        except Exception:
+            pass
 
 _COMMON_TICKER_MAP = {
     "btc": "BTC-USD",
@@ -250,9 +338,8 @@ class LLMConfig:
     def __init__(self) -> None:
         self.provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()
         raw_env_model = os.getenv("LLM_MODEL", "").strip()
-        # Otomatis naikkan dari flash-lite lama ke otak penalaran penuh gemini-3.5-flash!
         if not raw_env_model or "flash-lite" in raw_env_model:
-            self.model: str = "gemini-3.5-flash"
+            self.model: str = "gemini-2.5-flash"
         else:
             self.model = raw_env_model
         self.api_key: str = (
@@ -285,10 +372,10 @@ class LLMConfig:
     @staticmethod
     def _default_model(provider: str) -> str:
         defaults = {
-            "gemini": "gemini-3.5-flash",
+            "gemini": "gemini-2.5-flash",
             "openai": "gpt-4o",
             "anthropic": "claude-sonnet-4-20250514",
-            "openrouter": "google/gemini-3.5-flash",
+            "openrouter": "google/gemini-2.5-flash",
         }
         return defaults.get(provider, "gpt-4o")
 
@@ -317,6 +404,145 @@ class MultiLLMBrain:
         self.config = config
         self.autopilot = SmartAutopilotPlanner()
         self._rr_idx: int = 0
+        self.last_chat_ok: bool = True
+        self.last_error_kind: str = ""
+        self.last_error_detail: str = ""
+        self._unavailable_models: Dict[str, float] = {}
+        self._llm_semaphore = asyncio.Semaphore(2)
+        self._sleep_fn: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep
+
+    def _is_model_temporarily_unavailable(self, model_name: str) -> bool:
+        exp = self._unavailable_models.get(model_name)
+        if not exp:
+            return False
+        if _time.monotonic() >= exp:
+            self._unavailable_models.pop(model_name, None)
+            return False
+        return True
+
+    def _mark_model_unavailable(self, model_name: str, ttl_sec: float = 600.0) -> None:
+        self._unavailable_models[model_name] = _time.monotonic() + ttl_sec
+
+    def _gemini_candidate_models(self, *, light_first: bool = False) -> List[str]:
+        if light_first:
+            base_list = [
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-flash-lite",
+                "gemini-2.5-flash",
+            ]
+        else:
+            smart_pool = ["gemini-3.6-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
+            rot = self._rr_idx % len(smart_pool)
+            self._rr_idx += 1
+            base_list = (
+                smart_pool[rot:]
+                + smart_pool[:rot]
+                + ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
+            )
+            cfg_m = (self.config.model or "").strip()
+            if cfg_m and "flash-lite" not in cfg_m and cfg_m not in base_list:
+                base_list.insert(0, cfg_m)
+
+        avail = [m for m in base_list if not self._is_model_temporarily_unavailable(m)]
+        return avail or base_list
+
+    @staticmethod
+    def _extract_gemini_text(data: Dict[str, Any]) -> str:
+        cands = data.get("candidates") or []
+        if not cands:
+            return ""
+        content = cands[0].get("content") or {}
+        parts_out = content.get("parts") or []
+        return "".join(str(p.get("text", "")) for p in parts_out if isinstance(p, dict) and not p.get("thought")).strip()
+
+    @staticmethod
+    def _friendly_chat_error_message(kind: str) -> str:
+        if kind == "auth_error":
+            return "❌ API Key AI tidak valid atau belum aktif bro. Cek lagi lewat perintah `/apikey` atau menu pengaturan ya!"
+        if kind == "rate_limit":
+            return "⏳ Kuota request AI per menit lagi penuh sesaat (HTTP 429). Tunggu sekitar 5–10 detik lalu kirim ulang ya bro!"
+        if kind == "timeout":
+            return "⏱️ Respons server AI lewat batas waktu (timeout). Coba kirim ulang sebentar lagi ya bro!"
+        if kind == "network_error":
+            return "🌐 Koneksi jaringan ke server AI sempat terputus. Coba kirim ulang barusan ya bro!"
+        return "⚠️ Server AI sedang sibuk sementara (HTTP 503). Coba kirim ulang beberapa detik lagi ya bro!"
+
+    async def _post_gemini_single(
+        self,
+        model_name: str,
+        payload: Dict[str, Any],
+        timeout: float,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[LLMCallError]]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.config.api_key}"
+        client = get_shared_http()
+        try:
+            resp = await client.post(url, json=payload, timeout=timeout)
+        except httpx.TimeoutException:
+            return None, LLMCallError(
+                f"Timeout menunggu respons {model_name}",
+                kind="timeout",
+                model_name=model_name,
+            )
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as net_exc:
+            reset_shared_http()
+            return None, LLMCallError(
+                f"Koneksi socket AI terputus ({type(net_exc).__name__}) pada {model_name}",
+                kind="network_error",
+                model_name=model_name,
+            )
+        except httpx.TransportError as tr_exc:
+            return None, LLMCallError(
+                f"Gangguan jaringan AI ({type(tr_exc).__name__}) pada {model_name}",
+                kind="network_error",
+                model_name=model_name,
+            )
+        except Exception as exc:
+            return None, LLMCallError(
+                f"Koneksi AI gagal ({type(exc).__name__}) pada {model_name}",
+                kind="network_error",
+                model_name=model_name,
+            )
+
+        if resp.status_code == 200:
+            try:
+                return resp.json(), None
+            except Exception as j_exc:
+                return None, LLMCallError(
+                    f"Respons JSON HTTP 200 tidak valid dari {model_name} ({type(j_exc).__name__})",
+                    kind="invalid_output",
+                    status_code=200,
+                    model_name=model_name,
+                )
+
+        kind, msg = classify_http_failure(resp)
+        # Jika model menolak parameter thinkingConfig (HTTP 400), ulang 1x langsung tanpa thinkingConfig!
+        gen_cfg = payload.get("generationConfig") or {}
+        if resp.status_code == 400 and "thinkingConfig" in gen_cfg:
+            clean_payload = dict(payload)
+            clean_gen = dict(gen_cfg)
+            clean_gen.pop("thinkingConfig", None)
+            clean_payload["generationConfig"] = clean_gen
+            try:
+                resp2 = await get_shared_http().post(url, json=clean_payload, timeout=timeout)
+                if resp2.status_code == 200:
+                    return resp2.json(), None
+                kind, msg = classify_http_failure(resp2)
+                resp = resp2
+            except Exception:
+                pass
+
+        if kind == "model_not_found":
+            self._mark_model_unavailable(model_name)
+
+        retry_after = parse_retry_after_seconds(resp) if kind in ("rate_limit", "server_overloaded") else 0.0
+        return None, LLMCallError(
+            f"{msg} [{model_name}]",
+            kind=kind,
+            status_code=resp.status_code,
+            retry_after=retry_after,
+            model_name=model_name,
+        )
 
     async def quick_chat(
         self,
@@ -324,8 +550,11 @@ class MultiLLMBrain:
         recent_chat: Optional[List[Dict[str, Any]]] = None,
         user_memory_block: str = "",
     ) -> str:
-        """Mode Ngobrol AI cepat (<1 detik) tanpa beban browser."""
+        """Mode Ngobrol AI cepat dengan Sequential Fallback + Exponential Backoff (tanpa duplikasi request)."""
         if not self.config.has_api_key:
+            self.last_chat_ok = False
+            self.last_error_kind = "no_api_key"
+            self.last_error_detail = "API Key belum terpasang."
             return (
                 "Halo bro! Gua siap ngobrol, tapi pastiin API Key Gemini udah dipasang ya biar gua bisa mikir & jawab pertanyaan lu bebas."
             )
@@ -349,81 +578,133 @@ class MultiLLMBrain:
             "DILARANG KERAS menulis kalimat janji palsu seperti 'Lagi gua proses buka...', 'Tunggu bentar ya lagi loading...', '[Laporan Hasil...]', ATAU mengarang link download palsu seperti 'sandbox:/mnt/data/...'. "
             "2. Jika user meminta dibuatkan isi dokumen/surat/tabel, tulis langsung isi naskah/tabelnya dengan rapi tanpa membuat link download palsu (sistem otomatis yang akan melampirkan file aslinya ke Telegram). "
             "3. Jika user baru bertanya apakah bisa buka web / login / kerjain sesuatu tanpa menyebut web/tugasnya, jawab santai: 'Bisa banget bro! Langsung ketik aja mau buka web apa dan mau diapain, langsung gua sikat otomatis!' "
-            "3. Jika tersedia 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka tersebut secara akurat. "
+            "4. Jika tersedia 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka tersebut secara akurat. "
             "Jangan pakai simbol bintang (** atau *) berlebihan agar rapi di Telegram HP."
         )
         prompt = f"{mem_part}{hist_block}{live_ctx}USER: {message}"
 
-        if self.config.provider == "gemini":
-            smart_chat_pool = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.6-flash"]
-            rot = self._rr_idx % len(smart_chat_pool)
-            self._rr_idx += 1
-            fast_order = smart_chat_pool[rot:] + smart_chat_pool[:rot] + ["gemini-3.1-flash-lite-preview"]
-            if self.config.model and "flash-lite" not in self.config.model and self.config.model not in fast_order:
-                fast_order.insert(0, self.config.model)
-            client = get_shared_http()
+        async with self._llm_semaphore:
+            if self.config.provider == "gemini":
+                fast_order = self._gemini_candidate_models(light_first=False)
+                backoff_step = 0
+                last_err: Optional[LLMCallError] = None
 
-            async def _try_one(m_name: str) -> Optional[str]:
-                gen_cfg: Dict[str, Any] = {"temperature": 0.4, "maxOutputTokens": 900}
-                if "flash-lite" not in m_name:
-                    gen_cfg["thinkingConfig"] = {"thinkingBudget": 256}
-                payload = {
-                    "system_instruction": {"parts": [{"text": chat_sys}]},
-                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generationConfig": gen_cfg,
-                }
-                u = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}"
+                for m_name in fast_order:
+                    gen_cfg: Dict[str, Any] = {"temperature": 0.4, "maxOutputTokens": 1200}
+                    payload = {
+                        "system_instruction": {"parts": [{"text": chat_sys}]},
+                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "generationConfig": gen_cfg,
+                    }
+                    data, err = await self._post_gemini_single(m_name, payload, timeout=12.0)
+                    if data is not None:
+                        ans = self._extract_gemini_text(data)
+                        if ans:
+                            self.last_chat_ok = True
+                            self.last_error_kind = ""
+                            self.last_error_detail = ""
+                            return ans
+                        err = LLMCallError(
+                            f"Respons teks kosong dari {m_name}",
+                            kind="invalid_output",
+                            model_name=m_name,
+                        )
+
+                    last_err = err
+                    if err and err.kind == "auth_error":
+                        break
+                    if err and err.kind in ("model_not_found", "bad_request", "invalid_output"):
+                        continue
+                    if err and err.kind in ("rate_limit", "server_overloaded", "timeout", "network_error"):
+                        delay = compute_backoff_delay(backoff_step, retry_after=err.retry_after, base=0.65, cap=4.5)
+                        backoff_step += 1
+                        await self._sleep_fn(delay)
+
+                err_kind = last_err.kind if last_err else "server_overloaded"
+                self.last_chat_ok = False
+                self.last_error_kind = err_kind
+                self.last_error_detail = str(last_err) if last_err else "Seluruh kandidat model AI gagal merespons."
+                return self._friendly_chat_error_message(err_kind)
+
+            # Fallback OpenAI / OpenRouter / Anthropic pada quick_chat dengan retry & backoff
+            last_non_gemini_kind = "server_overloaded"
+            for attempt in range(3):
                 try:
-                    r = await client.post(u, json=payload, timeout=11.0)
-                    if r.status_code == 200:
-                        parts_out = r.json()["candidates"][0]["content"]["parts"]
-                        return "".join(p.get("text", "") for p in parts_out if not p.get("thought")).strip()
-                except Exception:
-                    pass
-                return None
+                    if self.config.provider == "anthropic":
+                        url = (self.config.base_url or "https://api.anthropic.com/v1").rstrip("/") + "/messages"
+                        resp = await get_shared_http().post(
+                            url,
+                            headers={
+                                "x-api-key": self.config.api_key,
+                                "anthropic-version": "2023-06-01",
+                                "content-type": "application/json",
+                            },
+                            json={
+                                "model": self.config.model or "claude-sonnet-4-20250514",
+                                "max_tokens": 1200,
+                                "system": chat_sys,
+                                "messages": [{"role": "user", "content": prompt}],
+                            },
+                            timeout=18.0,
+                        )
+                        if resp.status_code == 200:
+                            ans_a = "".join(
+                                b.get("text", "") for b in (resp.json().get("content") or []) if b.get("type") == "text"
+                            ).strip()
+                            if ans_a:
+                                self.last_chat_ok = True
+                                self.last_error_kind = ""
+                                self.last_error_detail = ""
+                                return ans_a
+                    else:
+                        base = self.config.base_url or (
+                            "https://openrouter.ai/api/v1" if self.config.provider == "openrouter" else "https://api.openai.com/v1"
+                        )
+                        resp = await get_shared_http().post(
+                            base.rstrip("/") + "/chat/completions",
+                            headers={"Authorization": f"Bearer {self.config.api_key}"},
+                            json={
+                                "model": self.config.model or "gpt-4o",
+                                "messages": [{"role": "system", "content": chat_sys}, {"role": "user", "content": prompt}],
+                            },
+                            timeout=18.0,
+                        )
+                        if resp.status_code == 200:
+                            choices = resp.json().get("choices") or []
+                            ans_o = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+                            if ans_o:
+                                self.last_chat_ok = True
+                                self.last_error_kind = ""
+                                self.last_error_detail = ""
+                                return ans_o
 
-            # Jalankan model tercepat (#1); jika lewat 3.0 detik belum balik (antrian server Google), langsung balapkan #2 paralel!
-            t_primary = asyncio.create_task(_try_one(fast_order[0]))
-            done, _ = await asyncio.wait({t_primary}, timeout=3.0)
-            if done:
-                ans = t_primary.result()
-                if ans:
-                    return ans
-
-            t_backup = asyncio.create_task(_try_one(fast_order[1]))
-            pending = {t for t in (t_primary, t_backup) if not t.done()}
-            while pending:
-                done_set, pending = await asyncio.wait(pending, timeout=9.0, return_when=asyncio.FIRST_COMPLETED)
-                if not done_set:
+                    kind, detail = classify_http_failure(resp)
+                    last_non_gemini_kind = kind
+                    self.last_error_detail = detail
+                    if kind in ("auth_error", "model_not_found", "bad_request"):
+                        break
+                    if attempt < 2:
+                        ra = parse_retry_after_seconds(resp)
+                        await self._sleep_fn(compute_backoff_delay(attempt, retry_after=ra, base=0.8, cap=5.0))
+                except httpx.TimeoutException:
+                    last_non_gemini_kind = "timeout"
+                    self.last_error_detail = "Timeout menghubungi provider AI."
+                    if attempt < 2:
+                        await self._sleep_fn(compute_backoff_delay(attempt, base=0.8, cap=5.0))
+                except httpx.TransportError as exc:
+                    reset_shared_http()
+                    last_non_gemini_kind = "network_error"
+                    self.last_error_detail = f"Gangguan jaringan AI ({type(exc).__name__})."
+                    if attempt < 2:
+                        await self._sleep_fn(compute_backoff_delay(attempt, base=0.8, cap=5.0))
+                except Exception as exc:
+                    last_non_gemini_kind = "server_overloaded"
+                    self.last_error_detail = f"Gangguan respons AI ({type(exc).__name__})."
                     break
-                for d_task in done_set:
-                    ans = d_task.result()
-                    if ans:
-                        for p in pending:
-                            p.cancel()
-                        return ans
 
-            for p in pending:
-                p.cancel()
-            ans3 = await _try_one(fast_order[2])
-            if ans3:
-                return ans3
-            return "Waduh koneksi AI lagi agak padat bro, coba kirim ulang barusan ya!"
-
-        # Fallback OpenAI/OpenRouter
-        base = self.config.base_url or ("https://openrouter.ai/api/v1" if self.config.provider == "openrouter" else "https://api.openai.com/v1")
-        async with httpx.AsyncClient(timeout=16.0) as client:
-            resp = await client.post(
-                base.rstrip("/") + "/chat/completions",
-                headers={"Authorization": f"Bearer {self.config.api_key}"},
-                json={
-                    "model": self.config.model or "gpt-4o",
-                    "messages": [{"role": "system", "content": chat_sys}, {"role": "user", "content": prompt}],
-                },
-            )
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip()
-        return "Koneksi AI sedang sibuk, coba kirim lagi bro."
+            self.last_chat_ok = False
+            self.last_error_kind = last_non_gemini_kind
+            return self._friendly_chat_error_message(last_non_gemini_kind)
 
     async def classify_intent(
         self,
@@ -453,23 +734,20 @@ class MultiLLMBrain:
         payload = {
             "system_instruction": {"parts": [{"text": sys_i}]},
             "contents": [{"role": "user", "parts": [{"text": u_txt}]}],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 30, "responseMimeType": "application/json"},
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 40, "responseMimeType": "application/json"},
         }
-        client = get_shared_http()
-        for m_name in ("gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"):
-            try:
-                r = await client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}",
-                    json=payload,
-                    timeout=3.2,
-                )
-                if r.status_code == 200:
-                    raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        for m_name in self._gemini_candidate_models(light_first=True)[:3]:
+            data, err = await self._post_gemini_single(m_name, payload, timeout=3.5)
+            if data is not None:
+                try:
+                    raw = self._extract_gemini_text(data)
                     route = _extract_json(raw).get("route", "chat")
                     if route in ("chat", "open_web", "agent"):
                         return route
-            except Exception:
-                continue
+                except Exception:
+                    continue
+            if err and err.kind == "auth_error":
+                break
         return "chat"
 
     async def solve_captcha_image(self, raw_bytes: bytes, mime_type: str = "image/png", hint_text: str = "") -> str:
@@ -499,18 +777,20 @@ class MultiLLMBrain:
             ],
             "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
         }
-        client = get_shared_http()
-        for m_name in ("gemini-3.1-flash-lite-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite"):
-            u = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}"
-            try:
-                r = await client.post(u, json=payload, timeout=7.5)
-                if r.status_code == 200:
-                    raw_t = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        for idx_m, m_name in enumerate(self._gemini_candidate_models(light_first=True)[:3]):
+            data, err = await self._post_gemini_single(m_name, payload, timeout=8.0)
+            if data is not None:
+                try:
+                    raw_t = self._extract_gemini_text(data)
                     ans = str(_extract_json(raw_t).get("answer") or "").strip()
                     if ans:
                         return ans
-            except Exception:
-                continue
+                except Exception:
+                    continue
+            if err and err.kind == "auth_error":
+                break
+            if err and err.kind in ("rate_limit", "server_overloaded") and idx_m < 2:
+                await self._sleep_fn(compute_backoff_delay(idx_m, retry_after=err.retry_after, base=0.5, cap=3.0))
         return ""
 
     async def analyze_media(
@@ -523,6 +803,8 @@ class MultiLLMBrain:
     ) -> str:
         """Membaca foto (soal, form, KTP/paspor, tabel) atau dokumen (PDF, Word, Excel) dari Telegram."""
         if not self.config.has_api_key:
+            self.last_chat_ok = bool(extracted_text)
+            self.last_error_kind = "" if extracted_text else "no_api_key"
             if extracted_text:
                 return f"📄 Isi teks dari {filename}:\n\n{extracted_text[:2500]}"
             return "Pasang API Key Gemini dulu bro biar gua bisa baca foto & dokumen otomatis."
@@ -558,26 +840,37 @@ class MultiLLMBrain:
                 b64_data = _b64.b64encode(raw_bytes).decode("ascii")
                 parts.append({"inline_data": {"mime_type": mime_type, "data": b64_data}})
 
-        primary = self.config.model or "gemini-3.1-flash-lite"
-        candidates = [primary] + [m for m in ("gemini-3.1-flash-lite", "gemini-3-flash-preview") if m != primary]
         payload = {
             "system_instruction": {"parts": [{"text": sys_txt}]},
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": 0.25},
         }
-        async with _fast_http_client(timeout=24.0) as client:
-            for model in candidates:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
-                try:
-                    resp = await client.post(url, json=payload)
-                    if resp.status_code == 200:
-                        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                except Exception:
-                    continue
+        async with self._llm_semaphore:
+            last_err: Optional[LLMCallError] = None
+            backoff_idx = 0
+            for model in self._gemini_candidate_models(light_first=False)[:4]:
+                data, err = await self._post_gemini_single(model, payload, timeout=24.0)
+                if data is not None:
+                    txt_out = self._extract_gemini_text(data)
+                    if txt_out:
+                        self.last_chat_ok = True
+                        self.last_error_kind = ""
+                        self.last_error_detail = ""
+                        return txt_out
+                last_err = err
+                if err and err.kind == "auth_error":
+                    break
+                if err and err.kind in ("rate_limit", "server_overloaded", "timeout", "network_error"):
+                    await self._sleep_fn(compute_backoff_delay(backoff_idx, retry_after=err.retry_after, base=0.75, cap=4.5))
+                    backoff_idx += 1
 
         if extracted_text:
+            self.last_chat_ok = True
+            self.last_error_kind = ""
             return f"📄 Isi {filename} berhasil dibaca:\n\n{extracted_text[:2000]}"
-        return f"Waduh, gagal menganalisis {filename} karena server AI lagi sibuk. Coba kirim ulang ya bro!"
+        self.last_chat_ok = False
+        self.last_error_kind = last_err.kind if last_err else "server_overloaded"
+        return f"Waduh, gagal menganalisis {filename} ({self._friendly_chat_error_message(self.last_error_kind)})"
 
     async def resolve_website_url(self, raw_query: str) -> str:
         """Mengubah nama layanan (misal 'login Konami ID' atau 'elearning UT') menjadi URL resmi."""
@@ -592,7 +885,6 @@ class MultiLLMBrain:
             return "https://siskopatuh.haji.go.id/web/"
 
         if self.config.has_api_key and self.config.provider == "gemini":
-            candidates = ["gemini-3.1-flash-lite-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite"]
             payload = {
                 "system_instruction": {
                     "parts": [
@@ -610,17 +902,17 @@ class MultiLLMBrain:
                 "contents": [{"role": "user", "parts": [{"text": q}]}],
                 "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
             }
-            client = get_shared_http()
-            for model in candidates:
-                u = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.config.api_key}"
-                try:
-                    r = await client.post(u, json=payload, timeout=5.0)
-                    if r.status_code == 200:
-                        parsed = _extract_json(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            for model in self._gemini_candidate_models(light_first=True)[:3]:
+                data, err = await self._post_gemini_single(model, payload, timeout=5.0)
+                if data is not None:
+                    try:
+                        parsed = _extract_json(self._extract_gemini_text(data))
                         if parsed.get("url"):
                             return str(parsed["url"]).strip()
-                except Exception:
-                    continue
+                    except Exception:
+                        continue
+                if err and err.kind == "auth_error":
+                    break
 
         from urllib.parse import quote_plus
         return f"https://search.yahoo.com/search?p={quote_plus(q)}"
@@ -695,86 +987,82 @@ class MultiLLMBrain:
         )
 
     async def _call_gemini(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
-        import asyncio as _aio
-        # Pool 3 Otak Penalaran Penuh (kuota terpisah 3x lipat + jauh lebih pintar dari flash-lite!),
-        # dengan flash-lite HANYA sebagai cadangan darurat paling akhir jika ketiganya sedang 429.
-        smart_pool = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.6-flash"]
-        rot = self._rr_idx % len(smart_pool)
-        self._rr_idx += 1
-        candidates = smart_pool[rot:] + smart_pool[:rot] + ["gemini-3.1-flash-lite-preview"]
-        if self.config.model and "flash-lite" not in self.config.model and self.config.model not in candidates:
-            candidates.insert(0, self.config.model)
+        candidates = self._gemini_candidate_models(light_first=False)
+        last_err: Optional[LLMCallError] = None
+        backoff_step = 0
 
-        last_err = ""
-        client = get_shared_http()
+        async with self._llm_semaphore:
+            # Uji dengan screenshot terlebih dahulu; jika gagal karena payload gambar pada model tertentu,
+            # hanya coba tanpa gambar 1x pada kandidat sehat bila error bukan auth_error / rate_limit global.
+            for m_name in candidates:
+                parts: List[Dict[str, Any]] = [{"text": prompt_text}]
+                if screenshot_b64:
+                    parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
+                gen_cfg: Dict[str, Any] = {
+                    "temperature": 0.15,
+                    "responseMimeType": "application/json",
+                }
+                payload = {
+                    "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                    "contents": [{"role": "user", "parts": parts}],
+                    "generationConfig": gen_cfg,
+                }
+                data, err = await self._post_gemini_single(m_name, payload, timeout=18.0)
+                if data is not None:
+                    try:
+                        text = self._extract_gemini_text(data)
+                        parsed = _extract_json(text)
+                        act_obj = parsed.get("action") if isinstance(parsed, dict) else None
+                        if isinstance(act_obj, dict) and str(act_obj.get("name") or "").strip():
+                            return parsed
+                        err = LLMCallError(
+                            f"Skema JSON action kosong/tidak valid dari {m_name}",
+                            kind="invalid_output",
+                            model_name=m_name,
+                        )
+                    except Exception as parse_exc:
+                        err = LLMCallError(
+                            f"Format JSON melenceng pada {m_name} ({type(parse_exc).__name__})",
+                            kind="invalid_output",
+                            model_name=m_name,
+                        )
 
-        async def _try_step_model(m_name: str, include_img: bool) -> Optional[Dict[str, Any]]:
-            nonlocal last_err
-            parts: List[Dict[str, Any]] = [{"text": prompt_text}]
-            if include_img and screenshot_b64:
-                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
-            gen_cfg: Dict[str, Any] = {
-                "temperature": 0.15,
-                "responseMimeType": "application/json",
-            }
-            if "flash-lite" not in m_name:
-                gen_cfg["thinkingConfig"] = {"thinkingBudget": 384}
-            payload = {
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                "contents": [{"role": "user", "parts": parts}],
-                "generationConfig": gen_cfg,
-            }
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}"
-            try:
-                resp = await client.post(url, json=payload, timeout=16.0)
-            except Exception as exc:
-                last_err = f"Koneksi AI sibuk ({type(exc).__name__}) pada {m_name}"
-                return None
-            if resp.status_code >= 400:
-                last_err = f"Gemini API ({resp.status_code}) pada {m_name}"
-                return None
-            try:
-                data = resp.json()
-                cands = data.get("candidates") or []
-                if not cands:
-                    return None
-                parts_out = (cands[0].get("content") or {}).get("parts") or []
-                text = "".join(p.get("text", "") for p in parts_out if not p.get("thought")).strip()
-                parsed = _extract_json(text)
-                if isinstance(parsed, dict) and parsed.get("action"):
-                    return parsed
-            except Exception as parse_exc:
-                last_err = f"Format JSON melenceng pada {m_name} ({type(parse_exc).__name__})"
-            return None
+                last_err = err
+                if err and err.kind == "auth_error":
+                    raise err
+                if err and err.kind == "bad_request" and screenshot_b64:
+                    # Fallback 1x tanpa screenshot pada model yang sama bila gambar ditolak
+                    txt_only_payload = {
+                        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                        "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
+                        "generationConfig": gen_cfg,
+                    }
+                    data2, err2 = await self._post_gemini_single(m_name, txt_only_payload, timeout=15.0)
+                    if data2 is not None:
+                        try:
+                            parsed2 = _extract_json(self._extract_gemini_text(data2))
+                            act2 = parsed2.get("action") if isinstance(parsed2, dict) else None
+                            if isinstance(act2, dict) and str(act2.get("name") or "").strip():
+                                return parsed2
+                        except Exception:
+                            pass
+                    last_err = err2 or err
+                    continue
+                if err and err.kind in ("model_not_found", "bad_request", "invalid_output"):
+                    continue
+                if err and err.kind in ("rate_limit", "server_overloaded", "timeout", "network_error"):
+                    delay = compute_backoff_delay(backoff_step, retry_after=err.retry_after, base=0.75, cap=5.0)
+                    backoff_step += 1
+                    await self._sleep_fn(delay)
 
-        # Hedged Racing untuk langkah Browser Agent: jika model #1 antri > 4.5 detik (atau 429 instan), langsung balapkan model #2 & #3!
-        for include_img in ([True, False] if screenshot_b64 else [False]):
-            t1 = _aio.create_task(_try_step_model(candidates[0], include_img))
-            done, _ = await _aio.wait({t1}, timeout=4.5)
-            if done and t1.result():
-                return t1.result()
-
-            t2 = _aio.create_task(_try_step_model(candidates[1], include_img))
-            pending = {t for t in (t1, t2) if not t.done()}
-            while pending:
-                done_set, pending = await _aio.wait(pending, timeout=12.0, return_when=_aio.FIRST_COMPLETED)
-                if not done_set:
-                    break
-                for dt in done_set:
-                    res = dt.result()
-                    if res:
-                        for p in pending:
-                            p.cancel()
-                        return res
-            for p in pending:
-                p.cancel()
-
-            for extra_m in candidates[2:]:
-                res_extra = await _try_step_model(extra_m, include_img)
-                if res_extra:
-                    return res_extra
-
-        raise RuntimeError(redact_secrets(last_err or "Server AI sedang padat sesaat, coba kirim ulang 5 detik lagi."))
+        if last_err is not None:
+            last_err.exhausted_retry = True
+            raise last_err
+        raise LLMCallError(
+            "Server AI sedang sibuk sementara, coba lagi beberapa detik lagi.",
+            kind="server_overloaded",
+            exhausted_retry=True,
+        )
 
     async def _call_openai_compatible(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         base = self.config.base_url
@@ -806,13 +1094,38 @@ class MultiLLMBrain:
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code >= 400:
-                raise RuntimeError(redact_secrets(f"LLM API error ({resp.status_code}): {resp.text[:300]}"))
-            data = resp.json()
-            text = data["choices"][0]["message"]["content"]
-            return _extract_json(text)
+        last_err: Optional[LLMCallError] = None
+        async with self._llm_semaphore:
+            for attempt in range(3):
+                try:
+                    resp = await get_shared_http().post(url, headers=headers, json=payload, timeout=35.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        text = data["choices"][0]["message"]["content"]
+                        parsed = _extract_json(text)
+                        act = parsed.get("action") if isinstance(parsed, dict) else None
+                        if isinstance(act, dict) and str(act.get("name") or "").strip():
+                            return parsed
+                        raise ValueError("JSON action kosong")
+                    kind, detail = classify_http_failure(resp)
+                    ra = parse_retry_after_seconds(resp)
+                    last_err = LLMCallError(detail, kind=kind, status_code=resp.status_code, retry_after=ra)
+                    if kind in ("auth_error", "model_not_found", "bad_request"):
+                        break
+                except httpx.TimeoutException:
+                    last_err = LLMCallError("Timeout menunggu respons OpenAI/OpenRouter.", kind="timeout")
+                except httpx.TransportError as tr_exc:
+                    reset_shared_http()
+                    last_err = LLMCallError(f"Gangguan jaringan AI ({type(tr_exc).__name__}).", kind="network_error")
+                except Exception as exc:
+                    last_err = LLMCallError(f"Format respons AI tidak valid ({type(exc).__name__}).", kind="invalid_output")
+                    break
+                if attempt < 2 and last_err:
+                    await self._sleep_fn(compute_backoff_delay(attempt, retry_after=last_err.retry_after, base=0.85, cap=5.0))
+        if last_err:
+            last_err.exhausted_retry = True
+            raise last_err
+        raise LLMCallError("Gagal menghubungi provider OpenAI/OpenRouter.", kind="server_overloaded", exhausted_retry=True)
 
     async def _call_anthropic(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         url = (self.config.base_url or "https://api.anthropic.com/v1").rstrip("/") + "/messages"
@@ -838,13 +1151,38 @@ class MultiLLMBrain:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"Anthropic API error ({resp.status_code}): {resp.text[:300]}")
-            data = resp.json()
-            text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-            return _extract_json(text)
+        last_err: Optional[LLMCallError] = None
+        async with self._llm_semaphore:
+            for attempt in range(3):
+                try:
+                    resp = await get_shared_http().post(url, headers=headers, json=payload, timeout=35.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+                        parsed = _extract_json(text)
+                        act = parsed.get("action") if isinstance(parsed, dict) else None
+                        if isinstance(act, dict) and str(act.get("name") or "").strip():
+                            return parsed
+                        raise ValueError("JSON action kosong")
+                    kind, detail = classify_http_failure(resp)
+                    ra = parse_retry_after_seconds(resp)
+                    last_err = LLMCallError(detail, kind=kind, status_code=resp.status_code, retry_after=ra)
+                    if kind in ("auth_error", "model_not_found", "bad_request"):
+                        break
+                except httpx.TimeoutException:
+                    last_err = LLMCallError("Timeout menunggu respons Anthropic.", kind="timeout")
+                except httpx.TransportError as tr_exc:
+                    reset_shared_http()
+                    last_err = LLMCallError(f"Gangguan jaringan AI ({type(tr_exc).__name__}).", kind="network_error")
+                except Exception as exc:
+                    last_err = LLMCallError(f"Format respons AI tidak valid ({type(exc).__name__}).", kind="invalid_output")
+                    break
+                if attempt < 2 and last_err:
+                    await self._sleep_fn(compute_backoff_delay(attempt, retry_after=last_err.retry_after, base=0.85, cap=5.0))
+        if last_err:
+            last_err.exhausted_retry = True
+            raise last_err
+        raise LLMCallError("Gagal menghubungi provider Anthropic.", kind="server_overloaded", exhausted_retry=True)
 
 
 class SmartAutopilotPlanner:

@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -826,6 +826,483 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
             main_mod.STORAGE_STATUS.update(orig_storage_status)
 
         record(12, "Railway Volume Mount Proof, Production Fail-Closed & Non-Destructive Probe", True, "Mount kernel & RAILWAY_VOLUME_MOUNT_PATH tervalidasi, fail-closed 503 memblokir 100% tulis ke /tmp, & data lama utuh.")
+
+        # =====================================================================
+        # 13. TAHAP 1: AI ERROR CLASSIFICATION, BACKOFF + RETRY-AFTER & SEQUENTIAL FALLBACK
+        # =====================================================================
+        import httpx
+        import agent.llm_providers as llm_mod
+        from agent.llm_providers import (
+            LLMCallError,
+            MultiLLMBrain,
+            classify_http_failure,
+            compute_backoff_delay,
+            parse_retry_after_seconds,
+        )
+
+        # 13a. Unit check parse_retry_after_seconds, compute_backoff_delay, classify_http_failure
+        r_429 = httpx.Response(429, headers={"Retry-After": "3.5"}, text='{"error":{"message":"Quota exceeded"}}')
+        assert abs((parse_retry_after_seconds(r_429) or 0.0) - 3.5) < 0.01
+        d_429 = compute_backoff_delay(0, retry_after=parse_retry_after_seconds(r_429), base=0.65, cap=5.0)
+        assert d_429 >= 3.5, f"Backoff wajib menghormati Retry-After >= 3.5s, dapat: {d_429}"
+        k_401, _ = classify_http_failure(httpx.Response(401, text="API key not valid"))
+        k_404, _ = classify_http_failure(httpx.Response(404, text="models/foo is not found"))
+        k_503, _ = classify_http_failure(httpx.Response(503, text="The model is overloaded"))
+        assert (k_401, k_404, k_503) == ("auth_error", "model_not_found", "server_overloaded")
+
+        def _make_cfg(prov: str, key: str, mod: str = "") -> LLMConfig:
+            c = LLMConfig()
+            c.update(prov, mod, key)
+            return c
+
+        # Pastikan model usang gemini-3.1-flash-lite-preview tidak lagi ada di kandidat
+        brain_probe = MultiLLMBrain(_make_cfg("gemini", "dummy-unit-test-key-00"))
+        assert "gemini-3.1-flash-lite-preview" not in brain_probe._gemini_candidate_models(light_first=False)
+        assert "gemini-3.1-flash-lite-preview" not in brain_probe._gemini_candidate_models(light_first=True)
+        assert "gemini-2.5-flash" in brain_probe._gemini_candidate_models(light_first=False)
+        assert "gemini-3.1-flash-lite" in brain_probe._gemini_candidate_models(light_first=False)
+
+        orig_get_http = llm_mod.get_shared_http
+        try:
+            # 13b. 401/403 Auth Error -> langsung berhenti di percobaan ke-1 tanpa retry sia-sia, pesan jujur!
+            calls_auth: List[str] = []
+            sleeps_auth: List[float] = []
+
+            class _MockHttpAuth:
+                async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+                    calls_auth.append(url)
+                    return httpx.Response(403, text='{"error":{"message":"API key invalid or permission denied"}}')
+
+            llm_mod.get_shared_http = lambda: _MockHttpAuth()  # type: ignore
+            b_auth = MultiLLMBrain(_make_cfg("gemini", "dummy-unit-test-key-01"))
+            b_auth._sleep_fn = lambda s: (sleeps_auth.append(s) or asyncio.sleep(0))  # type: ignore
+            msg_auth = await b_auth.quick_chat("Halo tes")
+            assert len(calls_auth) == 1 and len(sleeps_auth) == 0, f"Auth error tidak boleh retry berulang: calls={len(calls_auth)}"
+            assert b_auth.last_chat_ok is False and b_auth.last_error_kind == "auth_error"
+            assert "API Key" in msg_auth and "sibuk" not in msg_auth.lower()
+
+            # 13c. Sequential Fallback (404 karantina model + 429 Retry-After + 503 + sukses di model cadangan, 0 duplikasi paralel)
+            calls_seq: List[str] = []
+            sleeps_seq: List[float] = []
+            in_flight = 0
+            max_in_flight = 0
+
+            class _MockHttpSeq:
+                async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+                    nonlocal in_flight, max_in_flight
+                    in_flight += 1
+                    max_in_flight = max(max_in_flight, in_flight)
+                    await asyncio.sleep(0.005)
+                    in_flight -= 1
+                    m_seg = url.split("/models/")[1].split(":")[0]
+                    calls_seq.append(m_seg)
+                    idx = len(calls_seq)
+                    if idx == 1:
+                        return httpx.Response(404, text='{"error":{"message":"Model not found"}}')
+                    if idx == 2:
+                        return httpx.Response(429, headers={"Retry-After": "2.25"}, text='{"error":{"message":"Resource exhausted"}}')
+                    if idx == 3:
+                        return httpx.Response(503, text='{"error":{"message":"Overloaded"}}')
+                    return httpx.Response(
+                        200,
+                        json={"candidates": [{"content": {"parts": [{"text": "Jawaban sukses dari model fallback!"}]}}]},
+                    )
+
+            llm_mod.get_shared_http = lambda: _MockHttpSeq()  # type: ignore
+            b_seq = MultiLLMBrain(_make_cfg("gemini", "dummy-unit-test-key-02", "dead-model-404"))
+            b_seq._sleep_fn = lambda s: (sleeps_seq.append(s) or asyncio.sleep(0))  # type: ignore
+            ans_seq = await b_seq.quick_chat("Jelaskan singkat")
+            assert ans_seq == "Jawaban sukses dari model fallback!"
+            assert b_seq.last_chat_ok is True and b_seq.last_error_kind == ""
+            assert max_in_flight == 1, f"Tidak boleh ada hedged racing paralel! max_in_flight={max_in_flight}"
+            assert "dead-model-404" in b_seq._unavailable_models, "Model 404 wajib dikarantina sementara"
+            assert any(s >= 2.25 for s in sleeps_seq), f"Wajib menghormati Retry-After 2.25s: {sleeps_seq}"
+
+            # 13d. _call_gemini dengan timeout, network error, & JSON rusak -> fallback lalu lempar LLMCallError(exhausted_retry=True) jika semua gagal
+            step_events: List[str] = []
+
+            class _MockHttpStep:
+                async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+                    m_seg = url.split("/models/")[1].split(":")[0]
+                    step_events.append(m_seg)
+                    n = len(step_events)
+                    if n == 1:
+                        raise httpx.ReadTimeout("Simulated read timeout")
+                    if n == 2:
+                        raise httpx.ConnectError("Simulated socket reset")
+                    if n == 3:
+                        # Malformed JSON / action kosong -> wajib ditolak!
+                        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": '{"thought": "bingung"}'}]}}]})
+                    return httpx.Response(
+                        200,
+                        json={
+                            "candidates": [
+                                {
+                                    "content": {
+                                        "parts": [
+                                            {"text": '{"thought":"ok","action":{"name":"navigate","url":"https://example.org"}}'}
+                                        ]
+                                    }
+                                }
+                            ]
+                        },
+                    )
+
+            llm_mod.get_shared_http = lambda: _MockHttpStep()  # type: ignore
+            b_step = MultiLLMBrain(_make_cfg("gemini", "dummy-unit-test-key-03"))
+            b_step._sleep_fn = lambda s: asyncio.sleep(0)  # type: ignore
+            dec_ok = await b_step._call_gemini("Buka example.org", "")
+            assert dec_ok["action"]["name"] == "navigate" and len(step_events) == 4
+
+            # Bila semua model 429 -> wajib melempar LLMCallError dengan exhausted_retry=True & kind='rate_limit'
+            class _MockAll429:
+                async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+                    return httpx.Response(429, headers={"Retry-After": "1.5"}, text="Quota exceeded")
+
+            llm_mod.get_shared_http = lambda: _MockAll429()  # type: ignore
+            b_429 = MultiLLMBrain(_make_cfg("gemini", "dummy-unit-test-key-04"))
+            b_429._sleep_fn = lambda s: asyncio.sleep(0)  # type: ignore
+            caught_llm_err: Optional[LLMCallError] = None
+            try:
+                await b_429._call_gemini("Tes semua 429", "")
+            except LLMCallError as exc_429:
+                caught_llm_err = exc_429
+            assert caught_llm_err is not None and caught_llm_err.kind == "rate_limit" and caught_llm_err.exhausted_retry is True
+        finally:
+            llm_mod.get_shared_http = orig_get_http
+
+        record(13, "Tahap 1: AI Error Classification, Backoff+Jitter, Retry-After & Sequential Fallback", True, "401/403 fast-fail jujur, 404 karantina, 429 Retry-After dipatuhi, timeout/network/JSON rusak fallback mulus tanpa duplikasi request.")
+
+        # =====================================================================
+        # 14. TAHAP 2: HONEST STATUS (BERHASIL vs SEBAGIAN BERHASIL vs GAGAL)
+        # =====================================================================
+        async def _wait_orch_idle(orch_inst: AgentOrchestrator, timeout_s: float = 8.0) -> None:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if orch_inst._task is None or orch_inst._task.done():
+                    break
+                await asyncio.sleep(0.03)
+
+        t2_root = tmp_dir / "t2_status_honesty"
+        fm_t2 = WorkspaceFileManager(str(t2_root / "ws"))
+        be_t2 = CloudBrowserEngine(fm_t2, _capture_ev, profile_dir=str(t2_root / "prof"))
+        orch_t2 = AgentOrchestrator(be_t2, fm_t2, LLMConfig(), _capture_ev, None)
+
+        # 14a. JSON rusak / action kosong TIDAK BOLEH pernah default ke 'done' / BERHASIL!
+        async def _broken_json_decide(**kwargs: Any) -> Dict[str, Any]:
+            return {"thought": "Output rusak tanpa objek action valid", "action": {}}
+
+        orch_t2.brain.decide_next_step = _broken_json_decide  # type: ignore
+        await orch_t2.start_goal("Hitung analisis lokal sederhana")
+        await _wait_orch_idle(orch_t2)
+        t_broken = orch_t2.task_store.get_latest_task()
+        assert t_broken and t_broken["status"] == "GAGAL" and t_broken["verification_result"]["verified"] is False, (
+            f"JSON rusak dilarang keras menjadi BERHASIL: {t_broken}"
+        )
+
+        # 14b. AI Error (LLMCallError exhausted_retry=True) -> 1x panggil tanpa badai retry ganda & status wajib GAGAL!
+        llm_err_calls = 0
+
+        async def _exhausted_ai_decide(**kwargs: Any) -> Dict[str, Any]:
+            nonlocal llm_err_calls
+            llm_err_calls += 1
+            raise LLMCallError("Kuota sementara penuh", kind="rate_limit", status_code=429, exhausted_retry=True)
+
+        orch_t2.brain.decide_next_step = _exhausted_ai_decide  # type: ignore
+        await orch_t2.start_goal("Rangkum catatan kerja lokal")
+        await _wait_orch_idle(orch_t2)
+        t_ai_err = orch_t2.task_store.get_latest_task()
+        assert llm_err_calls == 1, f"Orchestrator tidak boleh menggandakan retry saat LLMCallError exhausted: {llm_err_calls}"
+        assert t_ai_err and t_ai_err["status"] == "GAGAL" and t_ai_err["verification_result"]["verified"] is False
+
+        # 14c. Semua aksi gagal lalu AI memanggil 'done' -> WAJIB GAGAL (bukan BERHASIL palsu!)
+        seq_fail = iter(
+            [
+                {"thought": "Coba jalankan kode", "action": {"name": "run_python", "code": "raise ValueError('simulasi_error_1')"}},
+                {"thought": "Selesai", "action": {"name": "done", "summary": "Maaf, gagal memproses perhitungan Python."}},
+            ]
+        )
+
+        async def _decide_seq_fail(**kw: Any) -> Dict[str, Any]:
+            return next(seq_fail)
+
+        orch_t2.brain.decide_next_step = _decide_seq_fail  # type: ignore
+        await orch_t2.start_goal("Jalankan perhitungan statistik lokal")
+        await _wait_orch_idle(orch_t2)
+        t_all_fail = orch_t2.task_store.get_latest_task()
+        assert t_all_fail and t_all_fail["status"] == "GAGAL" and t_all_fail["verification_result"]["verified"] is False, (
+            f"Semua langkah gagal wajib GAGAL, dapat: {t_all_fail}"
+        )
+
+        # 14d. Sukses parsial (Langkah 1 berhasil, Langkah 2 gagal, lalu AI berhenti 'done' tanpa deliverable akhir) -> SEBAGIAN BERHASIL!
+        seq_partial = iter(
+            [
+                {"thought": "Langkah 1 ok", "action": {"name": "run_python", "code": "print('tahap_1_ok')"}},
+                {"thought": "Langkah 2 gagal", "action": {"name": "run_python", "code": "raise RuntimeError('simulasi_error_2')"}},
+                {"thought": "Berhenti", "action": {"name": "done", "summary": "Tahap pertama selesai tetapi tahap kedua terkendala."}},
+            ]
+        )
+
+        async def _decide_seq_partial(**kw: Any) -> Dict[str, Any]:
+            return next(seq_partial)
+
+        orch_t2.brain.decide_next_step = _decide_seq_partial  # type: ignore
+        await orch_t2.start_goal("Eksekusi dua tahap skrip lokal")
+        await _wait_orch_idle(orch_t2)
+        t_part = orch_t2.task_store.get_latest_task()
+        assert t_part and t_part["status"] == "SEBAGIAN BERHASIL" and t_part["verification_result"]["verified"] is False, (
+            f"Langkah akhir gagal wajib SEBAGIAN BERHASIL, dapat: {t_part}"
+        )
+
+        # 14e. Sukses murni -> BERHASIL & verified=True!
+        seq_pure_ok = iter(
+            [
+                {"thought": "Hitung", "action": {"name": "run_python", "code": "print(21 * 2)"}},
+                {"thought": "Beres", "action": {"name": "done", "summary": "Hasil perhitungan adalah 42."}},
+            ]
+        )
+
+        async def _decide_seq_pure(**kw: Any) -> Dict[str, Any]:
+            return next(seq_pure_ok)
+
+        orch_t2.brain.decide_next_step = _decide_seq_pure  # type: ignore
+        await orch_t2.start_goal("Hitung 21 dikali 2 dengan Python")
+        await _wait_orch_idle(orch_t2)
+        t_pure = orch_t2.task_store.get_latest_task()
+        assert t_pure and t_pure["status"] == "BERHASIL" and t_pure["verification_result"]["verified"] is True
+        await be_t2.stop()
+
+        record(14, "Tahap 2: Honest Status Logic (Pure Success vs Partial vs Failure, JSON/AI Guard)", True, "JSON rusak, AI error, & aksi gagal 0% bocor jadi BERHASIL; sukses murni, parsial, & gagal terpisah presisi.")
+
+        # =====================================================================
+        # 15. TAHAP 3: FIFO DEDUP, PER-CHAT CONCURRENCY LOCK + FAST-PATH, & CARD ISOLATION
+        # =====================================================================
+        t3_root = tmp_dir / "t3_concurrency"
+        fm_t3 = WorkspaceFileManager(str(t3_root / "ws"))
+        tg_t3 = TelegramBotBridge(state_dir=str(t3_root / "prof"))
+        tg_t3.token = "dummy_tg_unit_token"
+        be_t3 = CloudBrowserEngine(fm_t3, _capture_ev, profile_dir=str(t3_root / "prof"))
+        orch_t3 = AgentOrchestrator(be_t3, fm_t3, LLMConfig(), _capture_ev, tg_t3)
+        tg_t3.attach_orchestrator(orch_t3)
+
+        sent_t3: List[Tuple[int, int, str]] = []
+        edited_t3: List[Tuple[int, int, str]] = []
+        next_mid_t3 = 500
+
+        async def _mock_send_t3(cid: int, txt: str, reply_markup: Any = None) -> Optional[int]:
+            nonlocal next_mid_t3
+            next_mid_t3 += 1
+            sent_t3.append((cid, next_mid_t3, txt))
+            return next_mid_t3
+
+        async def _mock_edit_t3(cid: int, mid: int, txt: str, reply_markup: Any = None) -> None:
+            edited_t3.append((cid, mid, txt))
+
+        async def _noop_action_t3(cid: int, act: str = "typing") -> None:
+            return None
+
+        tg_t3.send_text = _mock_send_t3  # type: ignore
+        tg_t3._edit_text = _mock_edit_t3  # type: ignore
+        tg_t3._send_chat_action = _noop_action_t3  # type: ignore
+
+        # 15a. Bounded FIFO deduplication melewati batas 500 & 1000 tanpa .clear() massal!
+        for uid_i in range(1, 1006):
+            assert tg_t3._mark_update_seen(uid_i) is False
+        assert len(tg_t3._seen_update_ids) == 1000
+        assert tg_t3._mark_update_seen(1) is False, "Item tertua (>1000 lalu) ter-evict rapi secara FIFO"
+        for recent_uid in (500, 501, 999, 1000, 1005):
+            assert tg_t3._mark_update_seen(recent_uid) is True, f"Update terbaru {recent_uid} tidak boleh bocor akibat clear!"
+
+        # 15b. Serialisasi per-chat (tidak saling tabrak) + Fast-Path darurat (/stop tetap tembus instan!)
+        in_flight_chat = 0
+        max_in_flight_chat = 0
+        stop_finished_while_chat_busy = False
+
+        async def _slow_quick_chat(prompt: str, recent: Any = None, user_memory_block: str = "") -> str:
+            nonlocal in_flight_chat, max_in_flight_chat
+            in_flight_chat += 1
+            max_in_flight_chat = max(max_in_flight_chat, in_flight_chat)
+            await asyncio.sleep(0.18)
+            in_flight_chat -= 1
+            orch_t3.brain.last_chat_ok = True
+            return f"Balasan untuk: {prompt[:30]}"
+
+        orch_t3.brain.quick_chat = _slow_quick_chat  # type: ignore
+
+        upd_a = {"update_id": 9001, "message": {"message_id": 11, "chat": {"id": 777}, "from": {"id": 777}, "text": "halo pesan pertama"}}
+        upd_b = {"update_id": 9002, "message": {"message_id": 12, "chat": {"id": 777}, "from": {"id": 777}, "text": "halo pesan kedua"}}
+        upd_stop = {"update_id": 9003, "message": {"message_id": 13, "chat": {"id": 777}, "from": {"id": 777}, "text": "/stop"}}
+
+        async def _send_stop_midway() -> None:
+            nonlocal stop_finished_while_chat_busy
+            await asyncio.sleep(0.05)
+            t_s0 = time.monotonic()
+            await tg_t3._handle_update(upd_stop)
+            if (time.monotonic() - t_s0) < 0.10 and in_flight_chat == 1:
+                stop_finished_while_chat_busy = True
+
+        await asyncio.gather(
+            tg_t3._handle_update(upd_a),
+            tg_t3._handle_update(upd_b),
+            _send_stop_midway(),
+        )
+        assert max_in_flight_chat == 1, f"Pesan per-chat wajib diserialisasi satu per satu! max_in_flight={max_in_flight_chat}"
+        assert stop_finished_while_chat_busy is True, "/stop wajib lewat fast-path tanpa terblokir lock chat lambat!"
+
+        # 15c. Isolasi kartu progress antar-run (kartu task lama ditutup lebih dulu & tidak bisa menimpa kartu baru / selesai)
+        edited_t3.clear()
+        tg_t3.active_chat_ids.add(777)
+        tok1 = await tg_t3._begin_new_agent_card(777, "🟢 Kartu Tugas 1")
+        mid_card_1 = tg_t3._status_msg_ids[777]
+        tok2 = await tg_t3._begin_new_agent_card(777, "🟢 Kartu Tugas 2")
+        mid_card_2 = tg_t3._status_msg_ids[777]
+        assert tok2 > tok1 and mid_card_2 != mid_card_1
+        assert any(m == mid_card_1 and "DIGANTIKAN" in txt for (_, m, txt) in edited_t3), (
+            f"Kartu tugas 1 wajib ditutup bersih sebelum kartu 2 aktif: {edited_t3}"
+        )
+        await tg_t3.notify_done("Ringkasan Tugas 2", elapsed_sec=2, total_steps=1, final_status="BERHASIL")
+        assert 777 not in tg_t3._status_msg_ids, "Kartu progress tugas yang sudah selesai wajib dilepas agar tidak tertimpa!"
+        edits_count_after_done = len(edited_t3)
+        await tg_t3.notify_step(99, "Langkah nyasar terlambat")
+        assert len(edited_t3) == edits_count_after_done, "Langkah terlambat dilarang mengedit kartu yang sudah selesai!"
+        await be_t3.stop()
+
+        record(15, "Tahap 3: FIFO Dedup, Per-Chat Concurrency Lock + Fast-Path & Card Isolation", True, "Dedup FIFO 1000 ID anti-clear, chat per-user ter-serialisasi, /stop fast-path <0.1s, & kartu progress terisolasi penuh.")
+
+        # =====================================================================
+        # 16. TAHAP 4: ANTI ERROR-DOC EXPORT, HONEST OPEN_WEB, & CLEAN 'LANJUT'/TASK ISOLATION
+        # =====================================================================
+        t4_root = tmp_dir / "t4_edge_isolation"
+        fm_t4 = WorkspaceFileManager(str(t4_root / "ws"))
+        tg_t4 = TelegramBotBridge(state_dir=str(t4_root / "prof"))
+        tg_t4.token = "dummy_tg_t4_token"
+        be_t4 = CloudBrowserEngine(fm_t4, _capture_ev, profile_dir=str(t4_root / "prof"))
+        orch_t4 = AgentOrchestrator(be_t4, fm_t4, LLMConfig(), _capture_ev, tg_t4)
+        tg_t4.attach_orchestrator(orch_t4)
+
+        texts_t4: List[Tuple[int, str]] = []
+        edits_t4: List[Tuple[int, int, str]] = []
+        docs_t4: List[Tuple[int, str, int]] = []
+        mid_seq_t4 = 800
+
+        async def _send_t4(cid: int, txt: str, reply_markup: Any = None) -> Optional[int]:
+            nonlocal mid_seq_t4
+            mid_seq_t4 += 1
+            texts_t4.append((cid, txt))
+            return mid_seq_t4
+
+        async def _edit_t4(cid: int, mid: int, txt: str, reply_markup: Any = None) -> None:
+            edits_t4.append((cid, mid, txt))
+
+        async def _doc_t4(cid: int, fname: str, fbytes: bytes, caption: str = "") -> None:
+            docs_t4.append((cid, fname, len(fbytes)))
+
+        async def _noop_act_t4(cid: int, act: str = "typing") -> None:
+            return None
+
+        tg_t4.send_text = _send_t4  # type: ignore
+        tg_t4._edit_text = _edit_t4  # type: ignore
+        tg_t4.send_document = _doc_t4  # type: ignore
+        tg_t4._send_chat_action = _noop_act_t4  # type: ignore
+
+        # 16a. AI gagal (last_chat_ok=False) saat user minta dokumen PDF -> DILARANG ekspor PDF berisi teks error!
+        tg_t4.last_output_text[888] = "Dokumen surat pengantar resmi yang valid."
+
+        async def _failed_quick_chat_t4(prompt: str, recent: Any = None, user_memory_block: str = "") -> str:
+            orch_t4.brain.last_chat_ok = False
+            orch_t4.brain.last_error_kind = "rate_limit"
+            return "⚠️ Kuota permintaan AI sedang penuh sementara (HTTP 429)."
+
+        orch_t4.brain.quick_chat = _failed_quick_chat_t4  # type: ignore
+        await tg_t4._handle_update(
+            {
+                "update_id": 9501,
+                "message": {"message_id": 1, "chat": {"id": 888}, "from": {"id": 888}, "text": "buatkan surat lamaran kerja pdf"},
+            }
+        )
+        assert len(docs_t4) == 0, f"Dilarang keras membuat file PDF dari pesan error AI! docs={docs_t4}"
+        assert tg_t4.last_output_text[888] == "Dokumen surat pengantar resmi yang valid.", "last_output_text tidak boleh ditimpa teks error!"
+
+        # 16b. Isolasi konversi 'ke pdf': file usang tak bernama di workspace TIDAK dibajak di sesi kosong, sedangkan sesi valid dikonversi!
+        fm_t4.write_file("arsip_lama_2025.md", "# Arsip Lama Tidak Relevan")
+        await tg_t4._handle_update(
+            {
+                "update_id": 9502,
+                "message": {"message_id": 2, "chat": {"id": 889}, "from": {"id": 889}, "text": "ke pdf"},
+            }
+        )
+        assert len(docs_t4) == 0, "Sesi chat kosong tidak boleh diam-diam membajak file lama workspace tanpa disebut namanya!"
+        await tg_t4._handle_update(
+            {
+                "update_id": 9503,
+                "message": {"message_id": 3, "chat": {"id": 888}, "from": {"id": 888}, "text": "ke pdf"},
+            }
+        )
+        assert len(docs_t4) == 1 and docs_t4[0][1].endswith(".pdf") and docs_t4[0][2] > 100
+
+        # 16c. Kejujuran open_web saat target_url gagal dimuat ([UNREACHABLE_SITE]) -> WAJIB lapor GAGAL MEMBUKA WEB!
+        edits_t4.clear()
+        orch_t4.brain.resolve_website_url = lambda q: asyncio.sleep(0, result="https://portal-blokir.contoh.go.id")  # type: ignore
+        be_t4.navigate = lambda u: asyncio.sleep(0, result="[UNREACHABLE_SITE] Situs portal-blokir.contoh.go.id menolak koneksi")  # type: ignore
+        tg_t4.chat_modes[888] = "open_web"
+        await tg_t4._handle_update(
+            {
+                "update_id": 9504,
+                "message": {"message_id": 4, "chat": {"id": 888}, "from": {"id": 888}, "text": "portal-blokir.contoh.go.id"},
+            }
+        )
+        assert any("GAGAL MEMBUKA WEB" in txt for (_, _, txt) in edits_t4), f"open_web gagal wajib lapor jujur: {edits_t4}"
+        assert not any("SELESAI DIBUKA" in txt for (_, _, txt) in edits_t4), "open_web gagal dilarang klaim SELESAI DIBUKA!"
+
+        # 16d. Routing 'lanjut' jujur (tidak mengulang task BERHASIL, meresume task TERHENTI) & recent_chat bersih dari laporan 10-poin lama
+        seen_recent_chats: List[List[Dict[str, Any]]] = []
+
+        async def _done_with_capture_t4(**kw: Any) -> Dict[str, Any]:
+            seen_recent_chats.append(list(kw.get("recent_chat") or []))
+            return {"thought": "Selesai cepat", "action": {"name": "done", "summary": "Tugas selesai tuntas."}}
+
+        orch_t4.brain.decide_next_step = _done_with_capture_t4  # type: ignore
+        orch_t4.current_goal = "Tugas lama yang sudah tuntas"
+        tid_done = orch_t4.task_store.create_task("Tugas lama yang sudah tuntas")["task_id"]
+        orch_t4.task_store.finalize_task(tid_done, "BERHASIL", 3, True, "Sudah beres")
+
+        texts_t4.clear()
+        await tg_t4._handle_update(
+            {
+                "update_id": 9505,
+                "message": {"message_id": 5, "chat": {"id": 888}, "from": {"id": 888}, "text": "lanjut"},
+            }
+        )
+        assert any("udah selesai tuntas" in t for (_, t) in texts_t4), f"'lanjut' setelah BERHASIL tidak boleh mengulang task lama: {texts_t4}"
+
+        # Buat task TERHENTI -> 'lanjut bro' wajib memulihkan instruksi dari TaskStateStore!
+        tid_paused = orch_t4.task_store.create_task("Verifikasi tahap kedua formulir lokal")["task_id"]
+        orch_t4.task_store.finalize_task(tid_paused, "TERHENTI", 4, False, "Jeda sementara")
+        await tg_t4._handle_update(
+            {
+                "update_id": 9506,
+                "message": {"message_id": 6, "chat": {"id": 888}, "from": {"id": 888}, "text": "lanjut bro"},
+            }
+        )
+        await _wait_orch_idle(orch_t4)
+        assert "Verifikasi tahap kedua formulir lokal" in orch_t4.current_goal
+
+        # Pastikan laporan eksekusi 10-poin lama di chat_messages tersaring keluar dari recent_chat pada task baru!
+        await orch_t4._push_chat(
+            "agent",
+            "📋 LAPORAN EKSEKUSI\nNama Pekerjaan: Tugas Lama\nStatus Akhir: ✅ BERHASIL\nLangkah Berhasil: 2",
+        )
+        seen_recent_chats.clear()
+        await orch_t4.start_goal("Hitung tugas baru independen")
+        await _wait_orch_idle(orch_t4)
+        assert seen_recent_chats, "decide_next_step harus terpanggil pada task baru"
+        for msg_rc in seen_recent_chats[0]:
+            assert not ("Nama Pekerjaan:" in str(msg_rc.get("text", "")) and "Status Akhir:" in str(msg_rc.get("text", ""))), (
+                f"Laporan 10-poin task lama tidak boleh bocor ke recent_chat task baru: {msg_rc}"
+            )
+        await be_t4.stop()
+
+        record(16, "Tahap 4: Safe Doc Export Guard, Honest open_web & Clean 'lanjut'/Task Isolation", True, "0 file PDF/Word/Excel berisi teks error, open_web jujur saat gagal, 'lanjut' hanya untuk task terjeda, & konteks task baru bersih.")
 
     finally:
         if browser is not None:

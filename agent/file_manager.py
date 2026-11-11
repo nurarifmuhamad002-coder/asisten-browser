@@ -427,13 +427,92 @@ class WorkspaceFileManager:
         self._seed_starter_files()
 
     def _safe_path(self, filename: str) -> Path:
-        clean_name = os.path.basename(filename.strip())
-        if not clean_name or clean_name in (".", ".."):
-            raise ValueError("Nama file tidak valid.")
-        target = (self.base_dir / clean_name).resolve()
-        if not str(target).startswith(str(self.base_dir)):
+        raw = (filename or "").strip().replace("\\", "/").lstrip("/")
+        if not raw or raw in (".", ".."):
+            raise ValueError("Nama file/folder tidak valid.")
+        target = (self.base_dir / raw).resolve()
+        base_str = str(self.base_dir)
+        if str(target) != base_str and not str(target).startswith(base_str + os.sep):
             raise ValueError("Akses di luar folder workspace ditolak.")
         return target
+
+    def _rel_name(self, target: Path) -> str:
+        return target.resolve().relative_to(self.base_dir).as_posix()
+
+    def make_dir(self, dir_path: str) -> Dict[str, Any]:
+        target = self._safe_path(dir_path)
+        target.mkdir(parents=True, exist_ok=True)
+        return {"name": self._rel_name(target), "path": str(target), "is_dir": True}
+
+    def list_top_dirs(self) -> List[str]:
+        out: List[str] = []
+        for entry in sorted(self.base_dir.iterdir(), key=lambda p: p.name):
+            if entry.is_dir() and not entry.name.startswith(".") and entry.name != "__pycache__":
+                out.append(entry.name)
+        return out
+
+    def get_directory_tree(self, rel_root: str = "") -> str:
+        root = self._safe_path(rel_root) if (rel_root or "").strip() else self.base_dir
+        if not root.exists():
+            raise FileNotFoundError(f"Folder '{rel_root}' tidak ditemukan di workspace.")
+        if root.is_file():
+            return f"{self._rel_name(root)} ({root.stat().st_size} B)"
+
+        root_label = f"{root.name}/" if root != self.base_dir else "workspace_files/"
+        lines: List[str] = [root_label]
+        dir_count = 0
+        file_count = 0
+
+        def _walk(cur: Path, prefix: str) -> None:
+            nonlocal dir_count, file_count
+            children = [
+                p for p in sorted(cur.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+                if not p.name.startswith(".") and p.name != "__pycache__"
+            ]
+            for idx, ch in enumerate(children):
+                is_last = idx == len(children) - 1
+                branch = "└── " if is_last else "├── "
+                next_pref = prefix + ("    " if is_last else "│   ")
+                if ch.is_dir():
+                    dir_count += 1
+                    lines.append(f"{prefix}{branch}{ch.name}/")
+                    _walk(ch, next_pref)
+                else:
+                    file_count += 1
+                    lines.append(f"{prefix}{branch}{ch.name} ({ch.stat().st_size} B)")
+
+        _walk(root, "")
+        lines.append(f"\n[Terverifikasi di Disk: {dir_count} subfolder, {file_count} file]")
+        return "\n".join(lines)
+
+    def zip_directory(self, rel_dir: str) -> Dict[str, Any]:
+        import zipfile
+
+        folder = self._safe_path(rel_dir)
+        if not folder.exists() or not folder.is_dir():
+            raise FileNotFoundError(f"Folder '{rel_dir}' tidak ditemukan.")
+        zip_name = f"{folder.name}.zip"
+        zip_target = self._safe_path(zip_name)
+
+        with zipfile.ZipFile(str(zip_target), "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            # Sertakan folder utama & seluruh subfolder (termasuk subfolder kosong!) dan seluruh file di dalamnya
+            for cur_root, dirs, files in os.walk(str(folder)):
+                dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "__pycache__")
+                files = sorted(f for f in files if not f.startswith("."))
+                rel_cur = Path(cur_root).resolve().relative_to(folder.parent).as_posix().rstrip("/") + "/"
+                zinfo_dir = zipfile.ZipInfo(rel_cur)
+                zinfo_dir.external_attr = 0o40755 << 16
+                zf.writestr(zinfo_dir, b"")
+                for fn in files:
+                    full_f = Path(cur_root) / fn
+                    arc_f = full_f.resolve().relative_to(folder.parent).as_posix()
+                    zf.write(str(full_f), arcname=arc_f)
+
+        return {
+            "name": self._rel_name(zip_target),
+            "size": zip_target.stat().st_size,
+            "path": str(zip_target),
+        }
 
     def _seed_starter_files(self) -> None:
         sample_json = self.base_dir / "profil_pengajuan.json"
@@ -461,17 +540,23 @@ class WorkspaceFileManager:
 
     def list_files(self) -> List[Dict[str, Any]]:
         files = []
-        for entry in sorted(self.base_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-            if entry.is_file() and not entry.name.startswith("."):
-                stat = entry.stat()
-                files.append(
-                    {
-                        "name": entry.name,
-                        "size": stat.st_size,
-                        "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                        "ext": entry.suffix.lower().lstrip("."),
-                    }
-                )
+        all_files: List[Path] = []
+        for cur_root, dirs, fnames in os.walk(str(self.base_dir)):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+            for fn in fnames:
+                if not fn.startswith("."):
+                    all_files.append(Path(cur_root) / fn)
+
+        for entry in sorted(all_files, key=lambda p: p.stat().st_mtime, reverse=True):
+            stat = entry.stat()
+            files.append(
+                {
+                    "name": self._rel_name(entry),
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "ext": entry.suffix.lower().lstrip("."),
+                }
+            )
         return files
 
     def read_file(self, filename: str, max_chars: int = 20000) -> str:
@@ -533,6 +618,7 @@ class WorkspaceFileManager:
 
     def write_file(self, filename: str, content: str) -> Dict[str, Any]:
         target = self._safe_path(filename)
+        target.parent.mkdir(parents=True, exist_ok=True)
         ext = target.suffix.lower()
         stem_title = target.stem.replace("_", " ").replace("-", " ").title()
 
@@ -546,7 +632,7 @@ class WorkspaceFileManager:
             target.write_text(content, encoding="utf-8")
 
         return {
-            "name": target.name,
+            "name": self._rel_name(target),
             "size": target.stat().st_size,
             "path": str(target),
         }
@@ -560,23 +646,26 @@ class WorkspaceFileManager:
 
     def append_file(self, filename: str, content: str) -> Dict[str, Any]:
         target = self._safe_path(filename)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        rel_nm = self._rel_name(target)
         if target.suffix.lower() in (".docx", ".xlsx", ".pdf"):
-            prev = self.read_file(target.name) if target.exists() else ""
-            return self.write_file(target.name, (prev + "\n\n" + content).strip())
+            prev = self.read_file(rel_nm) if target.exists() else ""
+            return self.write_file(rel_nm, (prev + "\n\n" + content).strip())
         existing = target.read_text(encoding="utf-8") if target.exists() else ""
         sep = "\n" if existing and not existing.endswith("\n") else ""
         target.write_text(existing + sep + content, encoding="utf-8")
         return {
-            "name": target.name,
+            "name": rel_nm,
             "size": target.stat().st_size,
             "path": str(target),
         }
 
     def save_bytes(self, filename: str, data: bytes) -> Dict[str, Any]:
         target = self._safe_path(filename)
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         return {
-            "name": target.name,
+            "name": self._rel_name(target),
             "size": target.stat().st_size,
             "path": str(target),
         }

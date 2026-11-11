@@ -621,7 +621,7 @@ class TelegramBotBridge:
 
         if low.startswith("/apikey "):
             new_k = text.split(None, 1)[1].strip()
-            self.orchestrator.llm_config.update("gemini", "gemini-3.1-flash-lite", new_k, "")
+            self.orchestrator.llm_config.update("gemini", "gemini-3.5-flash", new_k, "")
             await self.send_text(chat_id, "✅ Mantap! API Key Gemini baru udah langsung aktif!", reply_markup=MAIN_MENU_KB)
             return
 
@@ -938,6 +938,30 @@ class TelegramBotBridge:
             return ("agent", text)
 
         if any(low.startswith(p) for p in ("klik ", "pencet ", "isi ", "ketik ", "scroll ", "geser ", "pilih ")):
+            return ("agent", text)
+
+        # 3B. TUGAS FILE SYSTEM / STRUKTUR FOLDER / PYTHON DATA / MULTI-STEP AGENT (Mesin punya akses penuh ke folder, file, & Python!)
+        fs_and_agent_markers = (
+            "sistem folder", "buat folder", "buatkan folder", "struktur folder", "struktur direktori",
+            "direktori", "file system", "filesystem", "├──", "└──", "readme.txt", ".txt", ".csv", ".json",
+            "dua sheet", "2 sheet", "sheet 1", "sheet 2", "multi sheet",
+            "jalankan python", "pakai python", "script python",
+        )
+        numbered_steps = len(re.findall(r"(?:^|\n)\s*\d+[\.\)]\s+\S+", text))
+        has_agent_spec = (
+            any(m in low for m in fs_and_agent_markers)
+            or (
+                numbered_steps >= 3
+                and any(
+                    kw in low
+                    for kw in (
+                        "tugas:", "tugas utama:", "instruksi:", "aturan:", "aturan kerja:", "laporan akhir:",
+                        "buat file", "periksa apakah", "verifikasi", "jangan mengklaim",
+                    )
+                )
+            )
+        )
+        if has_agent_spec:
             return ("agent", text)
 
         # 4. Minta bukain 1 website/layanan apa saja tanpa tugas lanjutan (contoh: "coba buka efhub bro", "buka youtube.com")

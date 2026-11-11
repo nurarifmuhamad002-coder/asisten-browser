@@ -188,9 +188,12 @@ DAFTAR ACTION YANG TERSEDIA (pilih TEPAT SATU action setiap langkah):
 - `{"name": "select", "index": 6, "option": "Label atau value"}` -> Pilih opsi pada `<select>` nomor [index].
 - `{"name": "scroll", "direction": "down"}` -> Scroll halaman ("down", "up", "top", "bottom").
 - `{"name": "go_back"}` -> Kembali ke halaman sebelumnya.
-- `{"name": "read_file", "filename": "profil_pengajuan.json"}` -> Baca isi file dari folder workspace (mendukung `.pdf`, `.docx`, `.xlsx`, `.csv`, `.json`, `.md`, `.txt`).
-- `{"name": "write_file", "filename": "hasil_riset.docx", "content": "..."}` -> Buat/timpa file asli di folder workspace & otomatis terkirim ke Telegram user! MENDUKUNG OTOMATIS Word (`.docx`), Excel Multi-Sheet (`.xlsx`), PDF (`.pdf`), `.md`, dan `.csv`.
+- `{"name": "make_dir", "path": "PROJECT_ADMIN/DOKUMEN"}` -> Buat folder/subdirektori sungguhan di dalam workspace (bisa juga beberapa sekaligus dipisah koma, contoh `"PROJECT_ADMIN/DOKUMEN, PROJECT_ADMIN/LAPORAN, PROJECT_ADMIN/ARSIP"`).
+- `{"name": "list_tree", "path": "PROJECT_ADMIN"}` -> Periksa & tampilkan pohon struktur direktori dan file sungguhan yang benar-benar ada di disk (gunakan untuk memverifikasi seluruh folder & file sebelum memanggil `"done"`!).
+- `{"name": "read_file", "filename": "profil_pengajuan.json"}` -> Baca isi file dari folder workspace (mendukung subfolder seperti `"PROJECT_ADMIN/README.txt"` serta format `.pdf`, `.docx`, `.xlsx`, `.csv`, `.json`, `.md`, `.txt`).
+- `{"name": "write_file", "filename": "hasil_riset.docx", "content": "..."}` -> Buat/timpa file asli di folder workspace (mendukung path bersarang di dalam subfolder seperti `"PROJECT_ADMIN/DOKUMEN/catatan.txt"`!) & otomatis terkirim ke Telegram user! MENDUKUNG OTOMATIS Word (`.docx`), Excel Multi-Sheet (`.xlsx`), PDF (`.pdf`), `.txt`, `.md`, dan `.csv`.
   * KHUSUS EXCEL MULTI-SHEET (`.xlsx`): Jika user meminta beberapa sheet (contoh Sheet 1 & Sheet 2), tulis pemisah `# Sheet 1: Data Produk` diikuti tabel pipa `| Kolom 1 | Kolom 2 |`, lalu `# Sheet 2: Analisis dan Rekomendasi` diikuti tabel/poin kesimpulannya — sistem otomatis menghasilkan beberapa tab worksheet Excel asli!
+  * KHUSUS TUGAS SISTEM FOLDER / DIREKTORI: Kamu MEMILIKI AKSES PENUH ke file system workspace melalui `"make_dir"`, `"write_file"` (dengan path subfolder), `"list_tree"`, maupun `"run_python"` (`os.makedirs`, `open`, `os.walk`). Buat seluruh folder & file sungguhan di disk, verifikasi dengan `"list_tree"`, lalu tampilkan pohon direktori terverifikasi pada `"done"` (sistem juga otomatis membungkus folder menjadi `.zip` untuk dikirim ke Telegram user!). JANGAN PERNAH mengaku tidak memiliki akses filesystem!
 
 ATURAN RISET DATA WEB, KATALOG PRODUK, ANALISIS, & PEMBUATAN FILE:
 1. Perhatikan blok `=== DAFTAR PRODUK / ITEM TERSTRUKTUR DI HALAMAN INI ===` pada observasi halaman! Jika Nama lengkap, Harga, Rating bintang, dan Status ketersediaan semua produk yang diminta SUDAH tertera lengkap di daftar tersebut, LANGSUNG olah datanya tanpa membuang langkah mengeklik satu per satu ke halaman detail!
@@ -437,9 +440,9 @@ class MultiLLMBrain:
 
         sys_i = (
             "Tentukan rute eksekusi untuk pesan user berikut menjadi TEPAT SATU JSON: {\"route\": \"chat\" | \"open_web\" | \"agent\"}.\n"
-            "- \"agent\": jika user menyuruh membuka/mengakses situs/akun/layanan web tertentu lalu melakukan aksi (login, isi form, klik, cari di web tertentu, rangkum halaman web, belanja, cek dashboard/classroom/portal, atau menindaklanjuti halaman browser yang sedang terbuka).\n"
+            "- \"agent\": jika user menyuruh membuka/mengakses situs web lalu melakukan aksi (login, isi form, klik, scraping, rangkum web), ATAU menyuruh membuat sistem folder/direktori/banyak file sungguhan di file system, menjalankan kode/analisis data Python, atau mengerjakan instruksi multi-langkah kompleks yang wajib diverifikasi.\n"
             "- \"open_web\": jika user HANYA menyuruh membuka 1 website/link saja tanpa tugas lanjutan (contoh: 'bukain web konami id', 'buka traveloka').\n"
-            "- \"chat\": jika user ngobrol biasa, bertanya pengetahuan umum/soal/coding, minta dibuatkan teks/surat/esai tanpa perlu buka website tertentu, atau tanya harga saham/kripto/kurs cepat."
+            "- \"chat\": jika user ngobrol santai, bertanya pengetahuan umum/soal singkat, minta dibuatkan 1 teks/surat sederhana tanpa struktur folder/browser, atau tanya harga saham/kripto cepat."
         )
         u_txt = f"URL Browser Aktif: {current_url or '(kosong)'}\n{hist_tail}PESAN USER: {message}"
         payload = {

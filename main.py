@@ -366,7 +366,16 @@ async def list_workspace_files():
     return {"files": file_manager.list_files()}
 
 
-@app.get("/api/files/{filename}")
+@app.get("/api/files/{filename:path}/download")
+async def download_workspace_file(filename: str):
+    try:
+        fpath = file_manager.get_file_path(filename)
+        return FileResponse(path=str(fpath), filename=fpath.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get("/api/files/{filename:path}")
 async def read_workspace_file(filename: str):
     try:
         content = file_manager.read_file(filename)
@@ -375,15 +384,6 @@ async def read_workspace_file(filename: str):
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.get("/api/files/{filename}/download")
-async def download_workspace_file(filename: str):
-    try:
-        fpath = file_manager.get_file_path(filename)
-        return FileResponse(path=str(fpath), filename=fpath.name)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.post("/api/files")

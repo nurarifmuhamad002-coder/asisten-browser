@@ -54,6 +54,7 @@ class AgentOrchestrator:
         self._field_warnings: Dict[str, str] = {}
         self._recorded_issues: List[str] = []
         self._created_files_this_run: List[str] = []
+        self._created_top_dirs: List[str] = []
         self._last_submit_verification: Optional[Dict[str, Any]] = None
         self._verify_retry_used: bool = False
         self._pre_submit_blocked_once: bool = False
@@ -241,6 +242,7 @@ class AgentOrchestrator:
         self._field_warnings = {}
         self._recorded_issues = []
         self._created_files_this_run = []
+        self._created_top_dirs = []
         self._last_submit_verification = None
         self._verify_retry_used = False
         self._pre_submit_blocked_once = False
@@ -323,9 +325,29 @@ class AgentOrchestrator:
                 decision = None
                 dom_state = None
                 last_step_err = None
+                goal_low_check = self.current_goal.lower()
+                needs_browser_obs = bool(
+                    self.browser._started
+                    or any(
+                        w in goal_low_check
+                        for w in ("http://", "https://", "website", "situs", "buka web", "browser", ".com", ".id", ".org", ".net", "login")
+                    )
+                )
                 for _attempt in range(2):
                     try:
-                        dom_state = await self.browser.observe(annotated_screenshot=self.llm_config.has_api_key)
+                        if needs_browser_obs:
+                            dom_state = await self.browser.observe(annotated_screenshot=self.llm_config.has_api_key)
+                        else:
+                            dom_state = {
+                                "url": "about:blank",
+                                "url_display": "(Mode Workspace File System & Python — Browser standby)",
+                                "title": "Workspace Lokal",
+                                "scroll": {"y": 0, "maxY": 0},
+                                "signals": {},
+                                "elements": [],
+                                "readable_text": "(Tugas lokal file/folder/Python — panggil 'navigate' kapan saja jika perlu membuka website)",
+                                "screenshot_b64": "",
+                            }
                         ws_files = self.file_manager.list_files()
                         decision = await self.brain.decide_next_step(
                             goal=self.current_goal,
@@ -385,7 +407,20 @@ class AgentOrchestrator:
                         })
                         continue
 
-                    # 2. GERBANG WAJIB FILE DELIVERABLE (Excel / Word / PDF / CSV jika diminta di instruksi!)
+                    # 1B. GERBANG VERIFIKASI SISTEM FOLDER / DIREKTORI SUNGGUHAN
+                    wants_folder_sys = any(
+                        fk in goal_low for fk in ("sistem folder", "buat folder", "buatkan folder", "struktur direktori", "├──")
+                    )
+                    if wants_folder_sys and not self._created_top_dirs and not self.file_manager.list_top_dirs() and step_num <= self.MAX_STEPS - 2:
+                        self.history.append({
+                            "step": step_num,
+                            "action_name": "verify_gate",
+                            "result": (
+                                "❌ DITOLAK SIMULASI SEMU: Instruksi meminta pembuatan folder/direktori SUNGGUHAN di file system, "
+                                "namun belum ada folder yang dibuat di disk! Gunakan 'make_dir' / 'write_file' / 'run_python' sekarang untuk membuat folder & file aslinya, lalu verifikasi dengan 'list_tree'!"
+                            ),
+                        })
+                        continue
                     req_file_ext = ""
                     if re.search(r"\b(buat(?:kan)?\s+(?:file\s+|laporan\s+)?excel|file\s+excel|\.xlsx)\b", goal_low):
                         req_file_ext = "xlsx"
@@ -534,7 +569,20 @@ class AgentOrchestrator:
                         summary_msg = f"{raw_summary}\n\n" + "\n\n".join(audit_parts)
                     else:
                         summary_msg = raw_summary
-                        if self._created_files_this_run:
+                        # Jika tugas membuat struktur folder (contoh PROJECT_ADMIN/), bungkus seluruh folder + subfolder kosongnya jadi .zip asli & kirim ke Telegram!
+                        zipped_bundles: List[str] = []
+                        for top_d in list(dict.fromkeys(self._created_top_dirs)):
+                            try:
+                                z_saved = self.file_manager.zip_directory(top_d)
+                                zipped_bundles.append(z_saved["name"])
+                                if self.telegram:
+                                    zf_path = self.file_manager.get_file_path(z_saved["name"])
+                                    await self.telegram.notify_file(z_saved["name"], zf_path.read_bytes())
+                            except Exception:
+                                pass
+                        if zipped_bundles:
+                            summary_msg += f"\n\n📦 Paket Folder Asli Terkirim: {', '.join(zipped_bundles)} (berisi seluruh struktur folder & file sungguhan)"
+                        elif self._created_files_this_run:
                             files_joined = ", ".join(dict.fromkeys(self._created_files_this_run))
                             if files_joined not in summary_msg:
                                 summary_msg += f"\n\n📎 File Dibuat & Dikirim: {files_joined}"
@@ -824,6 +872,7 @@ class AgentOrchestrator:
             if not py_code:
                 return "❌ Kode Python kosong."
             ws_dir = self.file_manager.base_dir
+            before_dirs = set(self.file_manager.list_top_dirs())
             before_snap = {
                 f["name"]: (f["size"], f["modified"])
                 for f in self.file_manager.list_files()
@@ -840,6 +889,10 @@ class AgentOrchestrator:
             except Exception as py_exc:
                 return f"❌ Gagal menjalankan Python ({str(py_exc)[:140]})."
 
+            for nd in self.file_manager.list_top_dirs():
+                if nd not in before_dirs and nd not in self._created_top_dirs:
+                    self._created_top_dirs.append(nd)
+
             after_files = self.file_manager.list_files()
             changed_names: List[str] = []
             for f in after_files:
@@ -850,10 +903,15 @@ class AgentOrchestrator:
                     changed_names.append(nm)
                     if nm not in self._created_files_this_run:
                         self._created_files_this_run.append(nm)
-                    fpath = self.file_manager.get_file_path(nm)
-                    await self._push_chat("file", f"File siap: {nm}", {"filename": nm, "size": f["size"]})
-                    if self.telegram:
-                        await self.telegram.notify_file(nm, fpath.read_bytes())
+                    if "/" in nm:
+                        top_seg = nm.split("/", 1)[0]
+                        if top_seg not in self._created_top_dirs:
+                            self._created_top_dirs.append(top_seg)
+                    else:
+                        fpath = self.file_manager.get_file_path(nm)
+                        await self._push_chat("file", f"File siap: {nm}", {"filename": nm, "size": f["size"]})
+                        if self.telegram:
+                            await self.telegram.notify_file(nm, fpath.read_bytes())
 
             if changed_names:
                 await self.broadcast({"type": "files_updated", "files": after_files})
@@ -866,6 +924,26 @@ class AgentOrchestrator:
             if proc.returncode != 0:
                 return f"❌ Python keluar dengan kode {proc.returncode}: {out_txt}{files_note}"
             return f"✅ Python berhasil dijalankan: {out_txt or '(tanpa output teks)'}{files_note}"
+
+        if act_name in ("make_dir", "mkdir"):
+            raw_p = str(action.get("path") or action.get("dirname") or action.get("filename") or "")
+            parts_p = [p.strip() for p in re.split(r"[,;\n]+", raw_p) if p.strip()]
+            if not parts_p:
+                return "❌ Path folder kosong."
+            made_list: List[str] = []
+            for p_item in parts_p:
+                d_res = self.file_manager.make_dir(p_item)
+                made_list.append(d_res["name"])
+                top_seg = d_res["name"].split("/", 1)[0]
+                if top_seg and top_seg not in self._created_top_dirs:
+                    self._created_top_dirs.append(top_seg)
+            return f"✅ Folder berhasil dibuat di disk: {', '.join(made_list)}"
+
+        if act_name in ("list_tree", "tree"):
+            rel_r = str(action.get("path") or action.get("dirname") or "")
+            tree_txt = self.file_manager.get_directory_tree(rel_r)
+            self.memory_notes[f"tree_{rel_r or 'root'}"] = tree_txt
+            return f"✅ Struktur Direktori Terverifikasi di Disk:\n{tree_txt}"
 
         if act_name == "list_files":
             flist = self.file_manager.list_files()
@@ -889,6 +967,10 @@ class AgentOrchestrator:
             )
             if saved["name"] not in self._created_files_this_run:
                 self._created_files_this_run.append(saved["name"])
+            if "/" in saved["name"]:
+                top_seg = saved["name"].split("/", 1)[0]
+                if top_seg and top_seg not in self._created_top_dirs:
+                    self._created_top_dirs.append(top_seg)
             self.memory_notes[f"file_dibuat_{saved['name']}"] = content[:2500]
             await self.broadcast({"type": "files_updated", "files": self.file_manager.list_files()})
             await self._push_chat(
@@ -897,7 +979,8 @@ class AgentOrchestrator:
                 {"filename": saved["name"], "size": saved["size"]},
             )
             fpath = self.file_manager.get_file_path(saved["name"])
-            if self.telegram:
+            # Jika file berada di root (bukan bagian dari proyek multi-folder yang akan dikirim utuh sebagai .zip), kirim langsung!
+            if self.telegram and "/" not in saved["name"]:
                 await self.telegram.notify_file(saved["name"], fpath.read_bytes())
 
             extra_sheet_info = ""
@@ -909,7 +992,7 @@ class AgentOrchestrator:
                     wb_i.close()
                 except Exception:
                     pass
-            return f"✅ File '{saved['name']}' berhasil dibuat & dikirim ke user ({saved['size']} bytes){extra_sheet_info}."
+            return f"✅ File '{saved['name']}' berhasil disimpan di disk ({saved['size']} bytes){extra_sheet_info}."
 
         return f"Action '{act_name}' tidak dikenali."
 

@@ -810,6 +810,63 @@ class AgentOrchestrator:
             cap_res = await self.browser.auto_solve_captcha(solver_fn=self.brain.solve_captcha_image)
             return cap_res or "Tidak ditemukan CAPTCHA gambar/hitungan yang perlu diisi di halaman ini."
 
+        if act_name == "run_js":
+            js_code = str(action.get("code") or action.get("script") or "")
+            js_out = await self.browser.run_page_js(js_code)
+            self.memory_notes[f"hasil_js_langkah_{step_num}"] = js_out[:2500]
+            return js_out
+
+        if act_name == "run_python":
+            import subprocess as _sp
+            import sys as _sys
+
+            py_code = str(action.get("code") or action.get("script") or "").strip()
+            if not py_code:
+                return "❌ Kode Python kosong."
+            ws_dir = self.file_manager.base_dir
+            before_snap = {
+                f["name"]: (f["size"], f["modified"])
+                for f in self.file_manager.list_files()
+            }
+            try:
+                proc = await asyncio.to_thread(
+                    _sp.run,
+                    [_sys.executable, "-I", "-c", py_code],
+                    cwd=str(ws_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=14,
+                )
+            except Exception as py_exc:
+                return f"❌ Gagal menjalankan Python ({str(py_exc)[:140]})."
+
+            after_files = self.file_manager.list_files()
+            changed_names: List[str] = []
+            for f in after_files:
+                nm = f["name"]
+                if nm.startswith(".") or nm in ("profil_pengajuan.json", "catatan_workspace.md"):
+                    continue
+                if nm not in before_snap or before_snap[nm] != (f["size"], f["modified"]):
+                    changed_names.append(nm)
+                    if nm not in self._created_files_this_run:
+                        self._created_files_this_run.append(nm)
+                    fpath = self.file_manager.get_file_path(nm)
+                    await self._push_chat("file", f"File siap: {nm}", {"filename": nm, "size": f["size"]})
+                    if self.telegram:
+                        await self.telegram.notify_file(nm, fpath.read_bytes())
+
+            if changed_names:
+                await self.broadcast({"type": "files_updated", "files": after_files})
+
+            out_txt = ((proc.stdout or "") + ("\n[STDERR]\n" + proc.stderr if proc.stderr else "")).strip()
+            if len(out_txt) > 3200:
+                out_txt = out_txt[:3200] + "... [dipotong]"
+            self.memory_notes[f"hasil_python_langkah_{step_num}"] = out_txt[:2500]
+            files_note = f" | File baru otomatis terkirim ke Telegram: {', '.join(changed_names)}" if changed_names else ""
+            if proc.returncode != 0:
+                return f"❌ Python keluar dengan kode {proc.returncode}: {out_txt}{files_note}"
+            return f"✅ Python berhasil dijalankan: {out_txt or '(tanpa output teks)'}{files_note}"
+
         if act_name == "list_files":
             flist = self.file_manager.list_files()
             summary = ", ".join(f["name"] for f in flist) or "(kosong)"

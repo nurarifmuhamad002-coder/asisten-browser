@@ -197,6 +197,8 @@ ATURAN RISET DATA WEB, KATALOG PRODUK, ANALISIS, & PEMBUATAN FILE:
 2. Hitung matematika (jumlah total, rata-rata presisi 2 desimal, nilai termurah/termahal, pengelompokan rating, dan filter kriteria seperti `Rating >= 4` DAN `Harga <= 30` beserta aturan prioritasnya) secara cermat & periksa ulang angkanya.
 3. WAJIB panggil `"write_file"` terlebih dahulu bila user meminta file Excel/Word/PDF dibuat. DILARANG KERAS memanggil `"done"` sebelum file benar-benar berhasil dibuat atau menulis kalimat gantung seperti *"saya akan melanjutkan..."* di dalam `"done"`! Pada `"done"`, jawab lengkap seluruh poin `LAPORAN AKHIR` yang diminta user.
 - `{"name": "append_file", "filename": "catatan.md", "content": "..."}` -> Tambahkan teks ke file di workspace.
+- `{"name": "run_js", "code": "return Array.from(document.querySelectorAll('...')).map(e => e.innerText)"}` -> Jalankan JavaScript langsung di halaman browser aktif! Gunakan secara proaktif kapan pun ada data tersembunyi di atribut HTML/CSS/Shadow DOM, tabel besar puluhan baris yang perlu diekstrak cepat 100% akurat sekaligus, atau tombol/elemen custom yang sulit diklik biasa.
+- `{"name": "run_python", "code": "import openpyxl ..."}` -> Jalankan kode Python 3 langsung di folder workspace (`openpyxl`, `docx`, `reportlab`, `csv`, `json`, `statistics`, `math` siap pakai)! Gunakan untuk perhitungan angka/statistik rumit agar 0% salah hitung, mengolah data besar, atau membuat file Excel multi-sheet berformula / Word / PDF kustom (setiap file yang disimpan di folder kerja otomatis terkirim ke Telegram user!).
 - `{"name": "solve_captcha"}` -> Baca, hitung, dan isi otomatis CAPTCHA gambar/matematika/teks yang ada di halaman saat ini menggunakan AI Vision! (Gunakan kapan saja ada CAPTCHA gambar/penjumlahan angka di formulir atau setelah mengisi username/password).
 - `{"name": "request_human_login", "reason": "Silakan login ke akun kamu terlebih dahulu di layar browser."}` -> Jeda agent & serahkan kontrol ke user untuk login akun pribadi / OTP.
 - `{"name": "ask_approval", "index": 9, "reason": "Konfirmasi pembayaran sebesar Rp ..."}` -> Minta izin user sebelum mengeksekusi elemen sensitif [index].
@@ -242,7 +244,12 @@ def _extract_json(raw_text: str) -> Dict[str, Any]:
 class LLMConfig:
     def __init__(self) -> None:
         self.provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()
-        self.model: str = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite-preview")
+        raw_env_model = os.getenv("LLM_MODEL", "").strip()
+        # Otomatis naikkan dari flash-lite lama ke otak penalaran penuh gemini-3.5-flash!
+        if not raw_env_model or "flash-lite" in raw_env_model:
+            self.model: str = "gemini-3.5-flash"
+        else:
+            self.model = raw_env_model
         self.api_key: str = (
             os.getenv("LLM_API_KEY")
             or os.getenv("GEMINI_API_KEY")
@@ -270,10 +277,10 @@ class LLMConfig:
     @staticmethod
     def _default_model(provider: str) -> str:
         defaults = {
-            "gemini": "gemini-3.1-flash-lite-preview",
+            "gemini": "gemini-3.5-flash",
             "openai": "gpt-4o",
             "anthropic": "claude-sonnet-4-20250514",
-            "openrouter": "google/gemini-3.1-flash-lite",
+            "openrouter": "google/gemini-3.5-flash",
         }
         return defaults.get(provider, "gpt-4o")
 
@@ -301,6 +308,7 @@ class MultiLLMBrain:
     def __init__(self, config: LLMConfig):
         self.config = config
         self.autopilot = SmartAutopilotPlanner()
+        self._rr_idx: int = 0
 
     async def quick_chat(
         self,
@@ -339,23 +347,29 @@ class MultiLLMBrain:
         prompt = f"{mem_part}{hist_block}{live_ctx}USER: {message}"
 
         if self.config.provider == "gemini":
-            # Urutan model tercepat dari hasil benchmark nyata (~1.1s vs 5.5s!) + Hedged Racing anti-ngelag
-            fast_order = ["gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
-            if self.config.model and self.config.model not in fast_order:
+            smart_chat_pool = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.6-flash"]
+            rot = self._rr_idx % len(smart_chat_pool)
+            self._rr_idx += 1
+            fast_order = smart_chat_pool[rot:] + smart_chat_pool[:rot] + ["gemini-3.1-flash-lite-preview"]
+            if self.config.model and "flash-lite" not in self.config.model and self.config.model not in fast_order:
                 fast_order.insert(0, self.config.model)
-            payload = {
-                "system_instruction": {"parts": [{"text": chat_sys}]},
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.45, "maxOutputTokens": 650},
-            }
             client = get_shared_http()
 
             async def _try_one(m_name: str) -> Optional[str]:
+                gen_cfg: Dict[str, Any] = {"temperature": 0.4, "maxOutputTokens": 900}
+                if "flash-lite" not in m_name:
+                    gen_cfg["thinkingConfig"] = {"thinkingBudget": 256}
+                payload = {
+                    "system_instruction": {"parts": [{"text": chat_sys}]},
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": gen_cfg,
+                }
                 u = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}"
                 try:
-                    r = await client.post(u, json=payload, timeout=10.0)
+                    r = await client.post(u, json=payload, timeout=11.0)
                     if r.status_code == 200:
-                        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        parts_out = r.json()["candidates"][0]["content"]["parts"]
+                        return "".join(p.get("text", "") for p in parts_out if not p.get("thought")).strip()
                 except Exception:
                     pass
                 return None
@@ -674,8 +688,13 @@ class MultiLLMBrain:
 
     async def _call_gemini(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         import asyncio as _aio
-        candidates = ["gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
-        if self.config.model and self.config.model not in candidates:
+        # Pool 3 Otak Penalaran Penuh (kuota terpisah 3x lipat + jauh lebih pintar dari flash-lite!),
+        # dengan flash-lite HANYA sebagai cadangan darurat paling akhir jika ketiganya sedang 429.
+        smart_pool = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.6-flash"]
+        rot = self._rr_idx % len(smart_pool)
+        self._rr_idx += 1
+        candidates = smart_pool[rot:] + smart_pool[:rot] + ["gemini-3.1-flash-lite-preview"]
+        if self.config.model and "flash-lite" not in self.config.model and self.config.model not in candidates:
             candidates.insert(0, self.config.model)
 
         last_err = ""
@@ -686,13 +705,16 @@ class MultiLLMBrain:
             parts: List[Dict[str, Any]] = [{"text": prompt_text}]
             if include_img and screenshot_b64:
                 parts.append({"inline_data": {"mime_type": "image/jpeg", "data": screenshot_b64}})
+            gen_cfg: Dict[str, Any] = {
+                "temperature": 0.15,
+                "responseMimeType": "application/json",
+            }
+            if "flash-lite" not in m_name:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 384}
             payload = {
                 "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
                 "contents": [{"role": "user", "parts": parts}],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "responseMimeType": "application/json",
-                },
+                "generationConfig": gen_cfg,
             }
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={self.config.api_key}"
             try:
@@ -709,7 +731,7 @@ class MultiLLMBrain:
                 if not cands:
                     return None
                 parts_out = (cands[0].get("content") or {}).get("parts") or []
-                text = "".join(p.get("text", "") for p in parts_out).strip()
+                text = "".join(p.get("text", "") for p in parts_out if not p.get("thought")).strip()
                 parsed = _extract_json(text)
                 if isinstance(parsed, dict) and parsed.get("action"):
                     return parsed
@@ -717,7 +739,7 @@ class MultiLLMBrain:
                 last_err = f"Format JSON melenceng pada {m_name} ({type(parse_exc).__name__})"
             return None
 
-        # Hedged Racing untuk langkah Browser Agent: jika model #1 antri > 4.5 detik, langsung balapkan model #2 paralel!
+        # Hedged Racing untuk langkah Browser Agent: jika model #1 antri > 4.5 detik (atau 429 instan), langsung balapkan model #2 & #3!
         for include_img in ([True, False] if screenshot_b64 else [False]):
             t1 = _aio.create_task(_try_step_model(candidates[0], include_img))
             done, _ = await _aio.wait({t1}, timeout=4.5)
@@ -739,10 +761,10 @@ class MultiLLMBrain:
             for p in pending:
                 p.cancel()
 
-            if len(candidates) > 2:
-                res3 = await _try_step_model(candidates[2], include_img)
-                if res3:
-                    return res3
+            for extra_m in candidates[2:]:
+                res_extra = await _try_step_model(extra_m, include_img)
+                if res_extra:
+                    return res_extra
 
         raise RuntimeError(last_err or "Server AI sedang padat sesaat, coba kirim ulang 5 detik lagi.")
 

@@ -1576,6 +1576,35 @@ class CloudBrowserEngine:
         await self._refresh_if_watched()
         return f"✅ Berhasil memilih opsi '{selected_txt}' pada dropdown '{(target_el or {}).get('label') or index}'."
 
+    async def run_page_js(self, js_code: str) -> str:
+        """
+        Mengeksekusi skrip JavaScript langsung di halaman aktif (untuk ekstraksi data kompleks,
+        membaca atribut/Shadow DOM tersembunyi, atau interaksi widget custom yang tidak standar).
+        """
+        await self.ensure_alive()
+        if not self.page:
+            raise RuntimeError("Browser belum aktif.")
+        code = (js_code or "").strip()
+        if not code:
+            return "❌ Kode JavaScript kosong."
+        wrapped = (
+            f"async () => {{ {code} }}"
+            if ("return " in code or ";" in code or "\n" in code)
+            else f"async () => ({code})"
+        )
+        try:
+            res = await asyncio.wait_for(self.page.evaluate(wrapped), timeout=6.0)
+            await self._refresh_if_watched()
+            if isinstance(res, (dict, list)):
+                out = json.dumps(res, ensure_ascii=False)
+            else:
+                out = "" if res is None else str(res)
+            if len(out) > 4000:
+                out = out[:4000] + "... [dipotong]"
+            return f"✅ Hasil JS ({len(out)} karakter): {out or '(selesai tanpa return value)'}"
+        except Exception as exc:
+            return f"❌ Error eksekusi JS di halaman: {str(exc)[:180]}"
+
     async def scroll_page(self, direction: str = "down", amount: int = 520) -> str:
         if not self.page:
             raise RuntimeError("Browser belum aktif.")

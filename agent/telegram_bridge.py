@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 import httpx
 
 from agent.llm_providers import get_shared_http
+from agent.security import PersistentSecurityState, redact_secrets, register_runtime_secret
 
 if TYPE_CHECKING:
     from agent.orchestrator import AgentOrchestrator
@@ -30,6 +31,8 @@ BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "tugas", "description": "Mode Kerjain Tugas Otomatis di Web"},
     {"command": "buka", "description": "Buka Website & Login Aman"},
     {"command": "layar", "description": "Kirim Foto Layar Browser Sekarang"},
+    {"command": "status_tugas", "description": "Cek Status & Checkpoint Tugas Terakhir"},
+    {"command": "lanjut", "description": "Lanjutkan Tugas dari Checkpoint Terakhir"},
     {"command": "kunci", "description": "Kunci Bot & Web Khusus HP Lu"},
     {"command": "stop", "description": "Hentikan Proses Saat Ini"},
 ]
@@ -44,9 +47,14 @@ class TelegramBotBridge:
     4. 🔒 Keamanan (Private Lock) — Kunci bot & layar web live khusus pemilik tunggal
     """
 
-    def __init__(self) -> None:
+    def __init__(self, state_dir: Optional[str] = None) -> None:
         self.token: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        register_runtime_secret(self.token)
         self.orchestrator: Optional["AgentOrchestrator"] = None
+
+        sec_dir = Path(state_dir or os.getenv("BROWSER_PROFILE_DIR", "/tmp/nusa_operator_profile"))
+        self._sec_store = PersistentSecurityState(sec_dir)
+        saved_sec = self._sec_store.load()
 
         render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
         railway_dom = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
@@ -62,11 +70,31 @@ class TelegramBotBridge:
             render_url or railway_dom or space_host or os.getenv("PUBLIC_WEB_URL", "").strip().startswith("https://")
         )
 
-        # Private Owner Lock
+        # Private Owner Lock (Environment Variable > Persisted Disk State)
         raw_owner = os.getenv("TELEGRAM_OWNER_ID", "").strip()
-        self.owner_id: Optional[int] = int(raw_owner) if raw_owner.isdigit() else None
-        self.owner_label: str = f"ID {self.owner_id}" if self.owner_id else ""
-        self.web_access_key: str = os.getenv("WEB_ACCESS_PIN", "").strip() or str(100000 + secrets.randbelow(900000))
+        persisted_owner = saved_sec.get("owner_id")
+        if raw_owner.isdigit():
+            self.owner_id: Optional[int] = int(raw_owner)
+        elif isinstance(persisted_owner, int) and persisted_owner > 0:
+            self.owner_id = persisted_owner
+        else:
+            self.owner_id = None
+
+        self.owner_label: str = saved_sec.get("owner_label") or (f"ID {self.owner_id}" if self.owner_id else "")
+        self.web_access_key: str = (
+            os.getenv("WEB_ACCESS_PIN", "").strip()
+            or str(saved_sec.get("web_access_key") or "")
+            or str(100000 + secrets.randbelow(900000))
+        )
+        self.webhook_secret: str = (
+            os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+            or str(saved_sec.get("webhook_secret") or "")
+            or PersistentSecurityState.generate_webhook_secret()
+        )
+        self._webhook_secret_registered: bool = False
+        register_runtime_secret(self.web_access_key)
+        register_runtime_secret(self.webhook_secret)
+        self._persist_security()
 
         self.active_chat_ids: Set[int] = {self.owner_id} if self.owner_id else set()
         self.chat_modes: Dict[int, str] = {}  # "chat" | "agent" | "open_web"
@@ -81,6 +109,23 @@ class TelegramBotBridge:
         self._poll_task: Optional[asyncio.Task] = None
         self._offset: int = 0
         self.bot_username: str = ""
+
+    def _persist_security(self) -> None:
+        try:
+            self._sec_store.save(
+                owner_id=self.owner_id,
+                owner_label=self.owner_label,
+                web_access_key=self.web_access_key,
+                webhook_secret=self.webhook_secret,
+            )
+        except Exception:
+            pass
+
+    def verify_webhook_request(self, header_secret: Optional[str]) -> bool:
+        """Memverifikasi header X-Telegram-Bot-Api-Secret-Token jika webhook sudah didaftarkan dengan secret_token."""
+        if not self._webhook_secret_registered:
+            return True
+        return bool(header_secret and secrets.compare_digest(header_secret, self.webhook_secret))
 
     def attach_orchestrator(self, orchestrator: "AgentOrchestrator") -> None:
         self.orchestrator = orchestrator
@@ -133,6 +178,7 @@ class TelegramBotBridge:
         self.bot_username = data["result"].get("username", "")
 
         self.token = clean
+        register_runtime_secret(clean)
         try:
             await client.post(
                 f"https://api.telegram.org/bot{clean}/setMyCommands",
@@ -144,15 +190,23 @@ class TelegramBotBridge:
 
         if self.use_webhook and self.public_web_url.startswith("https://"):
             wh_url = self.public_web_url.rstrip("/") + "/api/telegram/webhook"
-            await client.post(
+            wh_resp = await client.post(
                 f"https://api.telegram.org/bot{clean}/setWebhook",
-                json={"url": wh_url, "drop_pending_updates": False},
+                json={
+                    "url": wh_url,
+                    "drop_pending_updates": False,
+                    "secret_token": self.webhook_secret,
+                },
                 timeout=12.0,
             )
+            if wh_resp.status_code == 200 and wh_resp.json().get("ok"):
+                self._webhook_secret_registered = True
         else:
+            self._webhook_secret_registered = False
             await client.post(f"https://api.telegram.org/bot{clean}/deleteWebhook", timeout=10.0)
             self._poll_task = asyncio.create_task(self._poll_loop())
 
+        self._persist_security()
         return self.public_dict()
 
     async def start_if_env_set(self) -> None:
@@ -213,6 +267,7 @@ class TelegramBotBridge:
         self.owner_label = f"{fname} (@{uname})" if uname else f"{fname} (ID: {user_id})"
         # Bersihkan chat_id lain agar notifikasi hanya masuk ke pemilik tunggal
         self.active_chat_ids = {user_id}
+        self._persist_security()
 
     async def _send_security_panel(self, chat_id: int, user_id: int) -> None:
         if self.is_locked:
@@ -307,12 +362,15 @@ class TelegramBotBridge:
             if data == "unlock_owner":
                 self.owner_id = None
                 self.owner_label = ""
+                self._persist_security()
                 await self._answer_cb(cb_id, "🔓 Kunci dibuka sementara.")
                 await self._send_security_panel(chat_id, sender_id)
                 return
 
             if data == "regen_pin":
                 self.web_access_key = str(100000 + secrets.randbelow(900000))
+                register_runtime_secret(self.web_access_key)
+                self._persist_security()
                 await self._answer_cb(cb_id, f"PIN baru dibuat: {self.web_access_key}")
                 await self._send_security_panel(chat_id, sender_id)
                 return
@@ -330,8 +388,7 @@ class TelegramBotBridge:
                 self.start_progress_heartbeat()
                 await self._answer_cb(cb_id, "Melanjutkan pekerjaan...")
             elif data == "stop_running":
-                await self.orchestrator.stop_goal()
-                await self._finalize_progress_cards("⏹️ PEKERJAAN DIHENTIKAN OLEH LU")
+                await self.orchestrator.stop_goal(silent=False)
                 await self._answer_cb(cb_id, "Pekerjaan dihentikan.")
             elif data == "clear_user_mem":
                 self.orchestrator.clear_user_memories()
@@ -391,9 +448,28 @@ class TelegramBotBridge:
                     await self.send_text(chat_id, f"Gagal mengambil file: {exc}")
             elif data.startswith("rm_file:"):
                 fname = data.split(":", 1)[1]
+                await self._answer_cb(cb_id, "Konfirmasi penghapusan diperlukan")
+                kb_confirm = {
+                    "inline_keyboard": [
+                        [
+                            {"text": f"✅ Ya, Hapus '{fname[:24]}'", "callback_data": f"confirm_rm:{fname}"},
+                            {"text": "❌ Batal", "callback_data": "cancel_rm"},
+                        ]
+                    ]
+                }
+                await self.send_text(
+                    chat_id,
+                    f"🛡️ Konfirmasi Penghapusan File:\nYakin ingin menghapus permanen file `{fname}` dari Workspace?",
+                    reply_markup=kb_confirm,
+                )
+            elif data.startswith("confirm_rm:"):
+                fname = data.split(":", 1)[1]
                 self.orchestrator.file_manager.delete_file(fname)
                 await self._answer_cb(cb_id, f"🗑️ {fname} dihapus!")
                 await self.send_text(chat_id, f"🗑️ File '{fname}' berhasil dihapus dari Workspace.", reply_markup=MAIN_MENU_KB)
+            elif data == "cancel_rm":
+                await self._answer_cb(cb_id, "Penghapusan dibatalkan.")
+                await self.send_text(chat_id, "✅ Penghapusan file dibatalkan.", reply_markup=MAIN_MENU_KB)
             return
 
         # -------------------- PHOTO / DOCUMENT / TEXT MESSAGES --------------------
@@ -682,6 +758,24 @@ class TelegramBotBridge:
             )
             return
 
+        # Periksa status pekerjaan terakhir yang tersimpan di TaskStateStore
+        if low in ("/status_tugas", "/riwayat_tugas"):
+            latest_t = self.orchestrator.task_store.get_latest_task()
+            if not latest_t:
+                await self.send_text(chat_id, "📋 Belum ada riwayat tugas yang tercatat.", reply_markup=MAIN_MENU_KB)
+            else:
+                ver_s = (latest_t.get("verification_result") or {}).get("summary") or "-"
+                txt_st = (
+                    f"📋 STATUS TUGAS TERAKHIR ({latest_t.get('task_id')})\n"
+                    f"• Nama: {latest_t.get('title')}\n"
+                    f"• Status: {latest_t.get('status')}\n"
+                    f"• Langkah Selesai: {len(latest_t.get('completed_steps', []))} | Gagal: {len(latest_t.get('failed_steps', []))}\n"
+                    f"• URL Terverifikasi: {latest_t.get('last_verified_url') or '-'}\n"
+                    f"• Verifikasi: {ver_s}"
+                )
+                await self.send_text(chat_id, txt_st, reply_markup=MAIN_MENU_KB)
+            return
+
         # Backward compatibility bila tombol/command lama ditekan
         if text in ("💬 Ngobrol AI", "📝 Kerjain Tugas Web") or low in ("/ngobrol", "/tugas"):
             self.chat_modes[chat_id] = "auto"
@@ -937,7 +1031,11 @@ class TelegramBotBridge:
         if open_match and (has_task_verb or any(w in low for w in (" lalu ", " terus ", " cari ", " cek ", " baca ", " rangkum"))):
             return ("agent", text)
 
-        if any(low.startswith(p) for p in ("klik ", "pencet ", "isi ", "ketik ", "scroll ", "geser ", "pilih ")):
+        if low in ("lanjut", "lanjutkan", "teruskan", "/lanjut", "resume", "/resume"):
+            if self.orchestrator and (self.orchestrator.history or self.orchestrator.task_store.get_resumable_context()):
+                return ("agent", "lanjut")
+
+        if any(low.startswith(p) for p in ("klik ", "pencet ", "isi ", "ketik ", "scroll ", "geser ", "pilih ", "hapus file ")):
             return ("agent", text)
 
         # 3B. TUGAS FILE SYSTEM / STRUKTUR FOLDER / PYTHON DATA / MULTI-STEP AGENT (Mesin punya akses penuh ke folder, file, & Python!)
@@ -1271,7 +1369,8 @@ class TelegramBotBridge:
     ) -> None:
         if not self.token:
             return
-        payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text[:3900]}
+        safe_txt = redact_secrets(text)[:3900]
+        payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": safe_txt}
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         try:
@@ -1289,7 +1388,7 @@ class TelegramBotBridge:
         try:
             await get_shared_http().post(
                 f"https://api.telegram.org/bot{self.token}/answerCallbackQuery",
-                json={"callback_query_id": cb_id, "text": text},
+                json={"callback_query_id": cb_id, "text": redact_secrets(text)[:190]},
                 timeout=8.0,
             )
         except Exception:
@@ -1298,7 +1397,8 @@ class TelegramBotBridge:
     async def send_text(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Optional[int]:
         if not self.token:
             return None
-        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text[:3900]}
+        safe_txt = redact_secrets(text)[:3900]
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": safe_txt}
         if reply_markup:
             payload["reply_markup"] = reply_markup
         try:
@@ -1339,7 +1439,7 @@ class TelegramBotBridge:
         if not self.token or not photo_b64:
             return
         raw_bytes = base64.b64decode(photo_b64)
-        data: Dict[str, Any] = {"chat_id": str(chat_id), "caption": caption[:950]}
+        data: Dict[str, Any] = {"chat_id": str(chat_id), "caption": redact_secrets(caption)[:950]}
         if reply_markup:
             data["reply_markup"] = json.dumps(reply_markup)
         files = {"photo": ("screen.jpg", raw_bytes, "image/jpeg")}
@@ -1348,7 +1448,7 @@ class TelegramBotBridge:
     async def send_document(self, chat_id: int, filename: str, file_bytes: bytes, caption: str = "") -> None:
         if not self.token:
             return
-        data = {"chat_id": str(chat_id), "caption": caption[:950]}
+        data = {"chat_id": str(chat_id), "caption": redact_secrets(caption)[:950]}
         files = {"document": (filename, file_bytes)}
         await get_shared_http().post(f"https://api.telegram.org/bot{self.token}/sendDocument", data=data, files=files, timeout=22.0)
 
@@ -1392,10 +1492,10 @@ class TelegramBotBridge:
     async def notify_approval(self, sens_report: Dict[str, Any], frame_b64: str) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
-        await self._finalize_progress_cards("⏸️ DIJEDA SEBENTAR — Menunggu Persetujuan Lu")
+        await self._finalize_progress_cards("🛡️ MENUNGGU PERSETUJUAN — Butuh Izin Lu")
         caption = (
-            f"🛡️ Minta Izin Dulu Bro ({sens_report.get('category', '')})\n"
-            f"Mau klik tombol: [{sens_report.get('target_label', '')}]\n"
+            f"🛡️ STATUS: MENUNGGU PERSETUJUAN ({sens_report.get('category', 'Tindakan Sensitif')})\n"
+            f"Target: [{sens_report.get('target_label', '')}]\n"
             f"{sens_report.get('reason', '')}"
         )
         markup = {
@@ -1426,6 +1526,7 @@ class TelegramBotBridge:
         elapsed_sec: Optional[int] = None,
         total_steps: Optional[int] = None,
         proof_frame_b64: str = "",
+        final_status: Optional[str] = None,
     ) -> None:
         if not self.is_configured or not self.active_chat_ids:
             return
@@ -1433,11 +1534,21 @@ class TelegramBotBridge:
         el_s = elapsed_sec or (max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1)
         st_cnt = total_steps if total_steps is not None else (len(self.orchestrator.history) if self.orchestrator else 0)
         step_lbl = f" · {st_cnt} langkah" if st_cnt > 0 else ""
-        clean = summary.replace("**", "").strip()
-        is_failure = clean.startswith("❌") or clean.startswith("⚠️") or clean.startswith("🚫") or "GAGAL Verifikasi" in clean or "BELUM SESUAI" in clean.upper()
-        await self._finalize_progress_cards(
-            f"⚠️ PEKERJAAN TERHENTI ({el_s} dtk{step_lbl})" if is_failure else f"✅ PEKERJAAN TUNTAS ({el_s} dtk{step_lbl})!"
-        )
+        clean = redact_secrets(summary).replace("**", "").strip()
+
+        norm_st = (final_status or "").upper().strip()
+        if not norm_st:
+            is_fail_guess = clean.startswith("❌") or clean.startswith("⚠️") or clean.startswith("🚫") or "GAGAL Verifikasi" in clean
+            norm_st = "GAGAL" if is_fail_guess else "BERHASIL"
+
+        header_map = {
+            "BERHASIL": f"✅ STATUS: BERHASIL ({el_s} dtk{step_lbl})!",
+            "GAGAL": f"❌ STATUS: GAGAL ({el_s} dtk{step_lbl})",
+            "SEBAGIAN BERHASIL": f"⚠️ STATUS: SEBAGIAN BERHASIL ({el_s} dtk{step_lbl})",
+            "MENUNGGU PERSETUJUAN": f"🛡️ STATUS: MENUNGGU PERSETUJUAN ({el_s} dtk{step_lbl})",
+            "TERHENTI": f"⏹️ STATUS: TERHENTI ({el_s} dtk{step_lbl})",
+        }
+        await self._finalize_progress_cards(header_map.get(norm_st, f"📋 SELESAI ({el_s} dtk{step_lbl})"))
         export_kb = {
             "inline_keyboard": [
                 [
@@ -1447,13 +1558,19 @@ class TelegramBotBridge:
                 ]
             ]
         }
-        out_msg = clean if is_failure else f"✅ Beres!\n\n{clean}"
+        is_non_success = norm_st != "BERHASIL"
+        out_msg = clean if (is_non_success or clean.startswith("✅")) else f"✅ Beres!\n\n{clean}"
         targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
         for cid in targets:
-            self.last_output_text[cid] = summary
-            if proof_frame_b64 and not is_failure:
-                await self.send_photo_b64(cid, proof_frame_b64, "📸 Bukti layar hasil eksekusi akhir:")
-            await self.send_text(cid, out_msg, reply_markup=(MAIN_MENU_KB if is_failure else export_kb))
+            self.last_output_text[cid] = clean
+            if proof_frame_b64:
+                cap_lbl = (
+                    "📸 Bukti layar hasil eksekusi akhir:"
+                    if norm_st == "BERHASIL"
+                    else f"📸 Bukti layar saat status {norm_st}:"
+                )
+                await self.send_photo_b64(cid, proof_frame_b64, cap_lbl)
+            await self.send_text(cid, out_msg, reply_markup=(MAIN_MENU_KB if is_non_success else export_kb))
 
     async def send_to_all(self, message: str) -> None:
         if not self.is_configured or not self.active_chat_ids:

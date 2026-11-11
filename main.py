@@ -409,7 +409,7 @@ async def upload_workspace_file(file: UploadFile = File(...)):
     return {"ok": True, "file": saved}
 
 
-@app.delete("/api/files/{filename}")
+@app.delete("/api/files/{filename:path}")
 async def remove_workspace_file(filename: str):
     file_manager.delete_file(filename)
     await broadcast_event({"type": "files_updated", "files": file_manager.list_files()})
@@ -470,6 +470,9 @@ async def deploy_to_huggingface(payload: HfDeployPayload):
 
 @app.post("/api/telegram/webhook")
 async def telegram_webhook_endpoint(request: Request):
+    sec_hdr = request.headers.get("x-telegram-bot-api-secret-token")
+    if not telegram_bridge.verify_webhook_request(sec_hdr):
+        raise HTTPException(status_code=403, detail="Invalid webhook secret token")
     upd = await request.json()
     await telegram_bridge.process_webhook_update(upd)
     return {"ok": True}

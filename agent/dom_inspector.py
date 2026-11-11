@@ -4,6 +4,23 @@ from playwright.async_api import Page
 INSPECT_DOM_JS = """
 (options) => {
     const showBadges = !!(options && options.showBadges);
+    if (!document.getElementById('__nusa_cred_mask__') && (document.head || document.documentElement)) {
+        const mst = document.createElement('style');
+        mst.id = '__nusa_cred_mask__';
+        mst.textContent = `
+            input[type="password"],
+            input[autocomplete="one-time-code"],
+            input[autocomplete^="cc-"],
+            input[name*="otp" i], input[id*="otp" i],
+            input[name*="pin" i], input[id*="pin" i],
+            input[name*="cvv" i], input[id*="cvv" i],
+            input[name*="api_key" i], input[name*="apikey" i],
+            input[name*="secret" i], input[name*="token" i] {
+                -webkit-text-security: disc !important;
+            }
+        `;
+        (document.head || document.documentElement).appendChild(mst);
+    }
     const oldOverlay = document.getElementById('__nusa_som_overlay__');
     if (oldOverlay) oldOverlay.remove();
     document.querySelectorAll('[data-nusa-idx]').forEach(el => el.removeAttribute('data-nusa-idx'));
@@ -445,11 +462,58 @@ INSPECT_DOM_JS = """
     );
     const wasValidated = !!document.querySelector('form.was-validated, .is-invalid, input:invalid:focus');
 
+    // Ekstrak pesan error dari website / validasi form secara eksplisit untuk Error Recovery Engine
+    const pageErrors = [];
+    const seenErrs = new Set();
+    const errSelectors = '[role="alert"], .alert-danger, .alert-error, .error-message, .invalid-feedback, .form-error, .toast-error, [class*="error-msg" i], [data-test="error"]';
+    for (const en of document.querySelectorAll(errSelectors)) {
+        if (!isBoxRendered(en, true)) continue;
+        const et = (en.innerText || '').trim().replace(/\\s+/g, ' ');
+        if (et.length >= 3 && et.length <= 220 && !seenErrs.has(et)) {
+            seenErrs.add(et);
+            pageErrors.push(et);
+            if (pageErrors.length >= 10) break;
+        }
+    }
+    const titleLow = (document.title || '').toLowerCase();
+    if (/^(403|404|500|502|503|504)\\b|not found|bad gateway|service unavailable|access denied/i.test(titleLow)) {
+        const httpBanner = `HTTP/Halaman Error terdeteksi pada judul: ${document.title}`;
+        if (!seenErrs.has(httpBanner)) pageErrors.push(httpBanner);
+    }
+    if (wasValidated) {
+        for (const inv of document.querySelectorAll('form :invalid')) {
+            const tag = (inv.tagName || '').toLowerCase();
+            if (tag === 'form' || tag === 'fieldset') continue;
+            const vm = (inv.validationMessage || '').trim();
+            const fn = inv.getAttribute('placeholder') || inv.getAttribute('name') || inv.id || tag;
+            if (vm) {
+                const msgNat = `Field '${fn}': ${vm}`;
+                if (!seenErrs.has(msgNat) && pageErrors.length < 10) {
+                    seenErrs.add(msgNat);
+                    pageErrors.push(msgNat);
+                }
+            }
+        }
+    }
+
+    // Ringkasan sidik jari DOM ringan untuk mendeteksi apakah aksi benar-benar mengubah halaman (DOM delta)
+    const stateParts = [
+        window.location.href,
+        modalTitle,
+        String(elements.length),
+        String(resultTable.length),
+        elements.slice(0, 40).map(e => `${e.index}:${e.value}:${e.checked ? 1 : 0}:${e.disabled ? 1 : 0}`).join('|'),
+        pageErrors.join('|')
+    ];
+    const domSignature = stateParts.join('~').slice(0, 900);
+
     return {
         url: window.location.href,
         title: document.title || '',
         modal_title: modalTitle,
         was_validated: wasValidated,
+        page_errors: pageErrors,
+        dom_signature: domSignature,
         result_table: resultTable,
         catalog_items: catalogItems,
         single_page_rating: singlePageRating,
@@ -486,6 +550,8 @@ async def inspect_page(page: Page, show_badges: bool = False) -> Dict[str, Any]:
             "title": "",
             "modal_title": "",
             "was_validated": False,
+            "page_errors": [f"Gagal membaca DOM sementara: {exc}"],
+            "dom_signature": f"err~{page.url}",
             "result_table": [],
             "scroll": {"y": 0, "maxY": 0, "viewportHeight": 600, "viewportWidth": 800},
             "signals": {"has_password_field": False, "has_otp_field": False, "has_captcha": False},
@@ -517,6 +583,12 @@ def format_dom_for_llm(dom_state: Dict[str, Any]) -> str:
     active_signals = [k for k, v in signals.items() if v]
     if active_signals:
         lines.append(f"SINYAL KEAMANAN HALAMAN: {', '.join(active_signals)} (JANGAN ketik password sendiri, gunakan request_human_login!)")
+
+    page_errors: List[str] = dom_state.get("page_errors") or []
+    if page_errors:
+        lines.append("\n=== PESAN ERROR / PERINGATAN WEBSITE TERDETEKSI ===")
+        for pe in page_errors[:8]:
+            lines.append(f"- [ERROR WEB]: {pe}")
 
     # Tampilkan Tabel Hasil Submit paling atas jika muncul agar AI wajib memverifikasi tiap baris!
     result_table: List[Dict[str, str]] = dom_state.get("result_table") or []

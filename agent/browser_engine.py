@@ -9,6 +9,7 @@ from playwright.async_api import Browser, BrowserContext, CDPSession, Download, 
 
 from agent.dom_inspector import clear_som_badges, inspect_page
 from agent.file_manager import WorkspaceFileManager
+from agent.security import redact_secrets, register_runtime_secret
 
 
 class CloudBrowserEngine:
@@ -294,7 +295,32 @@ class CloudBrowserEngine:
 
         self.context = await self._browser.new_context(**ctx_kwargs)
         await self.context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            """() => {
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                const maskCss = `
+                    input[type="password"],
+                    input[autocomplete="one-time-code"],
+                    input[autocomplete^="cc-"],
+                    input[name*="otp" i], input[id*="otp" i],
+                    input[name*="pin" i], input[id*="pin" i],
+                    input[name*="cvv" i], input[id*="cvv" i],
+                    input[name*="api_key" i], input[name*="apikey" i],
+                    input[name*="secret" i], input[name*="token" i] {
+                        -webkit-text-security: disc !important;
+                    }
+                `;
+                const injectMask = () => {
+                    const root = document.head || document.documentElement;
+                    if (root && !document.getElementById('__nusa_cred_mask__')) {
+                        const st = document.createElement('style');
+                        st.id = '__nusa_cred_mask__';
+                        st.textContent = maskCss;
+                        root.appendChild(st);
+                    }
+                };
+                injectMask();
+                document.addEventListener('DOMContentLoaded', injectMask);
+            }"""
         )
 
         # Filter agresif hemat RAM: blokir video/font/iklan/websocket berat, dan blokir gambar dekoratif saat layar tidak ditonton user
@@ -855,9 +881,66 @@ class CloudBrowserEngine:
         asyncio.create_task(self.save_state())
         await self._refresh_if_watched()
         title = await self._safe_title()
+        disp_now = self._display_url(self.page.url)
         if status_code == 403:
-            return f"Membuka {self._display_url(self.page.url)} ({title}) — Catatan: Situs ini menampilkan 403/Anti-Bot terhadap IP server cloud."
-        return f"Berhasil membuka {self._display_url(self.page.url)} ({title})"
+            return f"Membuka {disp_now} ({title}) — Catatan: Situs ini menampilkan 403/Anti-Bot terhadap IP server cloud."
+        if disp_now and not disp_now.startswith(("about:", "chrome-error://")):
+            self.last_real_url = disp_now
+        return f"Berhasil membuka {disp_now} ({title})"
+
+    async def wait_for_page_stable(self, timeout_ms: int = 3200) -> bool:
+        """Menunggu halaman selesai memuat DOM & stabil setelah navigasi atau aksi klik."""
+        if not self.page or self.page.is_closed():
+            return False
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            try:
+                has_body = await asyncio.wait_for(
+                    self.page.evaluate("() => Boolean(document.body && document.body.innerText && document.body.innerText.trim().length > 60)"),
+                    timeout=1.2,
+                )
+                if has_body:
+                    await asyncio.wait_for(self.page.evaluate("() => window.stop()"), timeout=1.2)
+            except Exception:
+                pass
+        await asyncio.sleep(0.15)
+        return True
+
+    async def dismiss_obstructions(self) -> None:
+        """Menutup banner iklan mengambang / cookie / overlay non-modal yang menghalangi elemen target."""
+        if not self.page or self.page.is_closed():
+            return
+        try:
+            await self.page.evaluate(
+                """() => {
+                    for (const s of ['#fixedban', '[id*="google_ads"]', '.ad-banner', '.cookie-banner', '#onetrust-banner-sdk']) {
+                        document.querySelectorAll(s).forEach(n => { n.style.display = 'none'; });
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
+    async def capture_proof_screenshot(self) -> str:
+        """
+        Mengambil screenshot bukti kerja yang bersih (tanpa badge SOM, dengan masking CSS input rahasia aktif).
+        Mengembalikan string base64 JPEG atau '' bila halaman masih about:blank.
+        """
+        if not self._started or not self.page or self.page.is_closed():
+            return self.last_real_frame_b64 or ""
+        cur_u = self.page.url or ""
+        if cur_u in ("", "about:blank") or cur_u.startswith("chrome-error://"):
+            return self.last_real_frame_b64 or ""
+        try:
+            await clear_som_badges(self.page)
+            raw = await self.page.screenshot(type="jpeg", quality=75, timeout=5000, animations="disabled")
+            b64 = base64.b64encode(raw).decode("ascii")
+            self.latest_frame_b64 = b64
+            self._persist_last_screen(b64, self._display_url(cur_u))
+            return b64
+        except Exception:
+            return self.latest_frame_b64 or self.last_real_frame_b64 or ""
 
     # ======================== PURE DOM FORM & ELEMENT HELPERS ========================
 
@@ -915,6 +998,16 @@ class CloudBrowserEngine:
                 by_txt = self.page.get_by_text(target_el["text"], exact=True).first
                 if await by_txt.count() > 0:
                     return by_txt
+
+        # Bounded Fallback (1x re-inspect DOM) bila atribut data-nusa-idx sempat hilang akibat re-render SPA
+        if index > 0:
+            try:
+                await inspect_page(self.page, show_badges=False)
+                re_idx = self.page.locator(f'[data-nusa-idx="{index}"]').first
+                if await re_idx.count() > 0:
+                    return re_idx
+            except Exception:
+                pass
 
         return None
 
@@ -1296,15 +1389,20 @@ class CloudBrowserEngine:
             return {"submitted": False, "modal_title": "", "rows": [], "invalid_fields": []}
         return await self.page.evaluate(
             """() => {
-                const modal = document.querySelector('.modal.show, .modal-content, [role="dialog"]');
+                const isRendered = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const st = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return st.display !== 'none' && st.visibility !== 'hidden' && parseFloat(st.opacity) !== 0 && r.width > 4 && r.height > 4;
+                };
+                const modal = Array.from(document.querySelectorAll('.modal.show, .modal-content, [role="dialog"]')).find(isRendered) || null;
                 const rows = [];
                 const tables = modal
                     ? Array.from(modal.querySelectorAll('table'))
-                    : Array.from(document.querySelectorAll('table'));
+                    : Array.from(document.querySelectorAll('table:not(form table)'));
 
                 for (const tbl of tables) {
-                    const st = window.getComputedStyle(tbl);
-                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    if (!isRendered(tbl)) continue;
                     for (const tr of Array.from(tbl.querySelectorAll('tbody tr, tr'))) {
                         const cells = Array.from(tr.querySelectorAll('td, th')).map(c => (c.innerText || '').trim().replace(/\\s+/g, ' '));
                         if (cells.length >= 2 && cells[0] && cells[0].toLowerCase() !== 'label') {
@@ -2008,6 +2106,8 @@ class CloudBrowserEngine:
         items_to_fill: List[Dict[str, str]] = []
         if len(parts) >= 2:
             u_val, p_val = _strip_prefix(parts[0]), _strip_prefix(parts[1])
+            if p_val:
+                register_runtime_secret(p_val)
             if user_f and u_val:
                 items_to_fill.append({"selector": user_f["selector"], "value": u_val})
             if pass_f and p_val:
@@ -2017,12 +2117,15 @@ class CloudBrowserEngine:
         else:
             single_val = _strip_prefix(clean)
             if otp_f:
+                register_runtime_secret(single_val)
                 items_to_fill.append({"selector": otp_f["selector"], "value": single_val})
             elif pass_f and (not user_f or user_f.get("has_existing_value")):
+                register_runtime_secret(single_val)
                 items_to_fill.append({"selector": pass_f["selector"], "value": single_val})
             elif user_f and not pass_f:
                 items_to_fill.append({"selector": user_f["selector"], "value": single_val})
             elif pass_f:
+                register_runtime_secret(single_val)
                 items_to_fill.append({"selector": pass_f["selector"], "value": single_val})
 
         if items_to_fill:

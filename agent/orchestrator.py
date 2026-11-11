@@ -8,8 +8,17 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 from agent.browser_engine import CloudBrowserEngine
 from agent.file_manager import WorkspaceFileManager
-from agent.guardrails import inspect_element_sensitivity, is_credential_element, is_practice_sandbox_url
+from agent.guardrails import (
+    inspect_element_sensitivity,
+    inspect_non_browser_sensitivity,
+    is_credential_element,
+    is_practice_sandbox_url,
+)
 from agent.llm_providers import LLMConfig, MultiLLMBrain
+from agent.recovery_engine import ErrorRecoveryEngine
+from agent.reporting import compute_step_metrics, format_execution_report
+from agent.security import redact_secrets, register_runtime_secret
+from agent.task_store import TaskStateStore, compute_side_effect_fingerprint
 from agent.telegram_bridge import TelegramBotBridge
 
 
@@ -47,6 +56,10 @@ class AgentOrchestrator:
         self.persistent_notes: Dict[str, str] = {}
         self._user_mem_file = self.browser.profile_dir / "user_memory.json"
         self.user_memories: List[str] = self._load_user_memories()
+        self.task_store = TaskStateStore(str(self.browser.profile_dir / "task_state"))
+        self.recovery = ErrorRecoveryEngine()
+        self._active_task_id: str = ""
+        self._browser_actions_count: int = 0
         self._form_touched: bool = False
         self._goal_started_mono: float = 0.0
         self._expected_fields: Dict[str, str] = {}
@@ -225,6 +238,24 @@ class AgentOrchestrator:
         if self._task and not self._task.done():
             await self.stop_goal(silent=True)
 
+        # Dukungan pemulihan pasca-restart server/browser: jika user mengetik "lanjut" / "/lanjut",
+        # pulihkan otomatis instruksi & langkah terverifikasi terakhir dari TaskStateStore!
+        resumed_ctx: Optional[Dict[str, Any]] = None
+        if clean_goal.lower() in ("lanjut", "lanjutkan", "teruskan", "/lanjut", "resume", "/resume"):
+            resumed_ctx = self.task_store.get_resumable_context()
+            if resumed_ctx and resumed_ctx.get("initial_instruction"):
+                prev_steps_txt = "\n".join(
+                    f"- Langkah {s.get('step_num')} ({s.get('action_name')}): {s.get('result', '')[:120]}"
+                    for s in (resumed_ctx.get("completed_steps") or [])[-8:]
+                )
+                last_u = resumed_ctx.get("last_verified_url") or ""
+                clean_goal = (
+                    f"{resumed_ctx['initial_instruction']}\n\n"
+                    "[KONTEKS PEMULIHAN PASCA-RESTART / JEDA — JANGAN ULANGI AKSI BEREFEK SAMPING YANG SUDAH SELESAI]:\n"
+                    + (f"URL Terverifikasi Terakhir: {last_u}\n" if last_u else "")
+                    + (f"Langkah Terverifikasi Sebelumnya:\n{prev_steps_txt}" if prev_steps_txt else "")
+                ).strip()
+
         self.current_goal = clean_goal
         self.current_plan = [{"step": "Memahami perintah & menyiapkan langkah...", "status": "in_progress"}]
         self.history = []
@@ -236,6 +267,8 @@ class AgentOrchestrator:
         self.manual_takeover = False
         self._stop_requested = False
         self._form_touched = False
+        self._browser_actions_count = 0
+        self.recovery.reset_run()
         self._goal_started_mono = time.monotonic()
         self._expected_fields = {}
         self._goal_expectations = self._parse_goal_kv_expectations(clean_goal)
@@ -247,7 +280,21 @@ class AgentOrchestrator:
         self._verify_retry_used = False
         self._pre_submit_blocked_once = False
 
-        await self._push_chat("user", clean_goal)
+        task_rec = self.task_store.create_task(clean_goal, initial_plan=self.current_plan)
+        self._active_task_id = task_rec["task_id"]
+        if resumed_ctx and resumed_ctx.get("idempotency_ledger"):
+            # Wariskan idempotency ledger dari sesi sebelumnya agar aksi submit/hapus tidak dijalankan dua kali!
+            def _carry_ledger():
+                st = self.task_store._read_unlocked()
+                t = self.task_store._find(st, self._active_task_id)
+                if t:
+                    t["idempotency_ledger"] = dict(resumed_ctx["idempotency_ledger"])
+                    if resumed_ctx.get("last_verified_url"):
+                        t["last_verified_url"] = resumed_ctx["last_verified_url"]
+                    self.task_store._write_unlocked(st)
+            self.task_store._with_file_lock(write=True, fn=_carry_ledger)
+
+        await self._push_chat("user", redact_secrets(goal))
         self.state = "RUNNING"
         self.live_status = "Sedang memahami perintah..."
         await self._sync_state()
@@ -266,6 +313,36 @@ class AgentOrchestrator:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self._active_task_id:
+            el_s = max(1, int(time.monotonic() - self._goal_started_mono)) if self._goal_started_mono else 1
+            self.task_store.finalize_task(
+                self._active_task_id,
+                status="TERHENTI",
+                duration_sec=el_s,
+                verified=False,
+                verification_summary="Dihentikan oleh pengguna sebelum seluruh langkah selesai.",
+                issues=self._recorded_issues,
+            )
+            if not silent and self.telegram:
+                metrics = compute_step_metrics(self.history, self.current_plan, self._browser_actions_count, "TERHENTI")
+                proof_b64 = await self.browser.capture_proof_screenshot() if self._browser_actions_count > 0 else ""
+                rep_txt = format_execution_report(
+                    instruction=self.current_goal,
+                    final_status="TERHENTI",
+                    metrics=metrics,
+                    duration_sec=el_s,
+                    issues=self._recorded_issues or ["Dihentikan atas permintaan pengguna"],
+                    verification_summary="Pekerjaan dihentikan manual; progres terakhir tersimpan.",
+                    has_screenshot=bool(proof_b64),
+                )
+                await self.telegram.notify_done(
+                    rep_txt,
+                    elapsed_sec=el_s,
+                    total_steps=metrics["total_executed"],
+                    proof_frame_b64=proof_b64,
+                    final_status="TERHENTI",
+                )
+            self._active_task_id = ""
         self.state = "IDLE"
         self.live_status = "Online · Siap disuruh apa aja"
         await self._sync_state()
@@ -377,6 +454,8 @@ class AgentOrchestrator:
                 thought = decision.get("thought", "")
                 if decision.get("plan") and isinstance(decision["plan"], list):
                     self.current_plan = decision["plan"]
+                    if self._active_task_id:
+                        self.task_store.update_plan(self._active_task_id, self.current_plan)
 
                 action = decision.get("action") or {"name": "done", "summary": "Selesai."}
                 act_name = (action.get("name") or "done").lower()
@@ -508,15 +587,44 @@ class AgentOrchestrator:
                             self.state = "IDLE"
                             self.live_status = "Verifikasi formulir menemukan ketidaksesuaian"
                             await self._sync_state()
+                            elapsed_fail = max(1, int(time.monotonic() - self._goal_started_mono)) if self._goal_started_mono else 1
+                            metrics_fail = compute_step_metrics(self.history, self.current_plan, self._browser_actions_count, "GAGAL")
+                            proof_fail_b64 = await self.browser.capture_proof_screenshot() if (self._browser_actions_count > 0 or self._form_touched) else ""
                             fail_lines = "\n".join(f"• {item}" for item in problems_list) or "• Tabel hasil submit tidak muncul atau data tidak sesuai instruksi."
-                            honest_fail_msg = (
-                                "❌ Pengisian Formulir GAGAL Verifikasi (Data Belum Sesuai)!\n\n"
-                                "Daftar field yang bermasalah beserta penyebabnya:\n"
-                                f"{fail_lines}"
+                            ver_fail_summary = "Verifikasi pasca-submit GAGAL: data pada tabel hasil belum sesuai instruksi."
+                            if self._active_task_id:
+                                self.task_store.finalize_task(
+                                    self._active_task_id,
+                                    status="GAGAL",
+                                    duration_sec=elapsed_fail,
+                                    verified=False,
+                                    verification_summary=ver_fail_summary,
+                                    verification_details=problems_list,
+                                    issues=problems_list + self._recorded_issues,
+                                )
+                                self._active_task_id = ""
+                            honest_fail_msg = format_execution_report(
+                                instruction=self.current_goal,
+                                final_status="GAGAL",
+                                metrics=metrics_fail,
+                                duration_sec=elapsed_fail,
+                                issues=problems_list + self._recorded_issues,
+                                verification_summary=ver_fail_summary,
+                                narrative_summary=(
+                                    "❌ Pengisian Formulir GAGAL Verifikasi (Data Belum Sesuai)!\n\n"
+                                    f"Daftar field yang bermasalah beserta penyebabnya:\n{fail_lines}"
+                                ),
+                                has_screenshot=bool(proof_fail_b64),
                             )
                             await self._push_chat("agent", honest_fail_msg)
                             if self.telegram:
-                                await self.telegram.notify_done(honest_fail_msg)
+                                await self.telegram.notify_done(
+                                    honest_fail_msg,
+                                    elapsed_sec=elapsed_fail,
+                                    total_steps=metrics_fail["total_executed"],
+                                    proof_frame_b64=proof_fail_b64,
+                                    final_status="GAGAL",
+                                )
                             return
 
                     for p in self.current_plan:
@@ -526,9 +634,10 @@ class AgentOrchestrator:
                     self.live_status = "Online · Siap disuruh apa aja"
                     await self._sync_state()
 
-                    total_steps = len(self.history)
+                    metrics_ok = compute_step_metrics(self.history, self.current_plan, self._browser_actions_count, "BERHASIL")
+                    total_steps = metrics_ok["total_executed"]
                     elapsed_sec = max(1, int(time.monotonic() - self._goal_started_mono)) if self._goal_started_mono else 1
-                    raw_summary = (action.get("summary") or thought or "Pekerjaan beres dijalankan!").strip()
+                    raw_summary = redact_secrets((action.get("summary") or thought or "Pekerjaan beres dijalankan!").strip())
 
                     asks_metrics = any(
                         k in goal_low
@@ -537,7 +646,6 @@ class AgentOrchestrator:
                     ver_rows = (self._last_submit_verification or {}).get("rows") or []
 
                     if self._form_touched or asks_metrics:
-                        # Jika terdapat kendala/pemotongan karakter nyata, koreksi klaim palsu "Tidak ada kesalahan" dari LLM!
                         if self._recorded_issues:
                             raw_summary = re.sub(
                                 r"tidak ada (?:kesalahan|kendala|error)[^.\n]*\.?",
@@ -545,7 +653,6 @@ class AgentOrchestrator:
                                 raw_summary,
                                 flags=re.I,
                             ).strip()
-                        # Koreksi klaim jumlah langkah melenceng di dalam paragraf ringkasan LLM
                         raw_summary = re.sub(
                             r"\bdalam\s+\d+\s+langkah\b",
                             f"dalam {total_steps} langkah",
@@ -553,23 +660,13 @@ class AgentOrchestrator:
                             flags=re.I,
                         )
 
-                        audit_parts: List[str] = [
-                            f"📊 Rekap Eksekusi Akurat:\n• Jumlah Langkah: {total_steps} langkah\n• Waktu Pengerjaan: {elapsed_sec} detik"
-                        ]
-                        if self._recorded_issues:
-                            iss_bullets = "\n".join(f"• {it}" for it in self._recorded_issues)
-                            audit_parts.append(f"⚠️ Kendala / Penyesuaian Validasi Form:\n{iss_bullets}")
-                        elif asks_metrics or self._form_touched:
-                            audit_parts.append("✅ Kendala / Kesalahan: Tidak ditemukan kesalahan maupun pemotongan data.")
-
+                        extra_ver_blocks: List[str] = []
                         if ver_rows:
                             tbl_bullets = "\n".join(f"• {r['label']}: {r['value'] or '(kosong)'}" for r in ver_rows)
-                            audit_parts.append(f"📋 Tabel Hasil Terverifikasi di Layar:\n{tbl_bullets}")
-
-                        summary_msg = f"{raw_summary}\n\n" + "\n\n".join(audit_parts)
+                            extra_ver_blocks.append(f"📋 Tabel Hasil Terverifikasi di Layar:\n{tbl_bullets}")
+                        narrative_body = (raw_summary + ("\n\n" + "\n\n".join(extra_ver_blocks) if extra_ver_blocks else "")).strip()
                     else:
-                        summary_msg = raw_summary
-                        # Jika tugas membuat struktur folder (contoh PROJECT_ADMIN/), bungkus seluruh folder + subfolder kosongnya jadi .zip asli & kirim ke Telegram!
+                        narrative_body = raw_summary
                         zipped_bundles: List[str] = []
                         for top_d in list(dict.fromkeys(self._created_top_dirs)):
                             try:
@@ -581,18 +678,50 @@ class AgentOrchestrator:
                             except Exception:
                                 pass
                         if zipped_bundles:
-                            summary_msg += f"\n\n📦 Paket Folder Asli Terkirim: {', '.join(zipped_bundles)} (berisi seluruh struktur folder & file sungguhan)"
+                            narrative_body += f"\n\n📦 Paket Folder Asli Terkirim: {', '.join(zipped_bundles)} (berisi seluruh struktur folder & file sungguhan)"
                         elif self._created_files_this_run:
                             files_joined = ", ".join(dict.fromkeys(self._created_files_this_run))
-                            if files_joined not in summary_msg:
-                                summary_msg += f"\n\n📎 File Dibuat & Dikirim: {files_joined}"
+                            if files_joined not in narrative_body:
+                                narrative_body += f"\n\n📎 File Dibuat & Dikirim: {files_joined}"
 
                     proof_b64 = ""
-                    if self._form_touched:
-                        try:
-                            proof_b64 = await self.browser.refresh_frame()
-                        except Exception:
-                            proof_b64 = self.browser.latest_frame_b64
+                    if self._browser_actions_count > 0 or self._form_touched:
+                        proof_b64 = await self.browser.capture_proof_screenshot()
+
+                    if ver_rows:
+                        ver_summary_txt = f"Tabel hasil submit terverifikasi ({len(ver_rows)} baris sesuai)."
+                    elif self._created_files_this_run or self._created_top_dirs:
+                        ver_summary_txt = f"Deliverable file/folder terverifikasi di disk ({len(self._created_files_this_run)} file)."
+                    elif self._browser_actions_count > 0:
+                        ver_summary_txt = f"Hasil aksi browser terverifikasi pada halaman {self.browser.last_real_url or 'aktif'}."
+                    else:
+                        ver_summary_txt = "Jawaban & hasil langkah terverifikasi sesuai instruksi."
+
+                    if self._active_task_id:
+                        self.task_store.finalize_task(
+                            self._active_task_id,
+                            status="BERHASIL",
+                            duration_sec=elapsed_sec,
+                            verified=True,
+                            verification_summary=ver_summary_txt,
+                            issues=self._recorded_issues,
+                        )
+                        self._active_task_id = ""
+
+                    # Sertakan blok Laporan Eksekusi 10-poin standar ketika tugas menjalankan langkah nyata (total_steps > 0 atau form/file/browser)
+                    if total_steps > 0 or self._browser_actions_count > 0 or self._form_touched or self._created_files_this_run or asks_metrics:
+                        summary_msg = format_execution_report(
+                            instruction=self.current_goal,
+                            final_status="BERHASIL",
+                            metrics=metrics_ok,
+                            duration_sec=elapsed_sec,
+                            issues=self._recorded_issues,
+                            verification_summary=ver_summary_txt,
+                            narrative_summary=narrative_body,
+                            has_screenshot=bool(proof_b64),
+                        )
+                    else:
+                        summary_msg = narrative_body
 
                     await self._push_chat("agent", summary_msg)
                     if self.telegram:
@@ -601,6 +730,7 @@ class AgentOrchestrator:
                             elapsed_sec=elapsed_sec,
                             total_steps=total_steps,
                             proof_frame_b64=proof_b64,
+                            final_status="BERHASIL",
                         )
                     return
 
@@ -625,22 +755,120 @@ class AgentOrchestrator:
 
                 self.live_status = thought[:65] if thought else f"Menjalankan {act_name}..."
                 await self._sync_state()
+                if self._active_task_id:
+                    self.task_store.mark_step_running(self._active_task_id, step_num, act_name, thought or act_name)
 
                 if thought:
-                    await self._push_chat("step", thought, {"step": step_num, "action": act_name})
+                    safe_thought = redact_secrets(thought)
+                    await self._push_chat("step", safe_thought, {"step": step_num, "action": act_name})
                     if self.telegram:
-                        await self.telegram.notify_step(step_num, thought, self.current_plan)
+                        await self.telegram.notify_step(step_num, safe_thought, self.current_plan)
 
+                # Cek circuit breaker anti klik berulang membabi buta SEBELUM mengeksekusi aksi browser!
+                blind_block = self.recovery.check_blind_repeat_before_action(action, dom_state)
+                side_effect_fp: Optional[str] = None
+                if blind_block:
+                    result_text = blind_block
+                    if self._active_task_id:
+                        self.task_store.record_recovery(
+                            self._active_task_id,
+                            step_num,
+                            "blind_repeat_action",
+                            "Aksi identik berulang tanpa perubahan DOM",
+                            "Circuit breaker menghentikan klik ulang buta",
+                            "blocked",
+                        )
+                else:
+                    # Tandai apakah aksi ini berefek samping agar tidak pernah dijalankan dua kali tanpa verifikasi
+                    if act_name == "click":
+                        idx_chk = int(action.get("index", 0))
+                        el_chk = next((e for e in dom_state.get("elements", []) if e["index"] == idx_chk), None)
+                        if self._is_submit_target(el_chk) or inspect_element_sensitivity(el_chk):
+                            action["_is_side_effect"] = True
+                            action["_target_sig"] = (el_chk or {}).get("dom_selector") or (el_chk or {}).get("text") or str(idx_chk)
+                    side_effect_fp = compute_side_effect_fingerprint(action, dom_state.get("url", ""))
+                    prior_exec = self.task_store.check_idempotency(self._active_task_id, side_effect_fp) if self._active_task_id else None
+
+                    if prior_exec:
+                        result_text = (
+                            f"ℹ️ [VERIFIKASI IDEMPOTENSI] Aksi berefek samping '{act_name}' sudah pernah berhasil dijalankan "
+                            f"pada Langkah {prior_exec.get('step_num')} ({prior_exec.get('result', '')[:120]}). "
+                            "Tidak diulangi agar tidak terjadi duplikasi."
+                        )
+                    else:
+                        try:
+                            result_text = await self._execute_with_guardrails(step_num, action, dom_state)
+                        except Exception as step_exc:
+                            err_label = redact_secrets(str(step_exc).strip() or type(step_exc).__name__)
+                            rec_crash = await self.recovery.attempt_browser_recovery(
+                                self.browser,
+                                action,
+                                "browser_crash",
+                                err_label,
+                                last_verified_url=self.browser.last_real_url,
+                            )
+                            if rec_crash and rec_crash.get("recovered"):
+                                result_text = rec_crash["new_result"]
+                            else:
+                                result_text = f"❌ Kendala pada aksi {act_name}: {err_label[:110]}"
+
+                        # Error Recovery Engine: deteksi error & coba strategi alternatif berbatas aman (maks 2x)
+                        err_cls = self.recovery.classify_error(result_text, dom_state)
+                        if err_cls is not None:
+                            err_type, err_cause = err_cls
+                            rec_out = await self.recovery.attempt_browser_recovery(
+                                self.browser,
+                                action,
+                                err_type,
+                                err_cause,
+                                last_verified_url=self.browser.last_real_url,
+                            )
+                            if rec_out and rec_out.get("recovered"):
+                                result_text = rec_out["new_result"]
+                                if self._active_task_id:
+                                    self.task_store.record_recovery(
+                                        self._active_task_id,
+                                        step_num,
+                                        err_type,
+                                        err_cause,
+                                        rec_out["strategy"],
+                                        "recovered",
+                                    )
+                            elif self._active_task_id:
+                                self.task_store.record_recovery(
+                                    self._active_task_id,
+                                    step_num,
+                                    err_type,
+                                    err_cause,
+                                    "Evaluasi alternatif langkah oleh orchestrator",
+                                    "unrecovered_step",
+                                )
+
+                        self.recovery.record_action_delta(action, dom_state)
+
+                step_succeeded = not (
+                    result_text.startswith("❌")
+                    or result_text.startswith("⛔")
+                    or "[UNREACHABLE_SITE]" in result_text
+                )
+                cur_disp_u = ""
                 try:
-                    result_text = await self._execute_with_guardrails(step_num, action, dom_state)
-                except Exception as step_exc:
-                    err_label = str(step_exc).strip() or type(step_exc).__name__
-                    try:
-                        await self.browser.ensure_alive()
-                    except Exception:
-                        pass
-                    result_text = f"Kendala ringan pada aksi {act_name} ({err_label[:80]}), halaman sudah disegarkan."
-                self.history.append({"step": step_num, "action_name": act_name, "result": result_text})
+                    if self.browser.page:
+                        cur_disp_u = self.browser._display_url(self.browser.page.url)
+                except Exception:
+                    pass
+                if self._active_task_id:
+                    self.task_store.record_step_outcome(
+                        self._active_task_id,
+                        step_num=step_num,
+                        action_name=act_name,
+                        result_text=result_text,
+                        succeeded=step_succeeded,
+                        verified_url=cur_disp_u,
+                        idempotency_fp=side_effect_fp if step_succeeded else None,
+                    )
+
+                self.history.append({"step": step_num, "action_name": act_name, "result": redact_secrets(result_text)})
 
                 # Jika situs utama yang diminta user memblokir IP Cloud / down (misal portal .go.id tertentu),
                 # langsung hentikan dalam 9 detik dan beri penjelasan jernih tanpa muter berulang-ulang!
@@ -651,20 +879,47 @@ class AgentOrchestrator:
                         self.state = "IDLE"
                         self.live_status = "Situs tujuan menolak koneksi Cloud"
                         await self._sync_state()
+                        el_unreach = max(1, int(time.monotonic() - self._goal_started_mono)) if self._goal_started_mono else 1
+                        metrics_unreach = compute_step_metrics(self.history, self.current_plan, self._browser_actions_count, "GAGAL")
                         px_hint = (
                             "Pasang Proxy Indonesia lewat ketik `/proxy` kalau mau tembus situs `.go.id` ini, "
                             "atau lanjut ke situs lain!"
                             if not self.browser.proxy_config
                             else "Cek status `/proxy` untuk memastikan kuota/koneksi Proxy Indonesia aktif!"
                         )
-                        clean_unreach = (
-                            f"🚫 Situs `{req_host}` menolak atau tidak merespons koneksi dalam 9 detik.\n\n"
-                            "Ini biasa terjadi pada portal pemerintah (`.go.id`) yang dikunci khusus jaringan provider lokal Indonesia (Telkomsel/IndiHome/Biznet). "
-                            f"{px_hint}"
+                        unreach_cause = f"Situs {req_host} menolak atau tidak merespons koneksi dalam 9 detik."
+                        if self._active_task_id:
+                            self.task_store.finalize_task(
+                                self._active_task_id,
+                                status="GAGAL",
+                                duration_sec=el_unreach,
+                                verified=False,
+                                verification_summary=unreach_cause,
+                                issues=[unreach_cause],
+                            )
+                            self._active_task_id = ""
+                        clean_unreach = format_execution_report(
+                            instruction=self.current_goal,
+                            final_status="GAGAL",
+                            metrics=metrics_unreach,
+                            duration_sec=el_unreach,
+                            issues=[unreach_cause],
+                            verification_summary="Halaman target gagal dimuat karena blokir jaringan/timeout.",
+                            narrative_summary=(
+                                f"🚫 Situs `{req_host}` menolak atau tidak merespons koneksi dalam 9 detik.\n\n"
+                                "Ini biasa terjadi pada portal pemerintah (`.go.id`) yang dikunci khusus jaringan provider lokal Indonesia (Telkomsel/IndiHome/Biznet). "
+                                f"{px_hint}"
+                            ),
+                            has_screenshot=False,
                         )
                         await self._push_chat("agent", clean_unreach)
                         if self.telegram:
-                            await self.telegram.notify_done(clean_unreach)
+                            await self.telegram.notify_done(
+                                clean_unreach,
+                                elapsed_sec=el_unreach,
+                                total_steps=metrics_unreach["total_executed"],
+                                final_status="GAGAL",
+                            )
                         return
 
                 await asyncio.sleep(0.08)
@@ -672,10 +927,40 @@ class AgentOrchestrator:
             self.state = "IDLE"
             self.live_status = "Online · Siap disuruh apa aja"
             await self._sync_state()
-            max_msg = "Udah jalan maksimal 26 langkah bro. Kalau masih mau dilanjutin tinggal balas aja!"
+            el_max = max(1, int(time.monotonic() - self._goal_started_mono)) if self._goal_started_mono else 1
+            prelim = compute_step_metrics(self.history, self.current_plan, self._browser_actions_count, "SEBAGIAN BERHASIL")
+            max_status = "SEBAGIAN BERHASIL" if prelim["succeeded"] > 0 else "TERHENTI"
+            metrics_max = compute_step_metrics(self.history, self.current_plan, self._browser_actions_count, max_status)
+            proof_max = await self.browser.capture_proof_screenshot() if self._browser_actions_count > 0 else ""
+            if self._active_task_id:
+                self.task_store.finalize_task(
+                    self._active_task_id,
+                    status=max_status,
+                    duration_sec=el_max,
+                    verified=False,
+                    verification_summary=f"Batas {self.MAX_STEPS} langkah tercapai; siap dilanjutkan dengan perintah 'lanjut'.",
+                    issues=self._recorded_issues + [f"Batas langkah maksimum ({self.MAX_STEPS}) tercapai"],
+                )
+                self._active_task_id = ""
+            max_msg = format_execution_report(
+                instruction=self.current_goal,
+                final_status=max_status,
+                metrics=metrics_max,
+                duration_sec=el_max,
+                issues=self._recorded_issues + [f"Batas langkah maksimum ({self.MAX_STEPS}) tercapai"],
+                verification_summary="Sebagian tahapan selesai; balas 'lanjut' untuk meneruskan dari checkpoint terakhir.",
+                narrative_summary=f"Udah jalan maksimal {self.MAX_STEPS} langkah bro. Kalau masih mau dilanjutin tinggal balas `lanjut` aja!",
+                has_screenshot=bool(proof_max),
+            )
             await self._push_chat("agent", max_msg)
             if self.telegram:
-                await self.telegram.notify_done(max_msg)
+                await self.telegram.notify_done(
+                    max_msg,
+                    elapsed_sec=el_max,
+                    total_steps=metrics_max["total_executed"],
+                    proof_frame_b64=proof_max,
+                    final_status=max_status,
+                )
 
         except asyncio.CancelledError:
             self.state = "IDLE"
@@ -685,8 +970,10 @@ class AgentOrchestrator:
             self.state = "IDLE"
             self.live_status = "Online · Siap disuruh apa aja"
             await self._sync_state()
-            # DILARANG memanggil quick_chat di sini karena quick_chat tidak melihat browser dan bisa mengarang klaim palsu!
-            reason_txt = str(exc).strip() or f"Gangguan koneksi sementara ({type(exc).__name__})"
+            reason_txt = redact_secrets(str(exc).strip() or f"Gangguan koneksi sementara ({type(exc).__name__})")
+            el_err = max(1, int(time.monotonic() - self._goal_started_mono)) if self._goal_started_mono else 1
+            metrics_err = compute_step_metrics(self.history, self.current_plan, self._browser_actions_count, "TERHENTI")
+            proof_err = await self.browser.capture_proof_screenshot() if self._browser_actions_count > 0 else ""
             cur_u = ""
             try:
                 if self.browser.page:
@@ -694,13 +981,38 @@ class AgentOrchestrator:
             except Exception:
                 pass
             loc_info = f" di halaman `{cur_u}`" if cur_u and cur_u != "about:blank" else ""
-            err_msg = (
-                f"⚠️ Langkah pengerjaan web sempat terputus{loc_info} ({reason_txt[:110]}).\n\n"
-                "Posisi halaman terakhir masih tersimpan — ketik `lanjut` kalau mau gua terusin dari halaman itu!"
+            if self._active_task_id:
+                self.task_store.finalize_task(
+                    self._active_task_id,
+                    status="TERHENTI",
+                    duration_sec=el_err,
+                    verified=False,
+                    verification_summary=f"Terhenti karena kendala teknis: {reason_txt[:140]}",
+                    issues=self._recorded_issues + [reason_txt[:140]],
+                )
+                self._active_task_id = ""
+            err_msg = format_execution_report(
+                instruction=self.current_goal,
+                final_status="TERHENTI",
+                metrics=metrics_err,
+                duration_sec=el_err,
+                issues=self._recorded_issues + [reason_txt[:140]],
+                verification_summary="Eksekusi terhenti; posisi halaman & checkpoint terakhir tersimpan aman.",
+                narrative_summary=(
+                    f"⚠️ Langkah pengerjaan sempat terputus{loc_info} ({reason_txt[:110]}).\n\n"
+                    "Posisi & langkah terakhir masih tersimpan — ketik `lanjut` kalau mau gua terusin dari titik terakhir!"
+                ),
+                has_screenshot=bool(proof_err),
             )
             await self._push_chat("agent", err_msg)
             if self.telegram:
-                await self.telegram.send_to_all(err_msg)
+                await self.telegram.notify_done(
+                    err_msg,
+                    elapsed_sec=el_err,
+                    total_steps=metrics_err["total_executed"],
+                    proof_frame_b64=proof_err,
+                    final_status="TERHENTI",
+                )
 
     async def _wait_for_human_takeover(self, reason: str) -> None:
         self.state = "WAITING_HUMAN_TAKEOVER"
@@ -708,6 +1020,8 @@ class AgentOrchestrator:
         self.manual_takeover = True
         self.takeover_reason = reason
         self._resume_event.clear()
+        if self._active_task_id:
+            self.task_store.set_waiting_approval(self._active_task_id, f"Menunggu login/input pengguna: {reason}")
         await self._sync_state()
 
         await self._push_chat("takeover", reason, {"reason": reason})
@@ -729,6 +1043,17 @@ class AgentOrchestrator:
         act_name = (action.get("name") or "").lower()
         elements = dom_state.get("elements", [])
 
+        # GERBANG KEAMANAN AKSI NON-BROWSER (Penghapusan File & Eksekusi Skrip Destruktif / Eksfiltrasi)
+        non_br_sens = inspect_non_browser_sensitivity(action)
+        if non_br_sens:
+            if non_br_sens.get("decision") == "block":
+                return f"⛔ [BLOKIR KEAMANAN] {non_br_sens.get('reason', 'Aksi ditolak oleh sistem keamanan.')}"
+            approved_nb = await self._prompt_user_approval(non_br_sens)
+            if approved_nb != "approve":
+                await self._push_chat("system", f"🚫 Oke, `{non_br_sens['target_label']}` dibatalkan.")
+                return f"Tindakan '{non_br_sens['target_label']}' DITOLAK oleh pengguna. Jangan ulangi aksi ini."
+            await self._push_chat("system", f"✅ Disetujui! Menjalankan `{non_br_sens['target_label']}`...")
+
         if act_name == "type":
             idx = int(action.get("index", -1))
             target_el = next((e for e in elements if e["index"] == idx), None)
@@ -745,6 +1070,7 @@ class AgentOrchestrator:
                         "Ketemu kolom Password/OTP. Balas langsung di chat 'username | password' (otomatis dihapus 1 detik) atau isi di form simpel!"
                     )
                     return "User mengisi kredensial sendiri."
+                register_runtime_secret(typed_val)
 
         if act_name in ("click", "ask_approval"):
             idx = int(action.get("index", -1))
@@ -771,13 +1097,16 @@ class AgentOrchestrator:
                     return f"User mengambil alih layar pada tahap '{sens_report['target_label']}'."
                 await self._push_chat("system", f"✅ Disetujui! Mengeksekusi `{sens_report['target_label']}`...")
                 if idx > 0:
+                    self._browser_actions_count += 1
                     return await self.browser.click_element(idx, elements)
                 return "Disetujui oleh user."
 
         if act_name == "navigate":
+            self._browser_actions_count += 1
             return await self.browser.navigate(action.get("url", ""))
 
         if act_name == "click":
+            self._browser_actions_count += 1
             idx = int(action.get("index", 0))
             target_el = next((e for e in elements if e["index"] == idx), None)
             if self._is_submit_target(target_el):
@@ -801,6 +1130,7 @@ class AgentOrchestrator:
             return res
 
         if act_name == "type":
+            self._browser_actions_count += 1
             idx = int(action.get("index", 0))
             val_txt = str(action.get("text", ""))
             target_el = next((e for e in elements if e["index"] == idx), None)
@@ -826,6 +1156,7 @@ class AgentOrchestrator:
             return res
 
         if act_name == "select":
+            self._browser_actions_count += 1
             idx = int(action.get("index", 0))
             opt_txt = str(action.get("option", ""))
             target_el = next((e for e in elements if e["index"] == idx), None)
@@ -849,20 +1180,24 @@ class AgentOrchestrator:
             return res
 
         if act_name == "scroll":
+            self._browser_actions_count += 1
             return await self.browser.scroll_page(direction=str(action.get("direction", "down")))
 
         if act_name == "go_back":
+            self._browser_actions_count += 1
             return await self.browser.go_back()
 
         if act_name == "solve_captcha":
+            self._browser_actions_count += 1
             cap_res = await self.browser.auto_solve_captcha(solver_fn=self.brain.solve_captcha_image)
             return cap_res or "Tidak ditemukan CAPTCHA gambar/hitungan yang perlu diisi di halaman ini."
 
         if act_name == "run_js":
+            self._browser_actions_count += 1
             js_code = str(action.get("code") or action.get("script") or "")
             js_out = await self.browser.run_page_js(js_code)
-            self.memory_notes[f"hasil_js_langkah_{step_num}"] = js_out[:2500]
-            return js_out
+            self.memory_notes[f"hasil_js_langkah_{step_num}"] = redact_secrets(js_out)[:2500]
+            return redact_secrets(js_out)
 
         if act_name == "run_python":
             import subprocess as _sp
@@ -994,6 +1329,16 @@ class AgentOrchestrator:
                     pass
             return f"✅ File '{saved['name']}' berhasil disimpan di disk ({saved['size']} bytes){extra_sheet_info}."
 
+        if act_name in ("delete_file", "remove_file"):
+            fname = str(action.get("filename") or action.get("path") or "").strip()
+            if not fname:
+                return "❌ Nama file yang akan dihapus kosong."
+            deleted = self.file_manager.delete_file(fname)
+            await self.broadcast({"type": "files_updated", "files": self.file_manager.list_files()})
+            if deleted:
+                return f"🗑️ File '{fname}' berhasil dihapus setelah mendapat persetujuan pengguna."
+            return f"⚠️ File '{fname}' tidak ditemukan di workspace."
+
         return f"Action '{act_name}' tidak dikenali."
 
     async def _prompt_user_approval(self, sens_report: Dict[str, Any]) -> str:
@@ -1002,11 +1347,16 @@ class AgentOrchestrator:
         self.pending_approval = sens_report
         self._approval_decision = None
         self._resume_event.clear()
+        if self._active_task_id:
+            self.task_store.set_waiting_approval(
+                self._active_task_id,
+                f"Menunggu persetujuan pengguna untuk: {sens_report.get('target_label', 'aksi sensitif')}",
+            )
 
         await self._sync_state()
         await self._push_chat(
             "approval",
-            f"Mau klik tombol **{sens_report['target_label']}**. Boleh dilanjutin bro?",
+            f"Meminta izin untuk **{sens_report['target_label']}**. Boleh dilanjutin bro?",
             sens_report,
         )
         if self.telegram:
@@ -1053,6 +1403,17 @@ class AgentOrchestrator:
         import re as _re
 
         self._form_touched = True
+        # ATURAN #5: Verifikasi dulu apakah hasil submit sebelumnya SUDAH muncul nyata di layar sebelum mengklik Submit lagi!
+        already_sub = await self.browser.read_submission_result()
+        if already_sub.get("submitted") and any((r.get("value") or "").strip() for r in already_sub.get("rows", [])):
+            rows_prior = already_sub["rows"]
+            self._last_submit_verification = {"ok": True, "rows": rows_prior, "problems": []}
+            tbl_prior = "\n".join(f"  • {r['label']}: {r['value'] or '(kosong)'}" for r in rows_prior)
+            return (
+                "ℹ️ [VERIFIKASI HASIL SEBELUMNYA] Formulir terbukti SUDAH ter-submit sebelumnya (tidak diklik ulang).\n"
+                f"📋 Data pada Tabel Hasil:\n{tbl_prior}"
+            )
+
         audit = await self.browser.audit_form_state()
         pre_issues: List[str] = []
 

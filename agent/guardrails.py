@@ -111,7 +111,7 @@ def is_credential_element(element: Optional[Dict[str, Any]]) -> bool:
     """
     if not element:
         return False
-    if element.get("is_password"):
+    if element.get("is_password") or (element.get("type") or "").lower() == "password":
         return True
     combined = " ".join(
         [
@@ -123,3 +123,35 @@ def is_credential_element(element: Optional[Dict[str, Any]]) -> bool:
         ]
     )
     return bool(re.search(r"\b(password|kata\s*sandi|passcode|otp|2fa|kode\s*verifikasi|pin)\b", combined, re.IGNORECASE))
+
+
+def inspect_non_browser_sensitivity(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Memeriksa apakah aksi non-browser (penghapusan file atau eksekusi skrip destruktif)
+    memerlukan persetujuan eksplisit pemilik (Approval Gate) atau wajib diblokir.
+    """
+    from agent.security import inspect_script_safety
+
+    act_name = (action.get("name") or "").lower()
+    if act_name in ("delete_file", "remove_file", "rmdir", "delete_dir"):
+        target_f = str(action.get("filename") or action.get("path") or "(file)")
+        return {
+            "decision": "approve",
+            "category": "Penghapusan File / Direktori",
+            "target_label": f"Hapus '{target_f}'",
+            "reason": f"Agent meminta menghapus file/folder '{target_f}' dari penyimpanan workspace.",
+        }
+
+    if act_name == "run_python":
+        code = str(action.get("code") or action.get("script") or "")
+        chk = inspect_script_safety(code, lang="python")
+        if chk.get("decision") in ("block", "approve"):
+            return chk
+
+    if act_name == "run_js":
+        code = str(action.get("code") or action.get("script") or "")
+        chk = inspect_script_safety(code, lang="js")
+        if chk.get("decision") in ("block", "approve"):
+            return chk
+
+    return None

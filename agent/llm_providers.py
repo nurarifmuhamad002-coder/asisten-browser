@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from agent.dom_inspector import format_dom_for_llm
+from agent.security import redact_secrets
 
 # Pool koneksi HTTP/1.1 Keep-Alive permanen (IPv4 murni) — memangkas waktu jabat-tangan TLS 400–900ms di setiap pesan!
 _SHARED_HTTP_POOL: Optional[httpx.AsyncClient] = None
@@ -200,6 +201,7 @@ ATURAN RISET DATA WEB, KATALOG PRODUK, ANALISIS, & PEMBUATAN FILE:
 2. Hitung matematika (jumlah total, rata-rata presisi 2 desimal, nilai termurah/termahal, pengelompokan rating, dan filter kriteria seperti `Rating >= 4` DAN `Harga <= 30` beserta aturan prioritasnya) secara cermat & periksa ulang angkanya.
 3. WAJIB panggil `"write_file"` terlebih dahulu bila user meminta file Excel/Word/PDF dibuat. DILARANG KERAS memanggil `"done"` sebelum file benar-benar berhasil dibuat atau menulis kalimat gantung seperti *"saya akan melanjutkan..."* di dalam `"done"`! Pada `"done"`, jawab lengkap seluruh poin `LAPORAN AKHIR` yang diminta user.
 - `{"name": "append_file", "filename": "catatan.md", "content": "..."}` -> Tambahkan teks ke file di workspace.
+- `{"name": "delete_file", "filename": "catatan_lama.txt"}` -> Hapus file di workspace (sistem otomatis meminta persetujuan pengguna terlebih dahulu sebelum menghapus).
 - `{"name": "run_js", "code": "return Array.from(document.querySelectorAll('...')).map(e => e.innerText)"}` -> Jalankan JavaScript langsung di halaman browser aktif! Gunakan secara proaktif kapan pun ada data tersembunyi di atribut HTML/CSS/Shadow DOM, tabel besar puluhan baris yang perlu diekstrak cepat 100% akurat sekaligus, atau tombol/elemen custom yang sulit diklik biasa.
 - `{"name": "run_python", "code": "import openpyxl ..."}` -> Jalankan kode Python 3 langsung di folder workspace (`openpyxl`, `docx`, `reportlab`, `csv`, `json`, `statistics`, `math` siap pakai)! Gunakan untuk perhitungan angka/statistik rumit agar 0% salah hitung, mengolah data besar, atau membuat file Excel multi-sheet berformula / Word / PDF kustom (setiap file yang disimpan di folder kerja otomatis terkirim ke Telegram user!).
 - `{"name": "solve_captcha"}` -> Baca, hitung, dan isi otomatis CAPTCHA gambar/matematika/teks yang ada di halaman saat ini menggunakan AI Vision! (Gunakan kapan saja ada CAPTCHA gambar/penjumlahan angka di formulir atau setelah mengisi username/password).
@@ -271,10 +273,13 @@ class LLMConfig:
                 self.model = "claude-sonnet-4-20250514"
 
     def update(self, provider: str, model: str, api_key: str, base_url: str = "") -> None:
+        from agent.security import register_runtime_secret
+
         self.provider = (provider or "gemini").strip().lower()
         self.model = (model or "").strip() or self._default_model(self.provider)
         if api_key is not None and api_key != "********":
             self.api_key = api_key.strip()
+            register_runtime_secret(self.api_key)
         self.base_url = (base_url or "").strip()
 
     @staticmethod
@@ -769,7 +774,7 @@ class MultiLLMBrain:
                 if res_extra:
                     return res_extra
 
-        raise RuntimeError(last_err or "Server AI sedang padat sesaat, coba kirim ulang 5 detik lagi.")
+        raise RuntimeError(redact_secrets(last_err or "Server AI sedang padat sesaat, coba kirim ulang 5 detik lagi."))
 
     async def _call_openai_compatible(self, prompt_text: str, screenshot_b64: str) -> Dict[str, Any]:
         base = self.config.base_url
@@ -804,7 +809,7 @@ class MultiLLMBrain:
         async with httpx.AsyncClient(timeout=45.0) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
-                raise RuntimeError(f"LLM API error ({resp.status_code}): {resp.text[:300]}")
+                raise RuntimeError(redact_secrets(f"LLM API error ({resp.status_code}): {resp.text[:300]}"))
             data = resp.json()
             text = data["choices"][0]["message"]["content"]
             return _extract_json(text)

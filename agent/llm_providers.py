@@ -457,6 +457,51 @@ class MultiLLMBrain:
         return "".join(str(p.get("text", "")) for p in parts_out if isinstance(p, dict) and not p.get("thought")).strip()
 
     @staticmethod
+    def _gemini_finish_reason(data: Dict[str, Any]) -> str:
+        """Ambil finishReason kandidat pertama (STOP / MAX_TOKENS / SAFETY / RECITATION / ...)."""
+        cands = data.get("candidates") or []
+        if not cands:
+            return ""
+        return str(cands[0].get("finishReason") or "").strip().upper()
+
+    @staticmethod
+    def _looks_truncated(text: str) -> bool:
+        """
+        Deteksi teks yang berhenti di tengah jalan (kalimat/markdown belum tuntas).
+        Sengaja konservatif: lebih baik tidak mendeteksi (lalu tidak menyambung) daripada
+        menyambung jawaban yang sebenarnya sudah selesai dan menghasilkan kalimat acak.
+        """
+        t = (text or "").rstrip()
+        if not t:
+            return False
+
+        last_line = t.splitlines()[-1].strip() if t.splitlines() else t
+        # Baris tabel / bullet / heading / separator markdown yang valid -> bukan terpotong
+        if last_line.startswith(("|", "- ", "* ", "#", ">", "```")) or last_line.endswith(("|", "```")):
+            return False
+        # Diakhiri tanda baca penutup yang wajar -> selesai
+        if last_line.endswith((".", "!", "?", ")", "]", "}", '"', "'", "\u201d", "\u2019", "\u00bb")):
+            return False
+        # Terbuka di tengah penanda markdown tebal/miring/kode/link
+        if last_line.count("**") % 2 != 0 or last_line.count("`") % 2 != 0:
+            return True
+        if last_line.count("[") > last_line.count("]"):
+            return True
+        # Berhenti di kata sambung / preposisi yang jelas menggantung
+        dangling = (
+            "dan", "atau", "yang", "untuk", "dengan", "di", "ke", "dari", "pada", "karena",
+            "agar", "supaya", "tapi", "tetapi", "serta", "bahwa", "jika", "kalau", "lalu",
+            "the", "and", "or", "to", "of", "for", "with", "that", "but",
+        )
+        last_word = re.split(r"\s+", last_line)[-1].strip(",;:").lower() if last_line else ""
+        if last_word in dangling:
+            return True
+        # Baris terakhir panjang tanpa tanda baca & bukan struktur markdown -> kemungkinan terpotong
+        if len(last_line) >= 60:
+            return True
+        return False
+
+    @staticmethod
     def _friendly_chat_error_message(kind: str) -> str:
         if kind == "auth_error":
             return "❌ API Key AI tidak valid atau belum aktif bro. Cek lagi lewat perintah `/apikey` atau menu pengaturan ya!"
@@ -590,22 +635,60 @@ class MultiLLMBrain:
                 last_err: Optional[LLMCallError] = None
 
                 for m_name in fast_order:
-                    gen_cfg: Dict[str, Any] = {"temperature": 0.4, "maxOutputTokens": 1200}
+                    # CATATAN: maxOutputTokens dinaikkan dari 1200 -> 4096 supaya jawaban panjang
+                    # tidak terpotong di tengah kalimat. thinkingConfig dimatikan karena pada model
+                    # thinking, token "mikir" ikut memakan kuota output -> jawaban jadi setengah.
+                    gen_cfg: Dict[str, Any] = {
+                        "temperature": 0.4,
+                        "maxOutputTokens": 4096,
+                        "thinkingConfig": {"thinkingBudget": 0},
+                    }
                     payload = {
                         "system_instruction": {"parts": [{"text": chat_sys}]},
                         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                         "generationConfig": gen_cfg,
                     }
-                    data, err = await self._post_gemini_single(m_name, payload, timeout=12.0)
+                    data, err = await self._post_gemini_single(m_name, payload, timeout=25.0)
                     if data is not None:
                         ans = self._extract_gemini_text(data)
+                        finish = self._gemini_finish_reason(data)
                         if ans:
+                            # AUTO-CONTINUATION: kalau AI kehabisan token atau berhenti di tengah kalimat,
+                            # sambung otomatis (maks 2 putaran) supaya jawaban utuh sampai selesai.
+                            cont_round = 0
+                            while cont_round < 2 and (
+                                finish == "MAX_TOKENS"
+                                or (len(ans) >= 180 and self._looks_truncated(ans))
+                            ):
+                                cont_round += 1
+                                cont_prompt = (
+                                    "JAWABANMU SEBELUMNYA TERPOTONG DI TENGAH. "
+                                    "Lanjutkan LANGSUNG dari kata terakhir tanpa mengulang kalimat sebelumnya, "
+                                    "tanpa sapaan, tanpa penjelasan tambahan. Tulis lanjutannya saja sampai tuntas:\n\n"
+                                    f"{ans[-1200:]}"
+                                )
+                                cont_payload = {
+                                    "system_instruction": {"parts": [{"text": chat_sys}]},
+                                    "contents": [{"role": "user", "parts": [{"text": prompt + "\n\n" + cont_prompt}]}],
+                                    "generationConfig": dict(gen_cfg),
+                                }
+                                data_c, err_c = await self._post_gemini_single(m_name, cont_payload, timeout=25.0)
+                                if data_c is None:
+                                    break
+                                more_txt = self._extract_gemini_text(data_c)
+                                if not more_txt:
+                                    break
+                                ans = ans.rstrip() + "\n" + more_txt.lstrip()
+                                finish = self._gemini_finish_reason(data_c)
+                                if finish not in ("MAX_TOKENS", "") and not self._looks_truncated(ans):
+                                    break
+
                             self.last_chat_ok = True
                             self.last_error_kind = ""
                             self.last_error_detail = ""
                             return ans
                         err = LLMCallError(
-                            f"Respons teks kosong dari {m_name}",
+                            f"Respons teks kosong dari {m_name} (finishReason: {finish or 'UNKNOWN'})",
                             kind="invalid_output",
                             model_name=m_name,
                         )
@@ -641,7 +724,7 @@ class MultiLLMBrain:
                             },
                             json={
                                 "model": self.config.model or "claude-sonnet-4-20250514",
-                                "max_tokens": 1200,
+                                "max_tokens": 4096,
                                 "system": chat_sys,
                                 "messages": [{"role": "user", "content": prompt}],
                             },
@@ -665,6 +748,7 @@ class MultiLLMBrain:
                             headers={"Authorization": f"Bearer {self.config.api_key}"},
                             json={
                                 "model": self.config.model or "gpt-4o",
+                                "max_tokens": 4096,
                                 "messages": [{"role": "system", "content": chat_sys}, {"role": "user", "content": prompt}],
                             },
                             timeout=18.0,
@@ -840,19 +924,62 @@ class MultiLLMBrain:
                 b64_data = _b64.b64encode(raw_bytes).decode("ascii")
                 parts.append({"inline_data": {"mime_type": mime_type, "data": b64_data}})
 
+        gen_doc: Dict[str, Any] = {
+            "temperature": 0.25,
+            "maxOutputTokens": 4096,
+            "thinkingConfig": {"thinkingBudget": 0},
+        }
         payload = {
             "system_instruction": {"parts": [{"text": sys_txt}]},
             "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"temperature": 0.25},
+            "generationConfig": gen_doc,
         }
         async with self._llm_semaphore:
             last_err: Optional[LLMCallError] = None
             backoff_idx = 0
             for model in self._gemini_candidate_models(light_first=False)[:4]:
-                data, err = await self._post_gemini_single(model, payload, timeout=24.0)
+                data, err = await self._post_gemini_single(model, payload, timeout=30.0)
                 if data is not None:
                     txt_out = self._extract_gemini_text(data)
+                    finish_d = self._gemini_finish_reason(data)
                     if txt_out:
+                        # Sambung otomatis bila rangkuman dokumen kehabisan token
+                        cont_d = 0
+                        while cont_d < 2 and (
+                            finish_d == "MAX_TOKENS"
+                            or (len(txt_out) >= 180 and self._looks_truncated(txt_out))
+                        ):
+                            cont_d += 1
+                            cont_payload_d = {
+                                "system_instruction": {"parts": [{"text": sys_txt}]},
+                                "contents": [
+                                    {
+                                        "role": "user",
+                                        "parts": parts
+                                        + [
+                                            {
+                                                "text": (
+                                                    "\n\nJAWABANMU SEBELUMNYA TERPOTONG. Lanjutkan LANGSUNG dari kata "
+                                                    "terakhir tanpa mengulang, tulis lanjutannya saja sampai tuntas:\n"
+                                                    + txt_out[-1200:]
+                                                )
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "generationConfig": dict(gen_doc),
+                            }
+                            data_d, _err_d = await self._post_gemini_single(model, cont_payload_d, timeout=30.0)
+                            if data_d is None:
+                                break
+                            more_d = self._extract_gemini_text(data_d)
+                            if not more_d:
+                                break
+                            txt_out = txt_out.rstrip() + "\n" + more_d.lstrip()
+                            finish_d = self._gemini_finish_reason(data_d)
+                            if finish_d not in ("MAX_TOKENS", "") and not self._looks_truncated(txt_out):
+                                break
+
                         self.last_chat_ok = True
                         self.last_error_kind = ""
                         self.last_error_detail = ""

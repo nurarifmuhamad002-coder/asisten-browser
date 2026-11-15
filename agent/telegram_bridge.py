@@ -1656,25 +1656,80 @@ class TelegramBotBridge:
         except Exception:
             pass
 
+    @staticmethod
+    def _split_for_telegram(text: str, limit: int = 3900) -> List[str]:
+        """
+        Pecah teks panjang menjadi beberapa bagian <= limit karakter TANPA memotong kata/kalimat di tengah.
+        Telegram membatasi 4096 karakter per pesan; kalau dipotong keras, jawaban bot terlihat 'setengah'.
+        """
+        clean = (text or "").strip()
+        if not clean:
+            return []
+        if len(clean) <= limit:
+            return [clean]
+
+        chunks: List[str] = []
+        remaining = clean
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+            window = remaining[:limit]
+            # Prioritas 1: potong di akhir paragraf / baris baru
+            cut = window.rfind("\n\n")
+            if cut < limit * 0.5:
+                cut = window.rfind("\n")
+            # Prioritas 2: potong di akhir kalimat
+            if cut < limit * 0.5:
+                cut = max(window.rfind(". "), window.rfind("! "), window.rfind("? "), window.rfind("; "))
+                if cut != -1:
+                    cut += 1
+            # Prioritas 3: potong di spasi terakhir
+            if cut < limit * 0.5:
+                cut = window.rfind(" ")
+            # Prioritas 4 (darurat): potong keras
+            if cut <= 0:
+                cut = limit
+            piece = remaining[:cut].rstrip()
+            if piece:
+                chunks.append(piece)
+            remaining = remaining[cut:].lstrip()
+        return chunks
+
     async def send_text(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Optional[int]:
         if not self.token:
             return None
-        safe_txt = redact_secrets(text)[:3900]
-        payload: Dict[str, Any] = {"chat_id": chat_id, "text": safe_txt}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        try:
-            r = await get_shared_http().post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json=payload,
-                timeout=12.0,
-            )
-            d = r.json()
-            if d.get("ok"):
-                return d["result"].get("message_id")
-        except Exception:
-            pass
-        return None
+        chunks = self._split_for_telegram(redact_secrets(text))
+        if not chunks:
+            chunks = ["(kosong)"]
+
+        first_mid: Optional[int] = None
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks):
+            is_last = idx == total - 1
+            body = chunk
+            if total > 1:
+                marker = f"\n\n(bagian {idx + 1}/{total})"
+                allowed = 3900 - len(marker)
+                if len(body) > allowed:
+                    body = body[:allowed].rstrip()
+                body = body + marker
+            payload: Dict[str, Any] = {"chat_id": chat_id, "text": body}
+            # Tombol keyboard hanya ditempel di bagian terakhir supaya tidak dobel
+            if reply_markup and is_last:
+                payload["reply_markup"] = reply_markup
+            try:
+                r = await get_shared_http().post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    json=payload,
+                    timeout=15.0,
+                )
+                d = r.json()
+                if d.get("ok") and first_mid is None:
+                    first_mid = d["result"].get("message_id")
+            except Exception:
+                pass
+        return first_mid
 
     async def notify_step(self, step_num: int, thought: str, plan: Optional[List[Dict[str, Any]]] = None) -> None:
         if not self.is_configured or not self.active_chat_ids or self._active_run_seq <= 0:

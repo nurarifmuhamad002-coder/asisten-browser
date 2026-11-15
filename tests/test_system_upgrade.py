@@ -1304,6 +1304,136 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(16, "Tahap 4: Safe Doc Export Guard, Honest open_web & Clean 'lanjut'/Task Isolation", True, "0 file PDF/Word/Excel berisi teks error, open_web jujur saat gagal, 'lanjut' hanya untuk task terjeda, & konteks task baru bersih.")
 
+        # =====================================================================
+        # 17. TAHAP 5: ANTI BALASAN "SETENGAH" (TOKEN BUDGET, AUTO-CONTINUE, SPLIT PESAN)
+        # =====================================================================
+        from agent.llm_providers import MultiLLMBrain
+        from agent.telegram_bridge import TelegramBotBridge
+
+        # 17a. Token budget quick_chat sudah 4096 (bukan 1200) + thinking dimatikan
+        src_lp = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+        assert '"maxOutputTokens": 4096' in src_lp, "quick_chat wajib punya maxOutputTokens 4096 agar balasan tidak kepotong!"
+        assert '"maxOutputTokens": 1200' not in src_lp, "maxOutputTokens 1200 (penyebab jawaban setengah) harus sudah hilang!"
+        assert '"thinkingConfig": {"thinkingBudget": 0}' in src_lp, "thinkingConfig wajib dimatikan di quick_chat supaya token output penuh untuk teks!"
+        assert '"max_tokens": 4096' in src_lp, "Provider non-Gemini juga wajib pakai max_tokens 4096!"
+
+        # 17b. Deteksi finishReason MAX_TOKENS & teks terpotong
+        fake_max_tokens = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "Ini jawaban yang berhenti di tengah karena kehabisan token dan belum"}]},
+                    "finishReason": "MAX_TOKENS",
+                }
+            ]
+        }
+        assert MultiLLMBrain._gemini_finish_reason(fake_max_tokens) == "MAX_TOKENS"
+        assert MultiLLMBrain._looks_truncated("Kalimat ini berhenti tanpa tanda baca penutup yang wajar sama sekali") is True
+        assert MultiLLMBrain._looks_truncated("Sudah lengkap kok bro, semua aman.") is False
+        assert MultiLLMBrain._looks_truncated("Tabel:\n| poin | nilai |") is False, "Baris tabel valid tidak boleh dianggap terpotong"
+        assert MultiLLMBrain._looks_truncated("Daftar:\n- poin pertama\n- poin kedua") is False, "List valid tidak boleh dianggap terpotong"
+        # Kalimat menggantung di kata sambung -> WAJIB terdeteksi terpotong
+        assert MultiLLMBrain._looks_truncated("Jadi langkah selanjutnya yang harus lu lakuin adalah login ke") is True
+        assert MultiLLMBrain._looks_truncated("Pertama buka webnya lalu klik tombol dan") is True
+        # Markdown tebal belum ditutup -> terdeteksi terpotong
+        assert MultiLLMBrain._looks_truncated("Ini **penting banget bro") is True
+        # Teks kosong/whitespace aman
+        assert MultiLLMBrain._looks_truncated("") is False and MultiLLMBrain._looks_truncated("   ") is False
+
+        # 17c. Auto-continuation: respons pertama MAX_TOKENS -> otomatis disambung model yang sama
+        cfg_c = LLMConfig()
+        cfg_c.update("gemini", "gemini-2.5-flash", "dummy-unit-test-key-05")
+        brain_c = MultiLLMBrain(cfg_c)
+        brain_c._sleep_fn = lambda _s: asyncio.sleep(0)  # type: ignore
+        cont_calls = {"n": 0}
+
+        async def _fake_post_cont(m_name: str, payload: Dict[str, Any], timeout: float = 0.0):
+            cont_calls["n"] += 1
+            if cont_calls["n"] == 1:
+                return (
+                    {
+                        "candidates": [
+                            {
+                                "content": {"parts": [{"text": "Penjelasan lengkap tahap pertama dimulai dari sini dan berlanjut ke bagian penting yang sangat panjang sekali lalu berhenti di tengah"}]},
+                                "finishReason": "MAX_TOKENS",
+                            }
+                        ]
+                    },
+                    None,
+                )
+            return (
+                {
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "kalimat sampai tuntas dan selesai dengan baik bro."}]},
+                            "finishReason": "STOP",
+                        }
+                    ]
+                },
+                None,
+            )
+
+        brain_c._post_gemini_single = _fake_post_cont  # type: ignore
+        ans_cont = await brain_c.quick_chat("Jelaskan panjang lebar")
+        assert cont_calls["n"] == 2, f"Auto-continuation wajib memanggil model kedua kali saat MAX_TOKENS (dapat {cont_calls['n']} call)"
+        assert "sampai tuntas dan selesai" in ans_cont, f"Bagian lanjutan wajib tersambung: {ans_cont!r}"
+        assert "berhenti di tengah" in ans_cont, f"Bagian awal tidak boleh hilang: {ans_cont!r}"
+        assert brain_c.last_chat_ok is True
+
+        # 17d. Split pesan Telegram: balasan panjang dipecah utuh, tidak dipotong keras
+        long_reply = "\n\n".join(
+            f"Paragraf ke-{i}. " + ("Ini penjelasan panjang yang harus sampai utuh ke user tanpa terpotong. " * 8)
+            for i in range(1, 14)
+        )
+        assert len(long_reply) > 3900, "Fixture uji harus lebih panjang dari batas 3900 karakter"
+        parts = TelegramBotBridge._split_for_telegram(long_reply)
+        assert len(parts) >= 2, f"Balasan panjang wajib dipecah jadi >=2 pesan (dapat {len(parts)})"
+        assert all(len(p) <= 3900 for p in parts), f"Setiap bagian wajib <=3900 karakter: {[len(p) for p in parts]}"
+        rejoined_words = " ".join(" ".join(parts).split())
+        original_words = " ".join(long_reply.split())
+        assert rejoined_words == original_words, "Isi gabungan semua bagian wajib identik dengan teks asli (tidak ada yang hilang)"
+        assert parts[-1].endswith("tanpa terpotong."), f"Bagian terakhir wajib berakhir utuh di akhir kalimat: {parts[-1][-80:]!r}"
+        # Teks pendek tetap 1 pesan
+        assert TelegramBotBridge._split_for_telegram("Halo bro, santai aja!") == ["Halo bro, santai aja!"]
+
+        # 17e. send_text benar-benar mengirim SEMUA bagian (bukan cuma potongan pertama)
+        sent_payloads: List[Dict[str, Any]] = []
+
+        class _FakeResp:
+            status_code = 200
+
+            def json(self) -> Dict[str, Any]:
+                return {"ok": True, "result": {"message_id": 7000 + len(sent_payloads)}}
+
+        class _FakeHTTP:
+            async def post(self, url: str, json: Any = None, timeout: Any = None, **kwargs: Any) -> Any:
+                sent_payloads.append(json or {})
+                return _FakeResp()
+
+        split_state_dir = Path(tempfile.mkdtemp(prefix="split_state_", dir=str(ROOT)))
+        tg_split = TelegramBotBridge(state_dir=str(split_state_dir))
+        tg_split.token = "123456789:AADummySyntheticToken00000000001"
+        import agent.telegram_bridge as _tb_mod
+
+        orig_shared_http = _tb_mod.get_shared_http
+        _tb_mod.get_shared_http = lambda: _FakeHTTP()  # type: ignore
+        try:
+            await tg_split.send_text(555, long_reply, reply_markup={"inline_keyboard": []})
+        finally:
+            _tb_mod.get_shared_http = orig_shared_http  # type: ignore
+        assert len(sent_payloads) == len(parts), (
+            f"send_text wajib mengirim {len(parts)} pesan, bukan {len(sent_payloads)} (balasan terpotong = bug lama)"
+        )
+        joined_sent = " ".join(" ".join(p["text"] for p in sent_payloads).split())
+        for w in ("Paragraf ke-1.", "Paragraf ke-7.", "Paragraf ke-13."):
+            assert w in joined_sent, f"Isi '{w}' wajib terkirim utuh ke user"
+        assert "(bagian " in sent_payloads[0]["text"], "Penanda bagian wajib ada agar user tahu balasan berlanjut"
+        assert "reply_markup" in sent_payloads[-1], "Tombol keyboard hanya di pesan terakhir"
+        assert "reply_markup" not in sent_payloads[0], "Pesan pertama tidak boleh membawa keyboard dobel"
+        shutil.rmtree(split_state_dir, ignore_errors=True)
+
+        record(17, "Tahap 5: Anti Balasan 'Setengah' (Token Budget 4096, Auto-Continue, Split Pesan Telegram)", True, "quick_chat 4096 token + thinking off, MAX_TOKENS auto-disambung, balasan panjang dipecah utuh & semua bagian terkirim.")
+
+
     finally:
         if browser is not None:
             await browser.stop()

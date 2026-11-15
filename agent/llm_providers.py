@@ -2360,6 +2360,35 @@ class MultiLLMBrain:
                 user_context = live_ctx + user_context
         screenshot_b64 = dom_state.get("screenshot_b64", "")
 
+        # === VISION THROTTLING (Hemat token + latency) ===
+        # Dulu: gambar dikirim ke LLM SETIAP langkah (~1032 token/gambar, +1-3 detik).
+        # Sekarang: kirim gambar hanya kalau benar-benar membantu penglihatan AI:
+        #   - langkah pertama (AI perlu orientasi di halaman baru)
+        #   - URL berubah (pindah halaman)
+        #   - halaman punya elemen yang belum pernah dilihat (struktur berubah)
+        #   - AI sendiri minta lihat layar (ada penanda "LIHAT LAYAR" di instruksi)
+        # Selain itu, DOM teks sudah cukup untuk menentukan langkah berikutnya.
+        _vision_key = f"{dom_state.get('url', '')}#{len(dom_state.get('elements') or [])}"
+        _force_vision = "LIHAT LAYAR" in (goal or "").upper()
+        _steps = len(history or [])
+        _need_vision = (
+            _force_vision
+            or _steps == 0
+            or _vision_key != getattr(self, "_last_vision_key", "")
+            or (_steps % 5 == 0)
+        )
+        if not _need_vision:
+            screenshot_b64 = ""
+            _perf = getattr(getattr(self, "browser", None), "perf", None)
+            if isinstance(_perf, dict):
+                _perf["vision_skipped"] = _perf.get("vision_skipped", 0) + 1
+        else:
+            self._last_vision_key = _vision_key
+            if screenshot_b64:
+                _perf = getattr(getattr(self, "browser", None), "perf", None)
+                if isinstance(_perf, dict):
+                    _perf["vision_sent"] = _perf.get("vision_sent", 0) + 1
+
         provider = self.config.provider
         if provider == "gemini":
             return await self._call_gemini(user_context, screenshot_b64)

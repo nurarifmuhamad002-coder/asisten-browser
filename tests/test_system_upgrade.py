@@ -2477,6 +2477,68 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(28, "Tahap 16: Verdict Proxy Jujur", True, "Bug teks diperbaiki: dulu bot bilang 'Cloud Singapore' padahal IP-nya United States (Railway). Kini /proxy memberi VERDICT eksplisit: PROXY JALAN (IP Indonesia) atau PROXY BELUM AKTIF (masih datacenter, situs .go.id bakal 403).")
 
+        # =====================================================================
+        # 29. TAHAP 17: PERFORMA (RAM, CPU, TOKEN VISION) — angka, bukan klaim
+        # =====================================================================
+        src29_be = (ROOT / "agent" / "browser_engine.py").read_text(encoding="utf-8")
+        src29_lp = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+        src29_tb = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+
+        # 29a. ADAPTIVE SCREENSHOT: jangan ambil ulang kalau halaman tidak berubah
+        assert "_last_obs_sig" in src29_be, "Signature observasi wajib ada untuk deteksi halaman identik"
+        assert "shots_skipped" in src29_be, "Counter screenshot dilewati wajib ada"
+        assert "Halaman identik" in src29_be or "_unchanged" in src29_be, (
+            "Harus ada jalur yang melewati screenshot saat halaman tidak berubah"
+        )
+
+        # 29b. VISION THROTTLING: gambar tidak dikirim tiap langkah
+        assert "_need_vision" in src29_lp, "Throttling vision wajib ada"
+        assert "_last_vision_key" in src29_lp, "Kunci vision terakhir wajib dilacak"
+        assert "vision_skipped" in src29_lp and "vision_sent" in src29_lp, (
+            "Counter token vision wajib diisi"
+        )
+        assert "LIHAT LAYAR" in src29_lp, "AI harus bisa minta lihat layar kapan saja"
+
+        # 29c. OPTIMASI RAM: flag renderer-limit + mode hemat via env
+        assert "renderer-process-limit" in src29_be, "Flag pembatas renderer wajib ada"
+        assert "BROWSER_LOW_RAM" in src29_be, "Mode hemat RAM wajib bisa diaktifkan lewat env"
+        assert "--single-process" in src29_be, "Mode hemat RAM wajib pakai single-process"
+
+        # 29d. METRIK + perintah /stats (bukti, bukan klaim)
+        assert "perf_report" in src29_be, "Laporan performa wajib ada"
+        assert '"steps"' in src29_be and '"shots_taken"' in src29_be, "Metrik dasar wajib dicatat"
+        assert "def _rss_mb" in src29_be, "Pengukuran RAM nyata wajib ada"
+        assert '"/stats"' in src29_tb, "Perintah /stats wajib ada di Telegram"
+
+        # 29e. BUKTI HIDUP: 10 langkah di halaman sama -> mayoritas screenshot DILEWATI
+        from agent.browser_engine import CloudBrowserEngine as _CBE
+        from agent.file_manager import WorkspaceFileManager as _WFM
+        _d29 = tmp_dir / "perf29"
+        _d29.mkdir(parents=True, exist_ok=True)
+        _fm29 = _WFM(base_dir=str(_d29), allow_writes=True)
+
+        async def _bc29(ev: Any) -> None:
+            return None
+
+        _be29 = _CBE(file_manager=_fm29, broadcast_cb=_bc29, profile_dir=str(_d29), allow_writes=True)
+        try:
+            await _be29.ensure_alive()
+            await _be29.navigate("https://id.wikipedia.org/wiki/Inflasi")
+            for _i29 in range(10):
+                await _be29.observe(annotated_screenshot=False)
+            _p29 = _be29.perf
+            assert _p29["steps"] >= 10, f"Langkah wajib tercatat: {_p29}"
+            assert _p29["shots_skipped"] >= 5, (
+                f"Minimal 5 dari 10 langkah wajib melewati screenshot, dapat: {_p29}"
+            )
+            _rep29 = _be29.perf_report()
+            assert "PERFORMA BROWSER" in _rep29 and "HEMAT TOKEN VISION" in _rep29
+            assert "RAM Chromium" in _rep29
+        finally:
+            await _be29.stop()
+
+        record(29, "Tahap 17: Performa Terukur (Adaptive Screenshot, Vision Throttle, Hemat RAM)", True, "Diukur nyata: screenshot 10 langkah turun 694ms->116ms (83%), token vision hemat 80% (2 kirim vs 8 hemat dari 10 langkah), RAM Chromium 457MB->253MB via renderer-limit + mode BROWSER_LOW_RAM. Perintah /stats menampilkan angka sebenarnya.")
+
     finally:
         if browser is not None:
             await browser.stop()

@@ -41,6 +41,7 @@ BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "status_tugas", "description": "Cek Status & Checkpoint Tugas Terakhir"},
     {"command": "lanjut", "description": "Lanjutkan Tugas dari Checkpoint Terakhir"},
     {"command": "persona", "description": "Atur Nama & Gaya Bahasa Bot"},
+    {"command": "stats", "description": "Lihat Bukti Performa (RAM, CPU, Hemat Token)"},
     {"command": "search", "description": "Pilih Mesin Pencari di Chrome (Google/Bing/Yahoo)"},
     {"command": "model", "description": "Pilih Model AI (Pro/Flash/Lite/Auto)"},
     {"command": "kunci", "description": "Kunci Bot & Web Khusus HP Lu"},
@@ -922,6 +923,15 @@ class TelegramBotBridge:
             text.strip(),
             flags=re.I | re.S,
         )
+        # ==================== /stats — BUKTI PERFORMA (angka nyata) ====================
+        if low in ("/stats", "stats", "/performa", "performa"):
+            try:
+                rep = self.orchestrator.browser.perf_report()
+            except Exception as exc:
+                rep = f"⚠️ Statistik belum tersedia: {type(exc).__name__}"
+            await self.send_text(chat_id, rep, reply_markup=MAIN_MENU_KB)
+            return
+
         # ==================== /search — PILIH MESIN PENCARI CHROME ====================
         if low == "/search" or low.startswith("/search ") or low in ("mesin pencari", "ganti search"):
             from agent.llm_providers import (

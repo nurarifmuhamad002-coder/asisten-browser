@@ -1131,10 +1131,24 @@ class TelegramBotBridge:
                 wait_id = await self.send_text(chat_id, "🌐 Mengecek lokasi IP jalur browser sekarang...")
                 ip_now = await self.orchestrator.browser.check_exit_ip()
                 px_stat = self.orchestrator.browser.proxy_summary()
+                _low_ip = (ip_now or "").lower()
+                _is_id = "indonesia" in _low_ip
+                _is_dc = any(k in _low_ip for k in ("railway", "amazon", "aws", "google", "azure", "hosting", "datacenter", "digitalocean", "ovh", "hetzner"))
+                if _is_id and not _is_dc:
+                    _verdict = (
+                        "✅ PROXY JALAN — IP Indonesia terdeteksi.\n"
+                        "Web .go.id (termasuk All Indonesia) harusnya bisa dibuka."
+                    )
+                else:
+                    _verdict = (
+                        "❌ PROXY BELUM AKTIF — IP lu masih server luar/datacenter.\n"
+                        "Situs .go.id seperti All Indonesia AKAN TETAP DITOLAK (403) sampai proxy Indonesia terpasang."
+                    )
                 msg_px = (
                     "🇮🇩 STATUS JALUR IP BROWSER:\n\n"
                     f"• Mode Proxy: {px_stat}\n"
                     f"• IP Keluar Saat Ini: {ip_now}\n\n"
+                    f"📌 VERDICT: {_verdict}\n\n"
                     "💡 Cara Aktifkan IP Indonesia (tembus Siskopatuh / web .go.id):\n"
                     "Tinggal tempel kode proxy dari penyedia Proxy Residential Indo (format apa aja langsung kebaca otomatis):\n"
                     "  `/proxy host:port:user:pass`\n"
@@ -1168,7 +1182,7 @@ class TelegramBotBridge:
                     )
                 else:
                     done_txt = (
-                        "🔌 Proxy dimatikan — Browser balik ke jalur gratis Cloud Singapore!\n"
+                        "🔌 Proxy dimatikan — Browser balik ke IP server biasa (BUKAN Indonesia).\n"
                         f"• Lokasi IP Sekarang: {res_px.get('ip_info')}"
                     )
                 if wait_id:

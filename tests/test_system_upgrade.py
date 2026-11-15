@@ -2456,6 +2456,27 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(27, "Tahap 15: Pencarian Lewat Chrome (Ketik di Kolom, Google/Bing/Yahoo)", True, "Pencarian kini MEMBUKA Chrome sungguhan lalu MENGETIK di kolom pencarian seperti manusia — kunci yang membuat Google lolos (buka URL hasil langsung = diblokir). Redirect Google /goto & Bing ck/a di-resolve jadi URL asli. Mesin bisa diganti lewat /search. DDG/Ecosia/Brave dibuang karena memblokir IP server. User dapat notifikasi tiap browser dibuka untuk mencari.")
 
+        # =====================================================================
+        # 28. TAHAP 16: HONEST PROXY VERDICT (jangan bohong soal IP)
+        # =====================================================================
+        src28_be = (ROOT / "agent" / "browser_engine.py").read_text(encoding="utf-8")
+        src28_tb = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+
+        # 28a. Jangan hardcode negara/penyedia yang bisa salah (dulu bilang 'Singapore' padahal IP di US)
+        assert "Cloud Singapore" not in src28_be, "Ringkasan proxy tidak boleh hardcode negara"
+        assert "Cloud Singapore" not in src28_tb, "Pesan /proxy off tidak boleh hardcode negara"
+
+        # 28b. /proxy wajib memberi VERDICT eksplisit (jalan / belum), bukan cuma data mentah
+        assert "VERDICT" in src28_tb, "/proxy wajib menyatakan verdict jelas"
+        assert "PROXY BELUM AKTIF" in src28_tb, "Wajib menyatakan tegas kalau proxy belum aktif"
+        assert "PROXY JALAN" in src28_tb, "Wajib menyatakan tegas kalau proxy jalan"
+
+        # 28c. Deteksi datacenter wajib mencakup penyedia cloud umum
+        for _isp in ("railway", "amazon", "google", "azure", "digitalocean", "ovh", "hetzner"):
+            assert _isp in src28_tb, f"Deteksi datacenter wajib mengenali {_isp}"
+
+        record(28, "Tahap 16: Verdict Proxy Jujur", True, "Bug teks diperbaiki: dulu bot bilang 'Cloud Singapore' padahal IP-nya United States (Railway). Kini /proxy memberi VERDICT eksplisit: PROXY JALAN (IP Indonesia) atau PROXY BELUM AKTIF (masih datacenter, situs .go.id bakal 403).")
+
     finally:
         if browser is not None:
             await browser.stop()

@@ -199,7 +199,7 @@ class CloudBrowserEngine:
 
     def proxy_summary(self) -> str:
         if not self.proxy_config or not self.proxy_config.get("server"):
-            return "Mati (Pakai IP Cloud Singapore langsung)"
+            return "Mati (pakai IP server apa adanya — bukan IP Indonesia)"
         srv = self.proxy_config["server"]
         has_auth = " + Login" if self.proxy_config.get("username") else ""
         return f"Aktif ({srv}{has_auth})"

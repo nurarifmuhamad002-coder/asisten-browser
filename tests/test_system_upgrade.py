@@ -1870,6 +1870,107 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(21, "Tahap 9: Tool Loop + Baca Halaman Penuh (#1 & #2)", True, "Ekstraksi artikel bersih (buang nav/iklan/script), decode URL DDG, baca halaman Wikipedia nyata >400 char & ter-cache, AI bisa loop cari->baca->jawab lalu berhenti saat 'answer'.")
 
+        # =====================================================================
+        # 22. TAHAP 10: MODEL FRONTIER + ROUTING 3 TINGKAT + KALKULATOR PYTHON
+        # =====================================================================
+        from agent.llm_providers import MultiLLMBrain as _MB
+
+        # 22a. Router tier: ringan -> light, sedang -> medium, berat -> heavy
+        assert _MB._pick_tier("oy") == "light"
+        assert _MB._pick_tier("p") == "light"
+        assert _MB._pick_tier("halo bro apa kabar hari ini") == "medium"
+        assert _MB._pick_tier("jelasin dampak inflasi ke portofolio gua") == "heavy"
+        assert _MB._pick_tier("analisa risiko investasi kripto gua") == "heavy"
+        assert _MB._pick_tier("harga bitcoin", has_research=True) == "heavy", "Kalau ada riset, wajib naik ke heavy"
+
+        # 22b. Kandidat model per tier: heavy WAJIB pakai model frontier (Pro) dulu
+        cfg_tier = LLMConfig()
+        cfg_tier.update("gemini", "", "dummy-unit-test-key-tier")
+        brain_tier = _MB(cfg_tier)
+        heavy_models = brain_tier._gemini_candidate_models(light_first=False, tier="heavy")
+        assert "gemini-2.5-pro" in heavy_models[:3], f"Tier heavy wajib memprioritaskan model frontier (Pro): {heavy_models[:3]}"
+        assert heavy_models[0].startswith("gemini-2.5-pro") or "pro" in heavy_models[0], (
+            f"Model pertama untuk tier heavy wajib Pro: {heavy_models[0]}"
+        )
+        light_models = brain_tier._gemini_candidate_models(light_first=True)
+        assert "flash-lite" in light_models[0], f"Tier light wajib pakai model hemat: {light_models[0]}"
+        medium_models = brain_tier._gemini_candidate_models(light_first=False, tier="medium")
+        assert "pro" not in medium_models[0], f"Tier medium TIDAK boleh langsung Pro (boros kuota): {medium_models[0]}"
+
+        # 22c. Deteksi kebutuhan kalkulasi
+        for q_calc in (
+            "hitung bunga majemuk 10 juta 5 tahun 8 persen",
+            "itungin cuan reksadana gua",
+            "simulasi cicilan rumah 500 juta tenor 15 tahun",
+            "berapa total 5 x 12",
+        ):
+            assert _MB._needs_calc(q_calc), f"{q_calc!r} wajib memicu kalkulator"
+        for q_nocalc in ("oy", "jelasin inflasi", "apa itu investasi", "siapa presiden indonesia"):
+            assert not _MB._needs_calc(q_nocalc), f"{q_nocalc!r} tidak perlu kalkulator"
+
+        # 22d. Kalkulator EKSEKUSI Python nyata & angkanya benar
+        cfg_calc = LLMConfig()
+        cfg_calc.update("gemini", "gemini-2.5-flash", "dummy-unit-test-key-calc")
+        brain_calc = _MB(cfg_calc)
+        CALC_CODE = (
+            "pokok = 10_000_000\n"
+            "akhir = pokok * (1 + 0.08) ** 5\n"
+            "print(f'Nilai akhir: {akhir:.2f}')\n"
+            "print(f'Cuan: {akhir - pokok:.2f}')\n"
+        )
+
+        async def _fake_calc(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            return ({"candidates": [{"content": {"parts": [{"text": CALC_CODE}]}, "finishReason": "STOP"}]}, None)
+
+        brain_calc._post_gemini_single = _fake_calc  # type: ignore
+        calc_out = await brain_calc._run_calc("hitung bunga majemuk 10 juta 5 tahun 8 persen")
+        assert "HASIL KALKULASI PYTHON" in calc_out, f"Hasil kalkulasi wajib berlabel jelas: {calc_out[:200]!r}"
+        assert "1469328" in calc_out.replace(",", "").replace(".", ""), (
+            f"Angka hasil hitung wajib benar (14.693.281), dapat: {calc_out!r}"
+        )
+        assert "ANGKA NYATA" in calc_out, "Label harus menegaskan ini angka nyata, bukan perkiraan"
+
+        # 22e. PENGAMAN: kode berbahaya wajib DITOLAK (0 eksekusi)
+        async def _fake_evil(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            return ({"candidates": [{"content": {"parts": [{"text": "import os\nos.system('rm -rf /tmp/x')"}]}, "finishReason": "STOP"}]}, None)
+
+        brain_calc._post_gemini_single = _fake_evil  # type: ignore
+        assert await brain_calc._run_calc("hitung apapun") == "", "Kode berbahaya wajib ditolak total (return kosong)"
+
+        async def _fake_net(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            return ({"candidates": [{"content": {"parts": [{"text": "import urllib.request\nprint('x')"}]}, "finishReason": "STOP"}]}, None)
+
+        brain_calc._post_gemini_single = _fake_net  # type: ignore
+        assert await brain_calc._run_calc("hitung apapun") == "", "Akses jaringan wajib ditolak"
+
+        # 22f. /model terdaftar & bisa mengganti model
+        assert "/model" in src_tb or '/model' in src_tb, "Perintah /model wajib terdaftar"
+        src_tb22 = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+        assert '{"command": "model"' in src_tb22, "/model wajib muncul di daftar perintah bot"
+        assert "gemini-2.5-pro" in src_tb22, "Pilihan model Pro wajib tersedia di /model"
+
+        # 22g. Kalkulator benar-benar disuntik ke prompt jawaban
+        cfg_inj = LLMConfig()
+        cfg_inj.update("gemini", "gemini-2.5-flash", "dummy-unit-test-key-inj")
+        brain_inj = _MB(cfg_inj)
+        captured_inj: Dict[str, Any] = {}
+
+        async def _fake_inj(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            gen = payload.get("generationConfig") or {}
+            # panggilan penulis kode (maxOutputTokens 800) vs panggilan jawaban
+            if gen.get("maxOutputTokens") == 800:
+                return ({"candidates": [{"content": {"parts": [{"text": "print('TOTAL=12345')"}]}, "finishReason": "STOP"}]}, None)
+            captured_inj["payload"] = payload
+            return ({"candidates": [{"content": {"parts": [{"text": "Hasilnya Rp 12.345 bro."}]}, "finishReason": "STOP"}]}, None)
+
+        brain_inj._post_gemini_single = _fake_inj  # type: ignore
+        await brain_inj.quick_chat("hitung total 5 x 12 juta")
+        inj_prompt = captured_inj["payload"]["contents"][0]["parts"][0]["text"]
+        assert "HASIL KALKULASI PYTHON" in inj_prompt, "Hasil kalkulasi WAJIB masuk ke prompt jawaban akhir"
+        assert "TOTAL=12345" in inj_prompt, "Angka hasil hitung wajib ikut terkirim ke AI"
+
+        record(22, "Tahap 10: Model Frontier + Routing 3 Tingkat + Kalkulator Python", True, "Routing light/medium/heavy (heavy wajib Pro), /model bisa ganti model, kalkulator eksekusi Python nyata (14.693.281 benar) & tolak 100% kode berbahaya/jaringan.")
+
     finally:
         if browser is not None:
             await browser.stop()

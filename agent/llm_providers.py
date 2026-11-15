@@ -860,6 +860,7 @@ class MultiLLMBrain:
         self.last_error_kind: str = ""
         self.last_error_detail: str = ""
         self.last_research_trail: List[str] = []
+        self.last_tier: str = ""
         self._unavailable_models: Dict[str, float] = {}
         self._llm_semaphore = asyncio.Semaphore(2)
         self._sleep_fn: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep
@@ -876,29 +877,162 @@ class MultiLLMBrain:
     def _mark_model_unavailable(self, model_name: str, ttl_sec: float = 600.0) -> None:
         self._unavailable_models[model_name] = _time.monotonic() + ttl_sec
 
-    def _gemini_candidate_models(self, *, light_first: bool = False) -> List[str]:
-        if light_first:
-            base_list = [
-                "gemini-3.5-flash-lite",
-                "gemini-3.1-flash-lite",
-                "gemini-2.5-flash-lite",
-                "gemini-2.5-flash",
-            ]
+    def _gemini_candidate_models(self, *, light_first: bool = False, tier: str = "") -> List[str]:
+        """
+        3 tingkat model (biar otak maksimal tanpa jebol kuota):
+          - "heavy"  : pertanyaan analitis/panjang -> model frontier (Pro) dulu
+          - "medium" : obrolan biasa              -> Flash
+          - "light"  : sapaan/klasifikasi         -> Flash-Lite (murah & cepat)
+        """
+        heavy_pool = [
+            "gemini-2.5-pro",
+            "gemini-3-pro-preview",
+            "gemini-2.5-flash",
+        ]
+        medium_pool = ["gemini-3.6-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
+        light_pool = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
+
+        if light_first or tier == "light":
+            base_list = light_pool + ["gemini-2.5-flash"]
+        elif tier == "heavy":
+            base_list = heavy_pool + light_pool
         else:
-            smart_pool = ["gemini-3.6-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
-            rot = self._rr_idx % len(smart_pool)
+            rot = self._rr_idx % len(medium_pool)
             self._rr_idx += 1
             base_list = (
-                smart_pool[rot:]
-                + smart_pool[:rot]
-                + ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
+                medium_pool[rot:]
+                + medium_pool[:rot]
+                + light_pool
             )
-            cfg_m = (self.config.model or "").strip()
-            if cfg_m and "flash-lite" not in cfg_m and cfg_m not in base_list:
-                base_list.insert(0, cfg_m)
+
+        cfg_m = (self.config.model or "").strip()
+        if cfg_m and "flash-lite" not in cfg_m and cfg_m not in base_list:
+            base_list.insert(0, cfg_m)
 
         avail = [m for m in base_list if not self._is_model_temporarily_unavailable(m)]
         return avail or base_list
+
+    @staticmethod
+    def _needs_calc(message: str) -> bool:
+        """Deteksi apakah user minta hitungan/analisis angka yang wajib akurat."""
+        q = (message or "").lower()
+        calc_markers = (
+            "hitung", "itung", "itungin", "kalkulasi", "simulasi", "proyeksi",
+            "bunga majemuk", "compound", "cuan", "return", "persen", "persentase",
+            "berapa total", "totalnya", "rata-rata", "average", "median",
+            "konversi", "konvert", "kurs", "perbandingan", "rasio", "break even",
+            "bep", "amortisasi", "cicilan", "angsuran", "dp ", "tenor",
+        )
+        if any(w in q for w in calc_markers):
+            return True
+        # Ada angka + kata finansial = kemungkinan besar butuh hitungan
+        has_num = bool(re.search(r"\d", q))
+        fin_words = ("juta", "miliar", "ribu", "rupiah", "rp", "dollar", "usd", "tahun", "bulan", "persen", "%")
+        return has_num and any(w in q for w in fin_words)
+
+    async def _run_calc(self, message: str, model_timeout: float = 20.0) -> str:
+        """
+        KALKULATOR NYATA: AI menulis kode Python, sistem mengeksekusi di subprocess terisolasi,
+        lalu hasilnya disuntik balik ke konteks jawaban. Jadi angkanya benar, bukan dikira-kira.
+        """
+        if self.config.provider != "gemini" or not self.config.has_api_key:
+            return ""
+
+        code_sys = (
+            "Kamu penulis kode Python untuk KALKULASI. Tugasmu: tulis SATU skrip Python yang "
+            "menjawab pertanyaan user dengan angka akurat.\n"
+            "ATURAN:\n"
+            "- HANYA output kode Python murni. Tanpa penjelasan, tanpa markdown fence.\n"
+            "- Gunakan hanya modul standar (math, statistics, datetime, json). JANGAN import pandas/numpy.\n"
+            "- WAJIB gunakan print() untuk menampilkan hasil akhir yang jelas & berlabel.\n"
+            "- Tampilkan angka penting + satuan. Bulatkan wajar (2 desimal untuk uang).\n"
+            "- Jangan pakai input(), jangan akses jaringan, jangan baca/tulis file.\n"
+            "- Kalau datanya kurang, hitung dengan asumsi eksplisit dan cetak asumsinya."
+        )
+        try:
+            payload = {
+                "system_instruction": {"parts": [{"text": code_sys}]},
+                "contents": [{"role": "user", "parts": [{"text": message[:2000]}]}],
+                "generationConfig": {"temperature": 0.0, "maxOutputTokens": 800},
+            }
+            data, _err = await self._post_gemini_single(
+                self._gemini_candidate_models(light_first=False, tier="medium")[0],
+                payload,
+                timeout=model_timeout,
+            )
+            if data is None:
+                return ""
+            code = self._extract_gemini_text(data)
+        except Exception:
+            return ""
+
+        if not code:
+            return ""
+        # Bersihkan pagar markdown kalau AI bandel
+        code = re.sub(r"^```(?:python)?\s*", "", code.strip())
+        code = re.sub(r"```\s*$", "", code).strip()
+        if "def " in code and "print(" not in code:
+            return ""
+        if not code:
+            return ""
+
+        # Pengaman: tolak kode berbahaya
+        blocked = (
+            "import os", "import sys", "import subprocess", "import socket", "import shutil",
+            "open(", "exec(", "eval(", "__import__", "requests", "urllib", "pathlib",
+            "input(", "rm ", "unlink", "remove(", "system(", "popen", "chmod",
+        )
+        low_code = code.lower()
+        if any(b in low_code for b in blocked):
+            return ""
+
+        import subprocess as _sp
+        import sys as _sys
+
+        try:
+            proc = await asyncio.to_thread(
+                _sp.run,
+                [_sys.executable, "-I", "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+        except Exception:
+            return ""
+
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if not out and not err:
+            return ""
+        if proc.returncode != 0 and not out:
+            return ""
+
+        return (
+            "=== HASIL KALKULASI PYTHON (ANGKA NYATA, SUDAH DIHITUNG) ===\n"
+            f"{out[:2500]}\n"
+            + (f"(catatan: {err[:200]})\n" if err else "")
+            + "=== AKHIR HASIL KALKULASI ===\n"
+            "_Gunakan angka di atas apa adanya sebagai hasil hitungan final._\n"
+        )
+
+    @staticmethod
+    def _pick_tier(message: str, has_research: bool = False) -> str:
+        """Tentukan kelas model dari bobot pertanyaan."""
+        q = (message or "").lower().strip()
+        if len(q) < 12:
+            return "light"
+        heavy_markers = (
+            "jelasin", "jelaskan", "analisa", "analisis", "bandingin", "bandingkan", "strategi",
+            "rencana", "dampak", "risiko", "kenapa", "mengapa", "bagaimana", "prediksi",
+            "proyeksi", "hitung", "simulasi", "evaluasi", "rekomendasi", "menurut lu",
+            "pendapat", "opini", "banding", "kelebihan", "kekurangan", "untung", "rugi",
+            "investasi", "saham", "portofolio", "bisnis", "karier", "keputusan", "pilih",
+        )
+        if any(w in q for w in heavy_markers):
+            return "heavy"
+        if len(q) > 160 or has_research:
+            return "heavy"
+        return "medium"
 
     @staticmethod
     def _extract_gemini_text(data: Dict[str, Any]) -> str:
@@ -1094,6 +1228,14 @@ class MultiLLMBrain:
                 except Exception:
                     research_ctx = ""
 
+        # KALKULATOR: kalau user minta hitungan, jalankan Python DULU biar angkanya akurat.
+        calc_ctx = ""
+        if self._needs_calc(message):
+            try:
+                calc_ctx = await asyncio.wait_for(self._run_calc(message), timeout=25.0)
+            except Exception:
+                calc_ctx = ""
+
         mem_part = (user_memory_block.strip() + "\n\n") if user_memory_block else ""
         chat_sys = (
             "Kamu adalah agent AI pribadi milik user, jalan di Telegram. Gaya ngomong: santai, hangat, dan to-the-point "
@@ -1142,34 +1284,42 @@ class MultiLLMBrain:
             "buka & kendalikan browser server, isi form, login, scraping/rangkum web, bikin file Word/Excel/PDF, "
             "ingat profil user (/ingat), dan kontrol layar live."
         )
-        prompt = f"{mem_part}{hist_block}{live_ctx}{research_ctx}USER: {message}"
+        prompt = f"{mem_part}{hist_block}{live_ctx}{research_ctx}{calc_ctx}USER: {message}"
 
         async with self._llm_semaphore:
             if self.config.provider == "gemini":
-                fast_order = self._gemini_candidate_models(light_first=False)
+                # Routing otomatis: pertanyaan berat -> model frontier (Pro), ringan -> Flash/Lite
+                tier = self._pick_tier(message, has_research=bool(research_ctx or calc_ctx))
+                self.last_tier = tier
+                fast_order = self._gemini_candidate_models(light_first=False, tier=tier)
                 backoff_step = 0
                 last_err: Optional[LLMCallError] = None
 
                 # Semua kandidat tetap dicoba (resiliensi), TAPI dibatasi deadline total ~14 detik
                 # supaya bot nggak kelihatan "diem" berjam-jam saat provider sedang gangguan.
-                deadline_chat = _time.monotonic() + 30.0
+                deadline_chat = _time.monotonic() + (75.0 if tier == "heavy" else 30.0)
                 for m_name in fast_order:
                     if _time.monotonic() >= deadline_chat and last_err is not None:
                         break
                     # CATATAN: maxOutputTokens dinaikkan dari 1200 -> 4096 supaya jawaban panjang
                     # tidak terpotong di tengah kalimat. thinkingConfig dimatikan karena pada model
                     # thinking, token "mikir" ikut memakan kuota output -> jawaban jadi setengah.
+                    # Heavy (Pro) dapat ruang token lebih besar untuk analisis mendalam.
+                    _is_heavy = tier == "heavy"
                     gen_cfg: Dict[str, Any] = {
                         "temperature": 0.4,
-                        "maxOutputTokens": 4096,
-                        "thinkingConfig": {"thinkingBudget": 0},
+                        "maxOutputTokens": 8192 if _is_heavy else 4096,
                     }
+                    # Model Lite/Flash: matikan thinking supaya token penuh untuk teks.
+                    # Model Pro: BIARKAN thinking default (itu yang bikin nalarnya dalam).
+                    if not _is_heavy:
+                        gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
                     payload = {
                         "system_instruction": {"parts": [{"text": chat_sys}]},
                         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                         "generationConfig": gen_cfg,
                     }
-                    data, err = await self._post_gemini_single(m_name, payload, timeout=30.0)
+                    data, err = await self._post_gemini_single(m_name, payload, timeout=55.0 if _is_heavy else 30.0)
                     if data is not None:
                         ans = self._extract_gemini_text(data)
                         finish = self._gemini_finish_reason(data)

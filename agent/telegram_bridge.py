@@ -41,6 +41,7 @@ BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "status_tugas", "description": "Cek Status & Checkpoint Tugas Terakhir"},
     {"command": "lanjut", "description": "Lanjutkan Tugas dari Checkpoint Terakhir"},
     {"command": "persona", "description": "Atur Nama & Gaya Bahasa Bot"},
+    {"command": "model", "description": "Pilih Model AI (Pro/Flash/Lite/Auto)"},
     {"command": "kunci", "description": "Kunci Bot & Web Khusus HP Lu"},
     {"command": "stop", "description": "Hentikan Proses Saat Ini"},
 ]
@@ -838,6 +839,61 @@ class TelegramBotBridge:
             text.strip(),
             flags=re.I | re.S,
         )
+        # ==================== /model — PILIH MODEL & MODE ROUTING ====================
+        if low == "/model" or low.startswith("/model ") or low in ("model", "ganti model"):
+            cfg_m = self.orchestrator.llm_config
+            arg = text.split(None, 1)[1].strip().lower() if len(text.split(None, 1)) > 1 else ""
+            if not arg:
+                await self.send_text(
+                    chat_id,
+                    "🧠 MODEL AI LU SEKARANG:\n\n"
+                    f"• Model aktif : {cfg_m.model or '(default)'}\n"
+                    f"• Provider    : {cfg_m.provider}\n"
+                    f"• Routing     : AUTO 3 tingkat "
+                    "(pertanyaan berat → Pro, sedang → Flash, ringan → Lite)\n\n"
+                    "GANTI MODEL (ketik salah satu):\n"
+                    "`/model pro`      → gemini-2.5-pro (paling pinter, kuota lebih boros)\n"
+                    "`/model flash`    → gemini-2.5-flash (seimbang, default)\n"
+                    "`/model lite`     → gemini-2.5-flash-lite (paling hemat)\n"
+                    "`/model auto`     → balik ke routing otomatis 3 tingkat\n\n"
+                    "Atau model spesifik: `/model gemini-2.5-pro`",
+                    reply_markup=MAIN_MENU_KB,
+                )
+                return
+
+            mapping = {
+                "pro": "gemini-2.5-pro",
+                "flash": "gemini-2.5-flash",
+                "lite": "gemini-2.5-flash-lite",
+                "auto": "",
+            }
+            new_model = mapping.get(arg, arg)
+            try:
+                if new_model:
+                    cfg_m.model = new_model
+                    self.orchestrator._persist_llm_config() if hasattr(self.orchestrator, "_persist_llm_config") else None
+                    await self.send_text(
+                        chat_id,
+                        f"✅ Model diganti ke *{new_model}*.\n\n"
+                        "Catatan: routing otomatis tetap jalan — pertanyaan ringan bisa tetap pakai model lebih hemat.",
+                        reply_markup=MAIN_MENU_KB,
+                    )
+                else:
+                    cfg_m.model = ""
+                    await self.send_text(
+                        chat_id,
+                        "✅ Balik ke *AUTO routing* 3 tingkat:\n"
+                        "• Berat → Pro\n• Sedang → Flash\n• Ringan → Lite",
+                        reply_markup=MAIN_MENU_KB,
+                    )
+            except Exception as exc:
+                await self.send_text(
+                    chat_id,
+                    f"⚠️ Gagal ganti model ({type(exc).__name__}). Coba lagi ya bro.",
+                    reply_markup=MAIN_MENU_KB,
+                )
+            return
+
         # ==================== /persona — ATUR NAMA & GAYA BAHASA BOT ====================
         if low == "/persona" or low.startswith("/persona ") or low in ("gaya bahasa", "ganti gaya"):
             arg = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""

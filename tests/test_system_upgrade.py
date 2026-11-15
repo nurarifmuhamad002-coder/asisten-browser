@@ -1834,6 +1834,23 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         assert "HASIL RISET BERTAHAP" in ctx_t, "Konteks wajib diberi label riset bertahap"
         assert len(ctx_t) > 1000, f"Konteks akhir wajib kaya data: {len(ctx_t)} char"
 
+        # 21f-2. REGRESI: baca halaman penuh WAJIB terjadi otomatis walau AI tidak minta.
+        # (bug lama: riset awal hanya simpan judul tanpa URL -> halaman tidak pernah dibaca)
+        cfg_auto = LLMConfig()
+        cfg_auto.update("gemini", "gemini-2.5-flash", "dummy-unit-test-key-09")
+        brain_auto = MultiLLMBrain(cfg_auto)
+
+        async def _fake_post_idle(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            return ({"candidates": [{"content": {"parts": [{"text": "{\"tool\":\"answer\"}"}]}, "finishReason": "STOP"}]}, None)
+
+        brain_auto._post_gemini_single = _fake_post_idle  # type: ignore
+        ctx_auto, trail_auto = await _research_with_tools("apa itu investasi", brain_auto, max_rounds=2)
+        assert "ISI HALAMAN PENUH" in ctx_auto, (
+            f"Walau AI langsung minta 'answer', sistem WAJIB baca 1 halaman penuh otomatis: trail={trail_auto}"
+        )
+        assert any("baca:" in x for x in trail_auto), f"Jejak wajib mencatat pembacaan halaman: {trail_auto}"
+        assert len(ctx_auto) > 2500, f"Konteks wajib substansial setelah baca halaman: {len(ctx_auto)} char"
+
         # 21g. Loop berhenti kalau AI minta 'answer' (tidak berputar selamanya)
         n_dec["n"] = 0
         decisions.clear()

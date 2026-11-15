@@ -220,13 +220,15 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
             r = await c.get("https://html.duckduckgo.com/html/", params={"q": q})
             if r.status_code != 200:
                 return []
-            for m in re.finditer(r'result__a[^>]*>(.*?)</a>', r.text, re.S):
-                title = _html.unescape(re.sub(r"<[^>]+>", " ", m.group(1))).strip()
-                title = re.sub(r"\s+", " ", title)
-                if len(title) > 12:
-                    out.append(title[:150])
-                if len(out) >= max_items:
-                    break
+            # Ambil judul + URL sekaligus supaya AI bisa memilih halaman untuk dibaca penuh
+            for title, href in _extract_result_links(r.text, limit=max_items):
+                out.append(f"{title} — {href}")
+            # Simpan URL mentah untuk pembacaan halaman berikutnya
+            try:
+                _LAST_LINKS.clear()
+                _LAST_LINKS.extend([h for _t, h in _extract_result_links(r.text, limit=max_items)])
+            except Exception:
+                pass
         return out
 
     async def _wikipedia() -> List[str]:
@@ -242,7 +244,8 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
                 snip = _html.unescape(re.sub(r"<[^>]+>", " ", item.get("snippet") or ""))
                 snip = re.sub(r"\s+", " ", snip).strip()
                 if item.get("title"):
-                    out.append(f"Wikipedia — {item['title']}: {snip[:260]}")
+                    wurl = f"https://id.wikipedia.org/wiki/{str(item['title']).replace(' ', '_')}"
+                    out.append(f"Wikipedia — {item['title']}: {snip[:260]} — {wurl}")
         return out
 
     async def _google_news() -> List[str]:
@@ -323,6 +326,7 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
 # PEMBACA HALAMAN PENUH (#2) — bukan cuma judul/snippet, tapi isi artikelnya.
 # =========================================================================
 _PAGE_CACHE: Dict[str, Tuple[float, str]] = {}
+_LAST_LINKS: List[str] = []
 _UNREADABLE_HOSTS = (
     "youtube.com", "youtu.be", "facebook.com", "instagram.com", "twitter.com", "x.com",
     "tiktok.com", "linkedin.com", "whatsapp.com", "t.me", "pinterest.com",
@@ -497,7 +501,7 @@ async def _research_with_tools(
         trail.append("riset awal")
 
     # Kumpulkan kandidat URL dari hasil awal (kalau ada)
-    candidate_urls: List[Tuple[str, str]] = []
+    candidate_urls: List[Tuple[str, str]] = [("", u) for u in list(_LAST_LINKS)[:3]]
     for ln in (base_ctx or "").splitlines():
         if ln.startswith("- ") and "http" in ln:
             m = re.search(r"(https?://[^\s)]+)", ln)
@@ -586,6 +590,17 @@ async def _research_with_tools(
             if txt:
                 read_urls.append(u)
                 trail.append("baca: (otomatis)")
+                notes.append(f"--- ISI HALAMAN PENUH: {u} ---\n{txt}")
+                break
+
+    # Jaminan: kalau belum ada halaman yang dibaca, baca 1 URL dari jejak riset.
+    # (dievaluasi ulang di sini karena candidate_urls terisi selama loop berjalan)
+    if not read_urls and candidate_urls:
+        for _, u in candidate_urls[:2]:
+            txt = await _fetch_page_text(u, max_chars=3000)
+            if txt:
+                read_urls.append(u)
+                trail.append("baca: " + u[:45])
                 notes.append(f"--- ISI HALAMAN PENUH: {u} ---\n{txt}")
                 break
 

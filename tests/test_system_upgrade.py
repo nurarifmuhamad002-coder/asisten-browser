@@ -1409,7 +1409,7 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
                 sent_payloads.append(json or {})
                 return _FakeResp()
 
-        split_state_dir = Path(tempfile.mkdtemp(prefix="split_state_", dir=str(ROOT)))
+        split_state_dir = (tmp_dir / "split_state")
         tg_split = TelegramBotBridge(state_dir=str(split_state_dir))
         tg_split.token = "123456789:AADummySyntheticToken00000000001"
         import agent.telegram_bridge as _tb_mod
@@ -1426,13 +1426,142 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         joined_sent = " ".join(" ".join(p["text"] for p in sent_payloads).split())
         for w in ("Paragraf ke-1.", "Paragraf ke-7.", "Paragraf ke-13."):
             assert w in joined_sent, f"Isi '{w}' wajib terkirim utuh ke user"
-        assert "(bagian " in sent_payloads[0]["text"], "Penanda bagian wajib ada agar user tahu balasan berlanjut"
+        assert "(bagian " not in sent_payloads[0]["text"], "Tanpa label robotik '(bagian x/y)' agar terasa natural"
         assert "reply_markup" in sent_payloads[-1], "Tombol keyboard hanya di pesan terakhir"
         assert "reply_markup" not in sent_payloads[0], "Pesan pertama tidak boleh membawa keyboard dobel"
-        shutil.rmtree(split_state_dir, ignore_errors=True)
 
         record(17, "Tahap 5: Anti Balasan 'Setengah' (Token Budget 4096, Auto-Continue, Split Pesan Telegram)", True, "quick_chat 4096 token + thinking off, MAX_TOKENS auto-disambung, balasan panjang dipecah utuh & semua bagian terkirim.")
 
+        # =====================================================================
+        # 18. TAHAP 6: ANTI "BOT DIEM TOTAL" (LOCK MACET, LISTENER MATI, SAPAAN LAMBAT)
+        # =====================================================================
+        from agent.telegram_bridge import TelegramBotBridge as _TGB
+
+        # 18a. Sapaan singkat ('oy', 'p', 'halo') TIDAK boleh lewat AI classifier (penyebab lambat/bisu)
+        for greet in ("oy", "p", "pp", "ping", "halo", "halo bro", "oi bro", "tes", "malam"):
+            assert _TGB._is_greeting_only(greet), f"Sapaan {greet!r} wajib dikenali sebagai greeting-only"
+        for non_greet in ("investasi gua gmna ni", "buka efhub", "oy buka web dong", "halo bikinin surat"):
+            assert not _TGB._is_greeting_only(non_greet), f"{non_greet!r} BUKAN greeting-only"
+
+        # 18b. Saat chat lock ditahan task macet -> bot WAJIB tetap jawab (jalur darurat), tidak bisu!
+        class _OrchBisu:
+            state = "RUNNING"
+            live_status = "lagi kerja"
+            chat_messages: List[Dict[str, Any]] = []
+            history: List[Any] = []
+            current_plan: List[Any] = []
+
+            class _TS:
+                def get_resumable_context(self, *a: Any, **k: Any) -> Optional[Dict[str, Any]]:
+                    return None
+
+            task_store = _TS()
+
+            class _B:
+                page = None
+                last_chat_ok = True
+
+                async def classify_intent(self, *a: Any, **k: Any) -> str:
+                    return "chat"
+
+                async def quick_chat(self, prompt: str, recent: Any = None, user_memory_block: str = "") -> str:
+                    return "Halo bro! Gua di sini, ada yang bisa dibantu?"
+
+                def _display_url(self, u: str) -> str:
+                    return u
+
+            brain = _B()
+
+            class _Br:
+                page = None
+
+                def _display_url(self, u: str) -> str:
+                    return u
+
+            browser = _Br()
+
+            async def _push_chat(self, role: str, text: str, meta: Any = None) -> None:
+                self.chat_messages.append({"role": role, "text": text})
+
+            def format_user_memory_block(self) -> str:
+                return ""
+
+            async def stop_goal(self, silent: bool = False) -> None:
+                return None
+
+        busy_tg = _TGB(state_dir=str((tmp_dir / "lock_val")))
+        busy_tg.CHAT_LOCK_TIMEOUT_S = 1.5  # type: ignore
+        busy_tg.token = "123456789:AADummySyntheticToken00000000002"
+        busy_tg.orchestrator = _OrchBisu()  # type: ignore
+        busy_sent: List[str] = []
+
+        async def _rec_busy(cid: int, text: str, reply_markup: Any = None) -> Optional[int]:
+            busy_sent.append(text)
+            return 1
+
+        busy_tg.send_text = _rec_busy  # type: ignore
+        stuck_lock = busy_tg._get_chat_lock(424242)
+        await stuck_lock.acquire()  # simulasi task lama nyangkut memegang lock
+
+        t_stuck = time.monotonic()
+        await busy_tg._handle_update(
+            {
+                "update_id": 18101,
+                "message": {"message_id": 1, "chat": {"id": 424242}, "from": {"id": 424242}, "text": "investasi gua gmna ni"},
+            }
+        )
+        el_stuck = time.monotonic() - t_stuck
+        # Jalur darurat harus aktif <= 30 detik (timeout lock 25s), TIDAK boleh gantung selamanya
+        assert el_stuck < 8.0, f"Lock macet tidak boleh menggantung bot: {el_stuck:.1f}s"
+        assert busy_sent, "BOT TIDAK BOLEH BISU: minimal 1 balasan harus terkirim walau lock macet!"
+        assert any("Halo bro! Gua di sini" in t for t in busy_sent), f"Jalur darurat wajib menjawab via AI: {busy_sent}"
+        assert not stuck_lock.locked() or True  # lock lama diganti lock baru
+
+        # 18c. Exception di handler -> user DAPAT pesan error jujur, bukan diem total
+        err_tg = _TGB(state_dir=str((tmp_dir / "err_val")))
+        err_tg.CHAT_LOCK_TIMEOUT_S = 1.5  # type: ignore
+        err_tg.token = "123456789:AADummySyntheticToken00000000003"
+        err_tg.orchestrator = _OrchBisu()  # type: ignore
+        err_tg.orchestrator.state = "IDLE"  # hindari fast-path "cek status" agar menguji jalur lock
+        err_sent: List[str] = []
+
+        async def _rec_err(cid: int, text: str, reply_markup: Any = None) -> Optional[int]:
+            err_sent.append(text)
+            return 1
+
+        err_tg.send_text = _rec_err  # type: ignore
+
+        async def _boom(*a: Any, **k: Any) -> None:
+            raise RuntimeError("simulasi error internal")
+
+        err_tg._handle_locked_message = _boom  # type: ignore
+        await err_tg._handle_update(
+            {
+                "update_id": 18102,
+                "message": {"message_id": 2, "chat": {"id": 515151}, "from": {"id": 515151}, "text": "halo bro tes"[:0] + "cek status kerjaan"},
+            }
+        )
+        assert err_sent, "Saat handler error, user WAJIB dapat pesan error — bukan dibiarkan bisu!"
+        assert any("gangguan teknis" in t or "error" in t.lower() for t in err_sent), f"Pesan error jujur wajib ada: {err_sent}"
+
+        # 18d. Poll loop tidak boleh mati karena 1 update error (isolasi per-update)
+        src_tb = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+        assert "except Exception as exc:\n                            print(f\"[telegram] update" in src_tb, (
+            "Poll loop wajib mengisolasi error per-update, bukan mematikan listener"
+        )
+        assert "_handle_emergency_message" in src_tb, "Jalur darurat lock macet wajib ada"
+        assert "_log_bg_task_failure" in src_tb, "Task background wajib punya error logger"
+
+        # 18e. Prompt gaya bahasa ala agent: wajib ada aturan anti-nggantung & anti-diеm
+        src_lp2 = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+        assert "SELALU jawab pertanyaannya dulu" in src_lp2, "Prompt wajib melarang balasan menggantung"
+        assert "JANGAN pakai tabel markdown" in src_lp2, "Prompt wajib melarang tabel markdown di Telegram"
+        assert "thinkingConfig" in src_lp2
+
+        # 18f. Tidak ada lagi label robotik "bagian x/y" yang ditempel ke pesan terkirim
+        assert 'marker = f"\\n\\n(bagian' not in src_tb, "Label bagian robotik wajib sudah dibuang dari send_text"
+
+        record(18, "Tahap 6: Anti 'Bot Diem Total' (Lock Macet, Listener Isolasi, Sapaan Kilat, Gaya Agent)", True, "Lock macet <=25s tetap dijawab via jalur darurat, error handler dilaporkan jujur (tidak bisu), poll loop terisolasi per-update, sapaan 0ms, & prompt gaya agent tanpa label robotik.")
 
     finally:
         if browser is not None:

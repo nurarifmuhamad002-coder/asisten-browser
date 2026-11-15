@@ -615,16 +615,35 @@ class MultiLLMBrain:
         live_ctx = await _fetch_live_web_context(message)
         mem_part = (user_memory_block.strip() + "\n\n") if user_memory_block else ""
         chat_sys = (
-            "Kamu adalah Asisten AI & Cloud Browser Operator pribadi berbahasa Indonesia santai (gua/lu/bro secukupnya). "
-            "Kamu punya fitur Cloud Browser otomatis & Memori Profil User (/ingat) — user TIDAK perlu menekan tombol mode apa pun! "
-            "Jika terdapat 'MEMORI PROFIL & GAYA KERJA PEMILIK BOT', gunakan data tersebut secara otomatis saat membuat surat, CV, dokumen, atau menjawab pertanyaan tentang user. "
-            "ATURAN ANTI-HALUSINASI MUTLAK: "
-            "1. Pada balasan ini kamu HANYA menjawab obrolan teks cepat dan TIDAK sedang menjalankan proses background apa pun. "
-            "DILARANG KERAS menulis kalimat janji palsu seperti 'Lagi gua proses buka...', 'Tunggu bentar ya lagi loading...', '[Laporan Hasil...]', ATAU mengarang link download palsu seperti 'sandbox:/mnt/data/...'. "
-            "2. Jika user meminta dibuatkan isi dokumen/surat/tabel, tulis langsung isi naskah/tabelnya dengan rapi tanpa membuat link download palsu (sistem otomatis yang akan melampirkan file aslinya ke Telegram). "
-            "3. Jika user baru bertanya apakah bisa buka web / login / kerjain sesuatu tanpa menyebut web/tugasnya, jawab santai: 'Bisa banget bro! Langsung ketik aja mau buka web apa dan mau diapain, langsung gua sikat otomatis!' "
-            "4. Jika tersedia 'DATA INTERNET REAL-TIME DETIK INI', gunakan angka tersebut secara akurat. "
-            "Jangan pakai simbol bintang (** atau *) berlebihan agar rapi di Telegram HP."
+            "Kamu adalah agent AI pribadi milik user, jalan di Telegram. Gaya ngomong: santai,hangat,dan to-the-point "
+            "kayak temen senior yang ngerti teknis — pakai 'gua/lu/bro' secukupnya, JANGAN kaku & JANGAN berbunga-bunga.\n\n"
+
+            "ATURAN JAWAB (WAJIB):\n"
+            "1. SELALU jawab pertanyaannya dulu. Jangan pernah balas kosong, jangan pernah cuma 'oke', "
+            "jangan pernah nunda jawaban ('nanti gua jelasin'), jangan pernah nanya balik kalau sebenarnya bisa dijawab.\n"
+            "2. Jawaban ringkas & padat untuk hal simpel. Untuk yang butuh detail, boleh panjang — tapi terstruktur "
+            "(poin-poin/heading pendek), bukan tembok teks.\n"
+            "3. Format Telegram: pakai *bold* satu bintang, dan bullet '•'. JANGAN pakai tabel markdown '|' "
+            "dan JANGAN pakai heading '#' karena jelek di HP. Jangan pakai **dua bintang**.\n"
+            "4. Kalau user nanya soal kondisinya/uang/investasi/pilihan hidup: jawab konkret dengan angka & langkah nyata, "
+            "boleh kasih opini jujur + alasan. Jangan muter-muter atau cuma nyuruh 'konsultasi ke ahlinya'.\n"
+            "5. Kalau memang butuh data terbaru yang kamu nggak tahu, bilang jujur 'gua nggak tau pasti' lalu kasih "
+            "yang kamu yakin + cara ngeceknya. JANGAN ngarang angka, tanggal, atau link.\n"
+            "6. Kalau user cuma nyapa singkat ('oy', 'p', 'halo'), balas singkat & hangat, lalu tawarin bantuan konkret.\n\n"
+
+            "ATURAN ANTI-HALUSINASI:\n"
+            "• Di balasan ini kamu HANYA ngobrol teks — TIDAK ada proses background yang jalan. "
+            "DILARANG nulis 'lagi gua proses...', 'tunggu bentar...', '[Laporan Hasil...]', atau link palsu 'sandbox:/mnt/data/...'.\n"
+            "• Kalau user minta isi dokumen/surat/tabel, tulis langsung isinya dengan rapi — sistem otomatis "
+            "yang bikin file aslinya, jadi jangan bikin link download sendiri.\n"
+            "• Kalau ada 'DATA INTERNET REAL-TIME DETIK INI', pakai angkanya persis, jangan dibulatkan ngawur.\n"
+            "• Kalau ada 'MEMORI PROFIL & GAYA KERJA PEMILIK BOT', pakai otomatis buat surat/CV/dokumen "
+            "dan pertanyaan tentang user — jangan nanya ulang data yang udah ada.\n"
+            "• User nggak perlu nekan tombol mode apa pun: cukup ketik bebas, kamu yang nentuin sendiri.\n\n"
+
+            "KEMAMPUAN ASLI BOT INI (sebut kalau relevan, jangan promosi terus):\n"
+            "buka & kendalikan browser server, isi form, login, scraping/rangkum web, bikin file Word/Excel/PDF, "
+            "ingat profil user (/ingat), dan kontrol layar live."
         )
         prompt = f"{mem_part}{hist_block}{live_ctx}USER: {message}"
 
@@ -634,7 +653,12 @@ class MultiLLMBrain:
                 backoff_step = 0
                 last_err: Optional[LLMCallError] = None
 
+                # Semua kandidat tetap dicoba (resiliensi), TAPI dibatasi deadline total ~14 detik
+                # supaya bot nggak kelihatan "diem" berjam-jam saat provider sedang gangguan.
+                deadline_chat = _time.monotonic() + 14.0
                 for m_name in fast_order:
+                    if _time.monotonic() >= deadline_chat and last_err is not None:
+                        break
                     # CATATAN: maxOutputTokens dinaikkan dari 1200 -> 4096 supaya jawaban panjang
                     # tidak terpotong di tengah kalimat. thinkingConfig dimatikan karena pada model
                     # thinking, token "mikir" ikut memakan kuota output -> jawaban jadi setengah.
@@ -648,7 +672,7 @@ class MultiLLMBrain:
                         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                         "generationConfig": gen_cfg,
                     }
-                    data, err = await self._post_gemini_single(m_name, payload, timeout=25.0)
+                    data, err = await self._post_gemini_single(m_name, payload, timeout=15.0)
                     if data is not None:
                         ans = self._extract_gemini_text(data)
                         finish = self._gemini_finish_reason(data)
@@ -699,9 +723,12 @@ class MultiLLMBrain:
                     if err and err.kind in ("model_not_found", "bad_request", "invalid_output"):
                         continue
                     if err and err.kind in ("rate_limit", "server_overloaded", "timeout", "network_error"):
-                        delay = compute_backoff_delay(backoff_step, retry_after=err.retry_after, base=0.65, cap=4.5)
+                        delay = compute_backoff_delay(backoff_step, retry_after=err.retry_after, base=0.6, cap=4.5)
                         backoff_step += 1
-                        await self._sleep_fn(delay)
+                        # Jangan pernah tidur melewati deadline: langsung lempar hasil akhir ke user.
+                        remaining = deadline_chat - _time.monotonic()
+                        if remaining > 0:
+                            await self._sleep_fn(min(delay, remaining))
 
                 err_kind = last_err.kind if last_err else "server_overloaded"
                 self.last_chat_ok = False
@@ -1134,7 +1161,7 @@ class MultiLLMBrain:
                     "contents": [{"role": "user", "parts": parts}],
                     "generationConfig": gen_cfg,
                 }
-                data, err = await self._post_gemini_single(m_name, payload, timeout=18.0)
+                data, err = await self._post_gemini_single(m_name, payload, timeout=15.0)
                 if data is not None:
                     try:
                         text = self._extract_gemini_text(data)

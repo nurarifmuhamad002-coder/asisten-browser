@@ -145,6 +145,8 @@ class TelegramBotBridge:
         self._seen_update_order: deque[int] = deque()
         self._max_seen_updates: int = 1000
         self._chat_locks: Dict[int, asyncio.Lock] = {}
+        self._bg_tasks: Set[asyncio.Task] = set()
+        self._lock_watchdog_task: Optional[asyncio.Task] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._offset: int = 0
         self.bot_username: str = ""
@@ -327,7 +329,18 @@ class TelegramBotBridge:
         self._poll_task = None
 
     async def process_webhook_update(self, upd: Dict[str, Any]) -> None:
-        asyncio.create_task(self._handle_update(upd))
+        task = asyncio.create_task(self._handle_update(upd))
+        # Simpan referensi supaya tidak di-garbage-collect & exception-nya tidak hilang diam-diam
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._log_bg_task_failure)
+
+    def _log_bg_task_failure(self, task: "asyncio.Task[Any]") -> None:
+        self._bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            print(f"[telegram] UNCAUGHT task error: {type(exc).__name__}: {exc}", flush=True)
 
     async def _poll_loop(self) -> None:
         base_url = f"https://api.telegram.org/bot{self.token}"
@@ -344,10 +357,25 @@ class TelegramBotBridge:
                         continue
                     for upd in data.get("result", []):
                         self._offset = max(self._offset, upd["update_id"] + 1)
-                        await self._handle_update(upd)
+                        # Isolasi per-update: satu pesan bermasalah TIDAK boleh membunuh listener.
+                        try:
+                            await self._handle_update(upd)
+                        except Exception as exc:
+                            print(f"[telegram] update {upd.get('update_id')} gagal: {type(exc).__name__}: {exc}", flush=True)
+                            cid_u = (upd.get("message") or {}).get("chat", {}).get("id")
+                            if cid_u:
+                                try:
+                                    await self.send_text(
+                                        cid_u,
+                                        f"⚠️ Ada error saat proses pesan itu ({type(exc).__name__}). Ketik ulang ya bro.",
+                                        reply_markup=MAIN_MENU_KB,
+                                    )
+                                except Exception:
+                                    pass
                 except asyncio.CancelledError:
                     break
-                except Exception:
+                except Exception as exc:
+                    print(f"[telegram] poll loop error: {type(exc).__name__}: {exc}", flush=True)
                     await asyncio.sleep(3)
 
     def _live_browser_inline_kb(self, include_task_btn: bool = True) -> Dict[str, Any]:
@@ -683,8 +711,82 @@ class TelegramBotBridge:
                         return
 
         # SERIALISASI PER-CHAT UNTUK PESAN REGULER, UPLOAD MEDIA, & PERINTAH TUGAS AGAR TIDAK SALING TABRAK!
-        async with self._get_chat_lock(chat_id):
-            await self._handle_locked_message(chat_id, sender_id, from_user, msg)
+        # PENTING: lock TIDAK BOLEH bikin bot bisu. Jika antrean macet > 25 detik,
+        # buka jalur darurat supaya pesan user tetap dijawab (jangan pernah diam total!).
+        lock = self._get_chat_lock(chat_id)
+        acquired = False
+        lock_wait_s = float(getattr(self, "CHAT_LOCK_TIMEOUT_S", 25.0))
+        try:
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=lock_wait_s)
+                acquired = True
+            except asyncio.TimeoutError:
+                print(f"[telegram] WARN: chat lock {chat_id} macet >{lock_wait_s:.0f}s, buka jalur darurat", flush=True)
+                self._chat_locks[chat_id] = asyncio.Lock()  # reset lock yang nyangkut
+                acquired = False
+            if acquired:
+                await self._handle_locked_message(chat_id, sender_id, from_user, msg)
+            else:
+                await self._handle_emergency_message(chat_id, sender_id, msg)
+        except Exception as exc:
+            # JANGAN PERNAH diam total: laporkan error ke user, jangan cuma ditelan log.
+            print(f"[telegram] ERROR handling msg ({type(exc).__name__}): {exc}", flush=True)
+            try:
+                await self.send_text(
+                    chat_id,
+                    f"⚠️ Waduh, ada gangguan teknis waktu proses pesan lu `{str((msg.get('text') or ''))[:40]}`.\n"
+                    f"Detail: {type(exc).__name__}\n\nCoba kirim ulang sebentar lagi ya bro, atau ketik /stop kalau nyangkut.",
+                    reply_markup=MAIN_MENU_KB,
+                )
+            except Exception:
+                pass
+        finally:
+            if acquired:
+                try:
+                    lock.release()
+                except RuntimeError:
+                    pass
+
+    async def _handle_emergency_message(self, chat_id: int, sender_id: int, msg: Dict[str, Any]) -> None:
+        """Jalur darurat: dipakai saat antrean chat macet. Fokus NGGOBROL AI langsung tanpa antre lock."""
+        assert self.orchestrator is not None
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return
+        low = text.lower().strip()
+        # Kontrol darurat tetap boleh
+        if low in ("/stop", "stop", "berhenti", "batal"):
+            await self._retire_active_cards("⏹️ STATUS: TERHENTI (Dihentikan pengguna)")
+            await self.orchestrator.stop_goal(silent=True)
+            self.chat_modes[chat_id] = "auto"
+            await self._send_main_menu(chat_id, "⏹️ Proses yang lagi jalan udah dihentikan.\n\n")
+            return
+        if low in ("/layar", "/ss", "layar", "ss", "cek layar", "📸 cek layar"):
+            await self._send_screen_snapshot(chat_id)
+            return
+        # Selain itu: jawab langsung lewat AI, potong antrean yang macet
+        await self.send_text(
+            chat_id,
+            "⚡ Antrean pesan sebelumnya sempat nyangkut, jadi gua buka jalur cepat buat jawab lu dulu...",
+        )
+        try:
+            await self.orchestrator._push_chat("user", text)
+            reply = await self.orchestrator.brain.quick_chat(
+                text,
+                self.orchestrator.chat_messages[:-1],
+                user_memory_block=self.orchestrator.format_user_memory_block(),
+            )
+            await self.orchestrator._push_chat("agent", reply)
+            if getattr(self.orchestrator.brain, "last_chat_ok", True):
+                self.last_output_text[chat_id] = reply
+            await self.send_text(chat_id, reply, reply_markup=MAIN_MENU_KB)
+        except Exception as exc:
+            await self.send_text(
+                chat_id,
+                f"⚠️ Jalur cepat juga kena gangguan ({type(exc).__name__}). Coba ketik ulang ya bro.",
+                reply_markup=MAIN_MENU_KB,
+            )
+
 
     async def _handle_locked_message(
         self,
@@ -1201,11 +1303,28 @@ class TelegramBotBridge:
         await self.orchestrator.start_goal(text)
         self.start_progress_heartbeat()
 
+    # Sapaan / panggilan super singkat: WAJIB dibalas cepat, jangan lewat klasifikasi AI (bikin lambat).
+    _GREETING_TOKENS = frozenset(
+        {"oy", "oi", "woy", "p", "pp", "ping", "tes", "test", "halo", "hallo", "hai", "hi", "hey", "heh",
+         "bro", "bg", "bang", "bos", "min", "gan", "sis", "mas", "assalamualaikum", "salam", "pagi",
+         "siang", "sore", "malam", "p", "halobro", "halo bro"}
+    )
+
+    @classmethod
+    def _is_greeting_only(cls, low: str) -> bool:
+        """True jika pesan cuma sapaan/panggilan singkat tanpa instruksi apa pun."""
+        tokens = [t for t in re.split(r"[\s,!\.\?]+", (low or "").strip()) if t]
+        return bool(tokens) and len(tokens) <= 3 and all(t in cls._GREETING_TOKENS for t in tokens)
+
     async def _detect_auto_route(self, chat_id: int, text: str, low: str) -> tuple[str, str]:
         """
         Router otomatis pintar 2-lapis (0ms aturan pasti + <0.4s AI untuk kalimat abu-abu)
         supaya user CUKUP KETIK BEBAS tanpa perlu menekan tombol mode apa pun terlebih dahulu!
         """
+        # 0. SAPAAN SINGKAT ("oy", "p", "halo") -> langsung chat cepat, 0ms, jangan lewat AI classifier.
+        if self._is_greeting_only(low):
+            return ("chat", text)
+
         # 1. Perintah "lanjut" / "terusin" hanya meresume bila benar-benar ada checkpoint terjeda di TaskStateStore
         if low in ("lanjut", "lanjut bro", "lanjutin", "terusin", "lanjutkan", "teruskan", "gas lanjut"):
             if self.orchestrator and self.orchestrator.task_store.get_resumable_context():
@@ -1704,17 +1823,10 @@ class TelegramBotBridge:
             chunks = ["(kosong)"]
 
         first_mid: Optional[int] = None
-        total = len(chunks)
         for idx, chunk in enumerate(chunks):
-            is_last = idx == total - 1
-            body = chunk
-            if total > 1:
-                marker = f"\n\n(bagian {idx + 1}/{total})"
-                allowed = 3900 - len(marker)
-                if len(body) > allowed:
-                    body = body[:allowed].rstrip()
-                body = body + marker
-            payload: Dict[str, Any] = {"chat_id": chat_id, "text": body}
+            is_last = idx == len(chunks) - 1
+            # Tanpa label "(bagian x/y)" — biar terasa natural kayak chat manusia, bukan robot.
+            payload: Dict[str, Any] = {"chat_id": chat_id, "text": chunk[:3900]}
             # Tombol keyboard hanya ditempel di bagian terakhir supaya tidak dobel
             if reply_markup and is_last:
                 payload["reply_markup"] = reply_markup

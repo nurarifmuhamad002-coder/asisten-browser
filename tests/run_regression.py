@@ -181,7 +181,10 @@ async def run_legacy_and_module_regression() -> None:
             s_res = await be.select_dropdown(idx_role, "Manajer", els_live)
             assert "✅" in s_res
             c_res = await be.click_element(idx_btn, els_live)
-            assert "Berhasil klik" in c_res
+            # Pilar 3: klik kini wajib menyertakan BUKTI, bukan sekadar "Berhasil klik".
+            # Tombol ini benar-benar mengubah halaman -> harus terlaporkan TERBUKTI.
+            assert "Berhasil klik" in c_res or "TERBUKTI" in c_res, f"klik harus dilaporkan: {c_res}"
+            assert "TERBUKTI" in c_res, f"klik yang mengubah halaman wajib menyebut bukti: {c_res}"
             out_txt = await be.page.locator("#out").inner_text()
             assert out_txt == "OK:Andi Wijaya"
 

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
@@ -282,6 +283,39 @@ class CloudBrowserEngine:
         except Exception as exc:
             return f"Gagal mengecek IP lewat proxy ({str(exc)[:70]}) — pastikan kode/kuota proxy aktif!"
         return "IP tidak terdeteksi"
+
+    async def verify_claim_on_page(self, claims: List[str]) -> Dict[str, Any]:
+        """Cek apakah klaim bot BENAR-BENAR ada di halaman nyata.
+
+        Dipakai sebelum bot bilang "selesai": setiap kata kunci penting dari
+        ringkasan (nama, email, nomor, kode booking, dsb) dicari di teks halaman.
+        Kalau tidak ketemu, klaim ditolak — bukan berarti pasti gagal, tapi
+        bot TIDAK BOLEH mengaku berhasil tanpa bukti.
+
+        Mengembalikan {"ok": bool, "found": [...], "missing": [...], "url": str}
+        """
+        res: Dict[str, Any] = {"ok": False, "found": [], "missing": [], "url": ""}
+        if not self.page:
+            return res
+        try:
+            body = await asyncio.wait_for(self.page.inner_text("body"), timeout=4000)
+        except Exception:
+            return res
+        body_low = re.sub(r"\s+", " ", (body or "").lower())
+        res["url"] = self._display_url(self.page.url or "")
+
+        for c in claims or []:
+            c_clean = (c or "").strip()
+            if len(c_clean) < 3:
+                continue
+            if re.sub(r"\s+", " ", c_clean.lower()) in body_low:
+                res["found"].append(c_clean)
+            else:
+                res["missing"].append(c_clean)
+        # Minimal separuh klaim harus terbukti
+        total = len(res["found"]) + len(res["missing"])
+        res["ok"] = bool(total) and len(res["found"]) >= max(1, total // 2)
+        return res
 
     def _rss_mb(self) -> float:
         """RAM proses Chromium saat ini (MB). Dipakai untuk bukti hemat memory."""
@@ -1659,6 +1693,13 @@ class CloudBrowserEngine:
         if locator is None:
             return f"❌ Elemen [{index}] tidak ditemukan berdasarkan DOM selector maupun label."
 
+        # Sidik jari halaman SEBELUM klik, untuk pembuktian sesudahnya
+        _snap = await self._snapshot_before_action()
+        url_before = _snap["url"]
+        title_before = _snap["title"]
+        dom_len_before = _snap["dom_len"]
+        text_before = _snap.get("text_hash", "")
+
         try:
             await self._dom_click_locator(locator)
         except Exception as exc:
@@ -1683,7 +1724,152 @@ class CloudBrowserEngine:
                     pass
 
         desc = (target_el.get("text") or target_el.get("label") or target_el.get("dom_selector") or f"elemen [{index}]") if target_el else f"elemen [{index}]"
-        return f"Berhasil klik [{index}] '{desc[:60]}'"
+
+        # === VERIFIKASI BUKTI KLIK (Pilar 3: jangan ngaku berhasil tanpa bukti) ===
+        # Dulu: klik apa pun langsung balas "Berhasil klik" — padahal tombol disabled,
+        # tertutup overlay, atau tidak melakukan apa-apa. Sekarang dicek tanda-tanda nyata:
+        #   URL berubah / judul berubah / muncul dialog / elemen berubah state / halaman berubah.
+        try:
+            ev = await self._evidence_after_click(
+                url_before=url_before, title_before=title_before,
+                dom_len_before=dom_len_before, text_before=text_before,
+                target_el=target_el, index=index,
+            )
+            if ev.get("confirmed"):
+                return f"Berhasil klik [{index}] '{desc[:60]}' — ✅ TERBUKTI: {ev.get('detail', '')}"
+            if ev.get("disabled"):
+                return (
+                    f"⚠️ Klik [{index}] '{desc[:60]}' DITEKAN tetapi TIDAK ADA PERUBAHAN — "
+                    "kemungkinan tombol DISABLED atau tertutup lapisan lain. "
+                    "JANGAN anggap berhasil; cari tombol lain atau penuhi syarat form dulu."
+                )
+            return (
+                f"⚠️ Klik [{index}] '{desc[:60]}' dikirim, tapi BELUM ADA BUKTI halaman berubah "
+                f"({ev.get('detail', 'tidak terdeteksi')}). Jangan klaim berhasil dulu — "
+                "periksa layar/DOM langkah berikutnya."
+            )
+        except Exception:
+            return f"Berhasil klik [{index}] '{desc[:60]}'"
+
+    async def _snapshot_before_action(self) -> Dict[str, Any]:
+        """Ambil sidik jari halaman SEBELUM aksi, untuk dibandingkan sesudahnya."""
+        snap = {"url": "", "title": "", "dom_len": 0, "text_hash": ""}
+        try:
+            if self.page:
+                snap["url"] = self.page.url or ""
+                snap["title"] = await asyncio.wait_for(self.page.title(), timeout=1500)
+                snap["dom_len"] = await asyncio.wait_for(
+                    self.page.evaluate("() => document.querySelectorAll('*').length"), timeout=1500
+                )
+                # Hash teks: menangkap tombol yang hanya mengubah isi teks (mis. #out -> "OK:...")
+                # tanpa menambah/mengurangi elemen. Tanpa ini, aksi yang BERHASIL bisa
+                # salah dilaporkan sebagai "tidak ada bukti".
+                snap["text_hash"] = await asyncio.wait_for(
+                    self.page.evaluate(
+                        "() => { const t = (document.body.innerText || '').trim(); "
+                        "let h = 0; for (let i = 0; i < t.length; i++) { h = ((h << 5) - h + t.charCodeAt(i)) | 0; } "
+                        "return String(h) + ':' + t.length; }"
+                    ),
+                    timeout=2000,
+                )
+        except Exception:
+            pass
+        return snap
+
+    async def _evidence_after_click(
+        self,
+        url_before: str = "",
+        title_before: str = "",
+        dom_len_before: int = 0,
+        text_before: str = "",
+        target_el: Optional[Dict[str, Any]] = None,
+        index: int = -1,
+    ) -> Dict[str, Any]:
+        """Cari BUKTI NYATA bahwa klik benar-benar berpengaruh.
+
+        Mengembalikan {"confirmed": bool, "disabled": bool, "detail": str}.
+        Ini jantung Pilar 3: bot tidak boleh mengaku berhasil tanpa bukti.
+        """
+        res = {"confirmed": False, "disabled": False, "detail": ""}
+        if not self.page:
+            return res
+        await asyncio.sleep(0.25)
+
+        # 1) URL berubah -> bukti paling kuat
+        url_now = self.page.url or ""
+        if url_before and url_now != url_before:
+            res["confirmed"] = True
+            res["detail"] = f"halaman pindah ke {self._display_url(url_now)}"
+            return res
+
+        # 2) Judul berubah
+        title_now = ""
+        try:
+            title_now = await asyncio.wait_for(self.page.title(), timeout=1500)
+        except Exception:
+            pass
+        if title_before and title_now and title_now != title_before:
+            res["confirmed"] = True
+            res["detail"] = f"judul halaman berubah jadi '{title_now[:50]}'"
+            return res
+
+        # 3) Muncul dialog/modal/alert baru
+        try:
+            modal_open = await self.page.evaluate(
+                """() => {
+                    const dlg = document.querySelector('dialog[open], [role="dialog"]:not([style*="display: none"]), .modal.show, .Toastify__toast');
+                    return !!dlg;
+                }"""
+            )
+            if modal_open:
+                res["confirmed"] = True
+                res["detail"] = "muncul dialog/modal/notifikasi baru"
+                return res
+        except Exception:
+            pass
+
+        # 4) Struktur DOM berubah signifikan (konten baru termuat)
+        try:
+            dom_now = await asyncio.wait_for(
+                self.page.evaluate("() => document.querySelectorAll('*').length"), timeout=1500
+            )
+            if dom_len_before and abs(dom_now - dom_len_before) >= 5:
+                res["confirmed"] = True
+                res["detail"] = f"struktur halaman berubah ({dom_len_before} → {dom_now} elemen)"
+                return res
+        except Exception:
+            pass
+
+        # 4B) TEKS halaman berubah (tombol yang mengisi hasil tanpa mengubah jumlah elemen)
+        try:
+            text_now = await self.page.evaluate(
+                "() => { const t = (document.body.innerText || '').trim(); "
+                "let h = 0; for (let i = 0; i < t.length; i++) { h = ((h << 5) - h + t.charCodeAt(i)) | 0; } "
+                "return String(h) + ':' + t.length; }"
+            )
+            if text_before and text_now and text_now != text_before:
+                res["confirmed"] = True
+                res["detail"] = "isi teks halaman berubah"
+                return res
+        except Exception:
+            pass
+
+        # 5) Tombol tujuan dalam keadaan disabled -> klik memang tidak mungkin berpengaruh
+        if target_el:
+            sel = target_el.get("dom_selector") or f'[data-nusa-idx="{index}"]'
+            try:
+                is_dis = await self.page.locator(sel).first.evaluate(
+                    "el => !!(el.disabled || el.getAttribute('aria-disabled') === 'true')"
+                )
+                if is_dis:
+                    res["disabled"] = True
+                    res["detail"] = "elemen dalam keadaan disabled"
+                    return res
+            except Exception:
+                pass
+
+        res["detail"] = "URL, judul, modal, dan struktur DOM semuanya tidak berubah"
+        return res
 
     async def type_into_element(
         self,

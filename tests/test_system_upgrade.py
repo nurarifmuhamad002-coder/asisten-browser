@@ -2539,6 +2539,104 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(29, "Tahap 17: Performa Terukur (Adaptive Screenshot, Vision Throttle, Hemat RAM)", True, "Diukur nyata: screenshot 10 langkah turun 694ms->116ms (83%), token vision hemat 80% (2 kirim vs 8 hemat dari 10 langkah), RAM Chromium 457MB->253MB via renderer-limit + mode BROWSER_LOW_RAM. Perintah /stats menampilkan angka sebenarnya.")
 
+        # =====================================================================
+        # 30. TAHAP 18: SELF VERIFICATION (bukti per-aksi, anti-klaim-palsu)
+        # =====================================================================
+        src30_be = (ROOT / "agent" / "browser_engine.py").read_text(encoding="utf-8")
+        src30_or = (ROOT / "agent" / "orchestrator.py").read_text(encoding="utf-8")
+
+        # 30a. Klik WAJIB diverifikasi, tidak boleh langsung bilang "Berhasil klik"
+        assert "async def _evidence_after_click" in src30_be, "Pembuktian klik wajib ada"
+        assert "async def _snapshot_before_action" in src30_be, "Snapshot sebelum aksi wajib ada"
+        assert "TERBUKTI" in src30_be, "Hasil klik wajib menyebut bukti"
+        assert "TIDAK ADA PERUBAHAN" in src30_be, "Klik tanpa efek wajib dilaporkan jujur"
+        assert "JANGAN anggap berhasil" in src30_be, "Peringatan anti-klaim-palsu wajib ada"
+
+        # 30b. Verifikasi klaim akhir di halaman nyata
+        assert "async def verify_claim_on_page" in src30_be, "Verifikasi klaim di halaman wajib ada"
+        assert "_claim_verified_once" in src30_or, "Gerbang bukti di loop agent wajib ada"
+        assert "DITOLAK SELESAI TANPA BUKTI" in src30_or, (
+            "Loop wajib menolak klaim selesai tanpa bukti di halaman"
+        )
+
+        # 30c. BUKTI HIDUP: klik nyata vs klik palsu dibedakan
+        import http.server as _hs30
+        import socketserver as _ss30
+        import threading as _th30
+        import functools as _ft30
+
+        _html30 = (
+            "<!doctype html><html><body><h1>Verif</h1><form>"
+            '<input id="nm" name="nm" placeholder="Nama">'
+            "<button id='ok' type='button' onclick=\"for(let i=0;i<8;i++){"
+            "document.body.insertAdjacentHTML('beforeend','<p>x'+i+'</p>')}\">Kirim Data</button>"
+            "<button id='dis' type='button' disabled>Tombol Mati</button>"
+            "<button id='noop' type='button'>Tanpa Aksi</button>"
+            "</form></body></html>"
+        )
+        _dir30 = tmp_dir / "ver30"
+        _dir30.mkdir(parents=True, exist_ok=True)
+        (_dir30 / "t.html").write_text(_html30, encoding="utf-8")
+
+        class _H30(_hs30.SimpleHTTPRequestHandler):
+            def log_message(self, *a: Any) -> None:
+                return None
+
+        _srv30 = _ss30.TCPServer(("127.0.0.1", 0), _ft30.partial(_H30, directory=str(_dir30)))
+        _port30 = _srv30.server_address[1]
+        _th30.Thread(target=_srv30.serve_forever, daemon=True).start()
+
+        from agent.browser_engine import CloudBrowserEngine as _CBE30
+        from agent.file_manager import WorkspaceFileManager as _WFM30
+
+        async def _bc30(ev: Any) -> None:
+            return None
+
+        _d30 = tmp_dir / "be30"
+        _d30.mkdir(parents=True, exist_ok=True)
+        _be30 = _CBE30(
+            file_manager=_WFM30(base_dir=str(_d30), allow_writes=True),
+            broadcast_cb=_bc30, profile_dir=str(_d30), allow_writes=True,
+        )
+        try:
+            await _be30.ensure_alive()
+            await _be30.navigate(f"http://127.0.0.1:{_port30}/t.html")
+            await asyncio.sleep(0.6)
+            _obs30 = await _be30.observe(annotated_screenshot=False)
+            _els30 = _obs30.get("elements") or []
+            assert _els30, "Halaman tes wajib punya elemen terdeteksi"
+
+            _hasil30 = {}
+            for _e in _els30:
+                _txt = (_e.get("text") or "").lower()
+                if "kirim" in _txt:
+                    _hasil30["ok"] = await _be30.click_element(_e["index"], _els30)
+                elif "mati" in _txt:
+                    _hasil30["disabled"] = await _be30.click_element(_e["index"], _els30)
+                elif "tanpa aksi" in _txt:
+                    _hasil30["noop"] = await _be30.click_element(_e["index"], _els30)
+
+            assert "TERBUKTI" in _hasil30.get("ok", ""), (
+                f"Klik yang benar-benar bekerja wajib dilaporkan TERBUKTI: {_hasil30.get('ok')}"
+            )
+            assert "TIDAK ADA PERUBAHAN" in _hasil30.get("disabled", ""), (
+                f"Klik tombol disabled wajib dilaporkan jujur: {_hasil30.get('disabled')}"
+            )
+            assert "BELUM ADA BUKTI" in _hasil30.get("noop", ""), (
+                f"Klik tanpa efek wajib dilaporkan jujur: {_hasil30.get('noop')}"
+            )
+
+            _v_ok = await _be30.verify_claim_on_page(["Verif", "Kirim Data"])
+            assert _v_ok["ok"] is True, f"Klaim yang ADA di halaman wajib lolos: {_v_ok}"
+            _v_bad = await _be30.verify_claim_on_page(["ZZZ Tidak Ada Sama Sekali ZZZ"])
+            assert _v_bad["ok"] is False, f"Klaim PALSU wajib ditolak: {_v_bad}"
+        finally:
+            await _be30.stop()
+            _srv30.shutdown()
+
+        record(30, "Tahap 18: Self Verification (Bukti Per-Aksi)", True, "Klik kini WAJIB punya bukti (URL/judul/modal/DOM berubah). Diuji nyata: tombol berfungsi -> TERBUKTI, tombol disabled -> TIDAK ADA PERUBAHAN, tombol no-op -> BELUM ADA BUKTI. Ditambah gerbang anti-klaim-palsu: bot ditolak selesai kalau data penting tidak ditemukan di halaman.")
+
+
     finally:
         if browser is not None:
             await browser.stop()

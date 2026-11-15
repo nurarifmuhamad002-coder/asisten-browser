@@ -94,6 +94,8 @@ class AgentOrchestrator:
         self._created_top_dirs: List[str] = []
         self._last_submit_verification: Optional[Dict[str, Any]] = None
         self._verify_retry_used: bool = False
+        # Pilar 3: penanda sudah dicek sekali apakah klaim akhir benar-benar ada di halaman
+        self._claim_verified_once: bool = False
         self._pre_submit_blocked_once: bool = False
         self.chat_messages: List[Dict[str, Any]] = []
 
@@ -345,6 +347,7 @@ class AgentOrchestrator:
         self._created_top_dirs = []
         self._last_submit_verification = None
         self._verify_retry_used = False
+        self._claim_verified_once = False
         self._pre_submit_blocked_once = False
 
         task_rec = self.task_store.create_task(clean_goal, initial_plan=self.current_plan)
@@ -593,6 +596,53 @@ class AgentOrchestrator:
                             ),
                         })
                         continue
+                    # 1C. GERBANG BUKTI DI HALAMAN (Pilar 3: anti-klaim-palsu)
+                    # Kalau bot mau bilang "selesai" padahal dia baru mengisi/mengirim
+                    # sesuatu di website, data penting dari ringkasannya WAJIB benar-benar
+                    # muncul di halaman. Kalau tidak, klaim ditolak sekali.
+                    if (
+                        not getattr(self, "_claim_verified_once", False)
+                        and self._browser_actions_count >= 2
+                        and self.browser.page
+                        and not (self.browser.page.url or "").startswith(("about:", "chrome-error://"))
+                        and step_num <= self.MAX_STEPS - 2
+                    ):
+                        import re as _re3
+                        _claims: List[str] = []
+                        # email
+                        _claims += _re3.findall(r"[\w.+-]+@[\w-]+\.[\w.]+", self.current_goal)[:2]
+                        # angka penting (nomor HP / NIK / kode booking >= 6 digit)
+                        _claims += [n for n in _re3.findall(r"\b\d{6,}\b", self.current_goal)][:2]
+                        # nama orang dari pola "nama: X" / "Name: X"
+                        for _m3 in _re3.finditer(
+                            r"(?:nama|name|first name|full name)\s*[:=]\s*([A-Za-z][A-Za-z .']{2,30})",
+                            self.current_goal,
+                            _re3.I,
+                        ):
+                            _claims.append(_m3.group(1).strip())
+                        _claims = list(dict.fromkeys(c for c in _claims if len(c.strip()) >= 3))[:5]
+
+                        if _claims:
+                            try:
+                                _ver = await self.browser.verify_claim_on_page(_claims)
+                            except Exception:
+                                _ver = {"ok": True, "found": [], "missing": []}
+                            self._claim_verified_once = True
+                            if not _ver.get("ok") and _ver.get("missing"):
+                                self.history.append({
+                                    "step": step_num,
+                                    "action_name": "verify_gate",
+                                    "result": (
+                                        "❌ DITOLAK SELESAI TANPA BUKTI: Kamu mau melaporkan tugas selesai, "
+                                        "tetapi data ini TIDAK ditemukan di halaman sekarang: "
+                                        + ", ".join(_ver["missing"][:4])
+                                        + ". Periksa apakah pengisian/pengiriman benar-benar berhasil. "
+                                        "Kalau memang gagal, LAPORKAN JUJUR GAGAL beserta alasannya — "
+                                        "jangan mengaku berhasil."
+                                    ),
+                                })
+                                continue
+
                     req_file_ext = ""
                     if re.search(r"\b(buat(?:kan)?\s+(?:file\s+|laporan\s+)?excel|file\s+excel|\.xlsx)\b", goal_low):
                         req_file_ext = "xlsx"

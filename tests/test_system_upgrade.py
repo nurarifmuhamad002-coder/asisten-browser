@@ -2039,6 +2039,164 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(23, "Tahap 11: Resolver Domain Anti-Tebak + Deteksi Blokir IP Datacenter", True, "Domain karangan (allindonesia.id) terdeteksi mati & dikoreksi ke domain resmi, Yahoo mati diganti pencari hidup, blokir CloudFront dilaporkan jujur sebagai 'situs hidup tapi blokir IP', & proxy mati terdeteksi.")
 
+        # =====================================================================
+        # 24. TAHAP 12: BUG FOTO+CAPTION BISU (REGRESI FATAL YANG DIBUAT SENDIRI)
+        # =====================================================================
+        src_tb24 = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+
+        # 24a. Jalur darurat WAJIB menangani media (field 'caption', bukan 'text')
+        emergency_block = src_tb24.split("async def _handle_emergency_message")[1].split("async def ")[0]
+        assert "photo" in emergency_block and "document" in emergency_block, (
+            "Jalur darurat wajib menangani foto/document/voice — bukan cuma teks"
+        )
+        assert "_handle_media_upload" in emergency_block, "Jalur darurat wajib memproses media lewat _handle_media_upload"
+        assert 'msg.get("caption")' in emergency_block, "Jalur darurat wajib membaca field 'caption' (caption foto)"
+        assert "nggak kebaca sistem" in emergency_block, (
+            "Kalau isi pesan tidak terbaca, user WAJIB diberi tahu — tidak boleh diam"
+        )
+
+        # 24b. _handle_locked_message tidak boleh return diam-diam saat teks kosong
+        locked_block = src_tb24.split("async def _handle_locked_message")[1].split("async def ")[0]
+        early = locked_block.split('if not text:')[1].split("return")[0]
+        assert 'msg.get("caption")' in locked_block, "_handle_locked_message wajib fallback ke caption"
+        assert "nggak ada teks/foto" in early, (
+            "Teks kosong tidak boleh return diam-diam: wajib kirim pemberitahuan ke user"
+        )
+
+        # 24c. Watchdog anti-bisu terpasang
+        assert "_silence_watchdog" in src_tb24, "Watchdog anti-bisu wajib ada"
+        assert "belum ada balasan dari sistem selama 20 detik" in src_tb24, (
+            "Watchdog wajib melapor jujur ke user kalau 20 detik tidak ada balasan"
+        )
+        assert "self._answered_chat" in src_tb24, "Bookkeeping 'sudah dibalas' wajib ada"
+
+        # 24d. REPRODUKSI NYATA: foto + caption saat lock macet -> WAJIB dibalas (dulu 0 balasan)
+        class _OrchPhoto:
+            state = "IDLE"
+            live_status = "-"
+            chat_messages: List[Dict[str, Any]] = []
+            history: List[Any] = []
+            current_plan: List[Any] = []
+            user_memories: List[str] = []
+            persistent_notes: Dict[str, str] = {}
+
+            class _TS:
+                def get_resumable_context(self, *a: Any, **k: Any) -> Optional[Dict[str, Any]]:
+                    return None
+
+            task_store = _TS()
+
+            class _B:
+                page = None
+                last_chat_ok = True
+
+                async def classify_intent(self, *a: Any, **k: Any) -> str:
+                    return "chat"
+
+                async def analyze_media(self, user_prompt: str, filename: str, raw_bytes: bytes, mime_type: str, extracted_text: str = "") -> str:
+                    return f"[analisis foto] caption={user_prompt!r}"
+
+            brain = _B()
+
+            class _Br:
+                page = None
+
+                def _display_url(self, u: str) -> str:
+                    return u
+
+            browser = _Br()
+
+            class _FM:
+                def save_bytes(self, n: str, b: bytes) -> Dict[str, Any]:
+                    return {"name": n}
+
+            file_manager = _FM()
+
+            async def _push_chat(self, role: str, text: str, meta: Any = None) -> None:
+                self.chat_messages.append({"role": role, "text": text})
+
+            def format_user_memory_block(self) -> str:
+                return ""
+
+            async def stop_goal(self, silent: bool = False) -> None:
+                return None
+
+        photo_tg = TelegramBotBridge(state_dir=str(tmp_dir / "photo_state"))
+        photo_tg.token = "123456789:AADummySyntheticToken00000000101"
+        photo_tg.CHAT_LOCK_TIMEOUT_S = 0.6  # type: ignore
+        photo_tg.orchestrator = _OrchPhoto()  # type: ignore
+        photo_sent: List[str] = []
+
+        async def _rec_photo(cid: int, text: str, reply_markup: Any = None) -> Optional[int]:
+            photo_sent.append(text)
+            return len(photo_sent)
+
+        async def _edit_photo(cid: int, mid: int, text: str, reply_markup: Any = None) -> None:
+            photo_sent.append(text)
+
+        async def _dl_photo(fid: str) -> bytes:
+            return b"\xff\xd8\xff\xe0fakejpeg"
+
+        photo_tg.send_text = _rec_photo  # type: ignore
+        photo_tg._edit_text = _edit_photo  # type: ignore
+        photo_tg._download_telegram_file = _dl_photo  # type: ignore
+
+        # Kunci chat ditahan (simulasi task lama macet) + user kirim FOTO bercaption
+        stuck2 = photo_tg._get_chat_lock(777001)
+        await stuck2.acquire()
+        await photo_tg._handle_update(
+            {
+                "update_id": 24001,
+                "message": {
+                    "message_id": 501,
+                    "chat": {"id": 777001},
+                    "from": {"id": 777001},
+                    "photo": [{"file_id": "AAA", "width": 800}],
+                    "caption": "perjalanan gua",
+                },
+            }
+        )
+        assert len(photo_sent) >= 1, (
+            "FOTO + CAPTION saat lock macet WAJIB menghasilkan balasan. "
+            "Bug lama: msg.get('text') kosong -> return diam-diam -> 0 balasan."
+        )
+        assert any("analisis foto" in x or "perjalanan gua" in x for x in photo_sent), (
+            f"Caption foto wajib ikut dianalisis & dibalas: {photo_sent}"
+        )
+        stuck2.release()
+
+        # 24e. Foto normal (tanpa lock macet) juga wajib dibalas
+        photo_sent.clear()
+        await photo_tg._handle_update(
+            {
+                "update_id": 24002,
+                "message": {
+                    "message_id": 502,
+                    "chat": {"id": 777001},
+                    "from": {"id": 777001},
+                    "photo": [{"file_id": "BBB", "width": 800}],
+                    "caption": "perjalanan gua",
+                },
+            }
+        )
+        assert photo_sent, "Foto biasa wajib dibalas analisisnya"
+        assert any("analisis foto" in x for x in photo_sent), f"Hasil analisis wajib dikirim: {photo_sent}"
+
+        # 24f. Pesan aneh tanpa teks & bukan media -> wajib dapat pemberitahuan, bukan diam
+        weird_sent: List[str] = []
+
+        async def _rec_weird(cid: int, text: str, reply_markup: Any = None) -> Optional[int]:
+            weird_sent.append(text)
+            return 1
+
+        photo_tg.send_text = _rec_weird  # type: ignore
+        await photo_tg._handle_locked_message(
+            777002, 777002, {}, {"message_id": 503, "chat": {"id": 777002}, "from": {"id": 777002}}
+        )
+        assert weird_sent, "Pesan tanpa teks & bukan media wajib dapat pemberitahuan (jangan diam)"
+
+        record(24, "Tahap 12: Fix Bug FOTO+CAPTION BISU (regresi jalur darurat)", True, "Jalur darurat kini memproses foto/document/voice lewat caption, teks kosong tidak lagi return diam-diam, & watchdog 20 detik melapor jujur kalau ada pesan tak terjawab.")
+
     finally:
         if browser is not None:
             await browser.stop()

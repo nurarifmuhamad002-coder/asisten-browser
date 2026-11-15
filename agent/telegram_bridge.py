@@ -148,6 +148,8 @@ class TelegramBotBridge:
         self._max_seen_updates: int = 1000
         self._chat_locks: Dict[int, asyncio.Lock] = {}
         self._bg_tasks: Set[asyncio.Task] = set()
+        self._answered_chat: Dict[int, int] = {}
+        self._last_update_id: Dict[int, int] = {}
         self._lock_watchdog_task: Optional[asyncio.Task] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._offset: int = 0
@@ -464,6 +466,14 @@ class TelegramBotBridge:
         if self._mark_update_seen(uid):
             return
 
+        # WATCHDOG ANTI-BISU: catat bahwa pesan ini WAJIB dibalas dalam 20 detik.
+        # Kalau ternyata tidak ada balasan sama sekali, watchdog akan melapor ke user.
+        _wm = upd.get("message") or upd.get("edited_message") or {}
+        _w_chat = (_wm.get("chat") or {}).get("id")
+        if _w_chat and ("message" in upd or "edited_message" in upd):
+            self._last_update_id[int(_w_chat)] = int(uid or 0)
+            asyncio.create_task(self._silence_watchdog(int(_w_chat), uid, _wm))
+
         # -------------------- INLINE BUTTON CALLBACKS --------------------
         if "callback_query" in upd:
             cb = upd["callback_query"]
@@ -736,7 +746,7 @@ class TelegramBotBridge:
             try:
                 await self.send_text(
                     chat_id,
-                    f"⚠️ Waduh, ada gangguan teknis waktu proses pesan lu `{str((msg.get('text') or ''))[:40]}`.\n"
+                    f"⚠️ Waduh, ada gangguan teknis waktu proses pesan lu `{str((msg.get('text') or msg.get('caption') or '[media]'))[:40]}`.\n"
                     f"Detail: {type(exc).__name__}\n\nCoba kirim ulang sebentar lagi ya bro, atau ketik /stop kalau nyangkut.",
                     reply_markup=MAIN_MENU_KB,
                 )
@@ -749,11 +759,56 @@ class TelegramBotBridge:
                 except RuntimeError:
                     pass
 
+    async def _silence_watchdog(self, chat_id: int, update_id: Optional[int], msg: Dict[str, Any]) -> None:
+        """
+        Jaring pengaman terakhir: kalau sebuah pesan masuk tapi TIDAK ADA balasan sama sekali
+        dalam 20 detik, kirim peringatan jujur ke user. Bot tidak boleh pernah diam total.
+        """
+        try:
+            await asyncio.sleep(20.0)
+            answered = self._answered_chat.get(chat_id)
+            if answered is not None and answered >= (update_id or 0):
+                return
+            kind = "foto/file" if any(k in msg for k in ("photo", "document", "voice", "audio")) else "teks"
+            await self.send_text(
+                chat_id,
+                f"⚠️ Pesan {kind} lu masuk tapi belum ada balasan dari sistem selama 20 detik.\n\n"
+                "Kemungkinan lagi ada gangguan internal. Coba kirim ulang, atau ketik /menu buat reset.",
+                reply_markup=MAIN_MENU_KB,
+            )
+            print(f"[telegram] WATCHDOG: update {update_id} tidak dibalas 20s (chat {chat_id})", flush=True)
+        except Exception:
+            pass
+
     async def _handle_emergency_message(self, chat_id: int, sender_id: int, msg: Dict[str, Any]) -> None:
-        """Jalur darurat: dipakai saat antrean chat macet. Fokus NGGOBROL AI langsung tanpa antre lock."""
+        """
+        Jalur darurat: dipakai saat antrean chat macet.
+        PENTING: harus menangani MEDIA juga (foto/voice/document pakai field 'caption', bukan 'text'),
+        supaya kiriman gambar tidak pernah berakhir tanpa balasan.
+        """
         assert self.orchestrator is not None
-        text = (msg.get("text") or "").strip()
+
+        # Media (foto/voice/audio/document) -> proses langsung, caption ikut dipakai sebagai instruksi
+        if any(k in msg for k in ("photo", "document", "voice", "audio")):
+            try:
+                await self._handle_media_upload(chat_id, msg)
+            except Exception as exc:
+                print(f"[telegram] emergency media gagal: {type(exc).__name__}: {exc}", flush=True)
+                await self.send_text(
+                    chat_id,
+                    f"⚠️ Gagal memproses file/foto lu ({type(exc).__name__}). Coba kirim ulang ya bro.",
+                    reply_markup=MAIN_MENU_KB,
+                )
+            return
+
+        text = (msg.get("text") or msg.get("caption") or "").strip()
         if not text:
+            # Jangan pernah diam: beri tahu user bahwa pesannya tidak terbaca
+            await self.send_text(
+                chat_id,
+                "⚠️ Pesan lu masuk tapi isinya nggak kebaca sistem. Coba kirim ulang sebagai teks ya bro.",
+                reply_markup=MAIN_MENU_KB,
+            )
             return
         low = text.lower().strip()
         # Kontrol darurat tetap boleh
@@ -801,8 +856,15 @@ class TelegramBotBridge:
             await self._handle_media_upload(chat_id, msg)
             return
 
-        text = (msg.get("text") or "").strip()
+        text = (msg.get("text") or msg.get("caption") or "").strip()
         if not text:
+            # Bukan media, bukan teks -> beri tahu, jangan diam.
+            print(f"[telegram] pesan tanpa teks & bukan media: keys={list(msg.keys())}", flush=True)
+            await self.send_text(
+                chat_id,
+                "⚠️ Gua terima pesannya, tapi nggak ada teks/foto yang bisa diproses. Coba kirim ulang ya bro.",
+                reply_markup=MAIN_MENU_KB,
+            )
             return
 
         low = text.lower().strip()
@@ -2042,6 +2104,9 @@ class TelegramBotBridge:
         chunks = self._split_for_telegram(redact_secrets(text))
         if not chunks:
             chunks = ["(kosong)"]
+
+        # Tandai chat ini SUDAH dibalas (dipakai watchdog anti-bisu)
+        self._answered_chat[chat_id] = int(self._last_update_id.get(chat_id, 0) or 0)
 
         first_mid: Optional[int] = None
         for idx, chunk in enumerate(chunks):

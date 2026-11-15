@@ -40,6 +40,7 @@ BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "layar", "description": "Kirim Foto Layar Browser Sekarang"},
     {"command": "status_tugas", "description": "Cek Status & Checkpoint Tugas Terakhir"},
     {"command": "lanjut", "description": "Lanjutkan Tugas dari Checkpoint Terakhir"},
+    {"command": "persona", "description": "Atur Nama & Gaya Bahasa Bot"},
     {"command": "kunci", "description": "Kunci Bot & Web Khusus HP Lu"},
     {"command": "stop", "description": "Hentikan Proses Saat Ini"},
 ]
@@ -837,6 +838,48 @@ class TelegramBotBridge:
             text.strip(),
             flags=re.I | re.S,
         )
+        # ==================== /persona — ATUR NAMA & GAYA BAHASA BOT ====================
+        if low == "/persona" or low.startswith("/persona ") or low in ("gaya bahasa", "ganti gaya"):
+            arg = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+            cur = self.orchestrator.get_agent_persona()
+            if not arg:
+                await self.send_text(
+                    chat_id,
+                    "🎭 PERSONA BOT LU SEKARANG:\n\n"
+                    f"{('• ' + cur) if cur else '• (belum diset — pakai gaya default: santai, gua/lu, to-the-point)'}\n\n"
+                    "Mau ganti? Ketik aja, contoh:\n"
+                    "`/persona nama lu Nusa, panggil gua Bos, jawab singkat tegas tanpa basa-basi`\n"
+                    "`/persona balas pakai bahasa formal dan sopan`\n"
+                    "`/persona lu asisten investasi yang kritis, selalu kasih angka`\n\n"
+                    "Hapus persona: `/persona hapus`",
+                    reply_markup=MAIN_MENU_KB,
+                )
+                return
+
+            mems = self.orchestrator.user_memories
+            # Buang baris persona lama
+            kept = [m for m in mems if not re.match(r"^persona\s*[:\-]", m.strip(), flags=re.I)]
+            if arg.lower() in ("hapus", "reset", "clear", "kosongkan"):
+                mems[:] = kept
+                self._save_mem_safe()
+                await self.send_text(
+                    chat_id,
+                    "✅ Persona custom udah dihapus. Balik ke gaya default (santai, to-the-point).",
+                    reply_markup=MAIN_MENU_KB,
+                )
+                return
+
+            kept.append(f"Persona: {arg[:400]}")
+            mems[:] = kept
+            self._save_mem_safe()
+            await self.send_text(
+                chat_id,
+                f"✅ Sip, persona baru gua pasang:\n\n• {arg[:400]}\n\n"
+                "Mulai sekarang semua balasan gua ikut gaya itu. Coba tes ngobrol sekarang!",
+                reply_markup=MAIN_MENU_KB,
+            )
+            return
+
         if low == "/ingat" or low.startswith("/ingat ") or natural_mem_match:
             arg = text[6:].strip() if (low == "/ingat" or low.startswith("/ingat ")) else natural_mem_match.group(1).strip()
             arg_low = arg.lower()
@@ -1291,9 +1334,9 @@ class TelegramBotBridge:
                         ]
                     ]
                 }
-                await self.send_text(chat_id, reply, reply_markup=export_kb)
+                await self._stream_reply(chat_id, reply, reply_markup=export_kb)
             else:
-                await self.send_text(chat_id, reply, reply_markup=MAIN_MENU_KB)
+                await self._stream_reply(chat_id, reply, reply_markup=MAIN_MENU_KB)
             return
 
         # Mode "agent" (Kerjain Tugas Web)
@@ -1349,6 +1392,14 @@ class TelegramBotBridge:
             f"{waktu.title()}{', ' + nama if nama else ' bro'}! Gua on. Mau mulai dari mana?",
         ]
         return _rnd.choice(varian)
+
+    def _save_mem_safe(self) -> None:
+        """Simpan memori profil tanpa pernah melempar exception ke handler chat."""
+        try:
+            if self.orchestrator is not None:
+                self.orchestrator._save_user_memories()
+        except Exception as exc:
+            print(f"[telegram] gagal simpan memori: {type(exc).__name__}", flush=True)
 
     async def _push_safe(self, role: str, text: str) -> None:
         """_push_chat yang tidak pernah melempar exception (biar chat history bukan penyebab bot bisu)."""
@@ -1788,6 +1839,72 @@ class TelegramBotBridge:
                     self._last_rendered_card.pop(cid, None)
         if clear_after and self._active_run_seq == expected_seq:
             self._active_run_seq = 0
+
+    async def _stream_reply(
+        self,
+        chat_id: int,
+        full_text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """
+        STREAMING ALA AGENT: kirim balasan bertahap (efek ngetik), bukan diem lalu muncul sekaligus.
+        - Pecah per potongan ~110 karakter di batas kata
+        - Edit pesan yang sama supaya tidak spam chat
+        - Kalau gagal di tengah jalan, kirim sisa teksnya secara normal (tidak ada yang hilang)
+        """
+        if not self.token:
+            return None
+        clean = redact_secrets(full_text).strip()
+        if not clean:
+            return None
+
+        # Balasan pendek: langsung sekali kirim, tidak perlu streaming
+        if len(clean) <= 220:
+            return await self.send_text(chat_id, clean, reply_markup=reply_markup)
+
+        # Potongan bertahap di batas kata
+        pieces: List[str] = []
+        remaining = clean
+        while remaining:
+            if len(remaining) <= 110:
+                pieces.append(remaining)
+                break
+            window = remaining[:110]
+            cut = max(window.rfind(" "), window.rfind("\n"))
+            if cut <= 30:
+                cut = 110
+            pieces.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip()
+
+        # Batasi jumlah edit supaya tidak kena rate-limit Telegram (maks ~10 update)
+        total = len(pieces)
+        step = max(1, total // 10)
+        shown = ""
+        mid: Optional[int] = None
+
+        for idx, piece in enumerate(pieces):
+            shown = (shown + piece).strip()
+            is_last = idx >= total - 1
+            if not is_last and idx % step != 0:
+                continue
+            body = shown if is_last else (shown + " ▌")
+            if mid is None:
+                mid = await self.send_text(chat_id, body[:3900])
+            else:
+                await self._edit_text(chat_id, mid, body[:3900], reply_markup=(reply_markup if is_last else None))
+            if not is_last:
+                await asyncio.sleep(0.28)
+
+        # JAMINAN UTUH: frame terakhir WAJIB berisi teks lengkap (dengan tombol kalau ada).
+        if mid is None:
+            return await self.send_text(chat_id, clean, reply_markup=reply_markup)
+        final_body = clean[:3900]
+        if mid and (shown.strip() != clean or reply_markup):
+            await self._edit_text(chat_id, mid, final_body, reply_markup=reply_markup)
+            # Kalau teks > 3900, sisanya tetap harus terkirim utuh
+            if len(clean) > 3900:
+                await self.send_text(chat_id, clean[3900:], reply_markup=reply_markup)
+        return mid
 
     async def _edit_text(
         self,

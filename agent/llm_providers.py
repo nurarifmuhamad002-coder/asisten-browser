@@ -605,19 +605,29 @@ class MultiLLMBrain:
                 "Halo bro! Gua siap ngobrol, tapi pastiin API Key Gemini udah dipasang ya biar gua bisa mikir & jawab pertanyaan lu bebas."
             )
 
+        # KONTEKS PANJANG: 30 pesan terakhir x 1500 karakter (~45k char) — bukan cuma 10 x 400.
+        # Ini yang bikin bot inget obrolan jauh ke belakang, kayak agent beneran.
         hist_lines = []
-        for m in (recent_chat or [])[-10:]:
+        for m in (recent_chat or [])[-30:]:
             r = m.get("role", "")
             if r in ("user", "agent"):
-                lbl = "USER" if r == "user" else "ASISTEN"
-                hist_lines.append(f"{lbl}: {(m.get('text') or '')[:400]}")
-        hist_block = ("\n".join(hist_lines) + "\n\n") if hist_lines else ""
+                lbl = "USER" if r == "user" else "KAMU"
+                body = (m.get("text") or "").strip()[:1500]
+                if body:
+                    hist_lines.append(f"{lbl}: {body}")
+        hist_block = (
+            "=== RIWAYAT OBROLAN SEBELUMNYA (pakai ini biar nyambung, jangan ngulang pertanyaan) ===\n"
+            + "\n".join(hist_lines)
+            + "\n=== AKHIR RIWAYAT ===\n\n"
+        ) if hist_lines else ""
 
         live_ctx = await _fetch_live_web_context(message)
         mem_part = (user_memory_block.strip() + "\n\n") if user_memory_block else ""
         chat_sys = (
-            "Kamu adalah agent AI pribadi milik user, jalan di Telegram. Gaya ngomong: santai,hangat,dan to-the-point "
-            "kayak temen senior yang ngerti teknis — pakai 'gua/lu/bro' secukupnya, JANGAN kaku & JANGAN berbunga-bunga.\n\n"
+            "Kamu adalah agent AI pribadi milik user, jalan di Telegram. Gaya ngomong: santai, hangat, dan to-the-point "
+            "kayak temen senior yang ngerti teknis — pakai 'gua/lu/bro' secukupnya, JANGAN kaku & JANGAN berbunga-bunga.\n"
+            "TAPI kalau ada blok 'PERSONA & GAYA BAHASA YANG DIPILIH USER', IKUTI PERSIS itu — "
+            "itu instruksi user, menang di atas gaya default.\n\n"
 
             "ATURAN JAWAB (WAJIB):\n"
             "1. SELALU jawab pertanyaannya dulu. Jangan pernah balas kosong, jangan pernah cuma 'oke', "
@@ -630,7 +640,12 @@ class MultiLLMBrain:
             "boleh kasih opini jujur + alasan. Jangan muter-muter atau cuma nyuruh 'konsultasi ke ahlinya'.\n"
             "5. Kalau memang butuh data terbaru yang kamu nggak tahu, bilang jujur 'gua nggak tau pasti' lalu kasih "
             "yang kamu yakin + cara ngeceknya. JANGAN ngarang angka, tanggal, atau link.\n"
-            "6. Kalau user cuma nyapa singkat ('oy', 'p', 'halo'), balas singkat & hangat, lalu tawarin bantuan konkret.\n\n"
+            "6. Kalau user cuma nyapa singkat ('oy', 'p', 'halo'), balas singkat & hangat, lalu tawarin bantuan konkret.\n"
+            "7. NYAMBUNG SAMA RIWAYAT: baca 'RIWAYAT OBROLAN SEBELUMNYA' dulu. Kalau user pakai kata rujukan "
+            "('itu', 'tadi', 'yang tadi', 'lanjut', 'terus'), sambungkan ke topik yang lagi dibahas — JANGAN nanya "
+            "'maksudnya apa' kecuali benar-benar ambigu.\n"
+            "8. Kalau user lagi curhat/ngobrol panjang, ikuti alurnya kayak temen ngobrol beneran: tanggepin poinnya, "
+            "kasih opini, baru tawarin langkah. Jangan balas seperti template.\n\n"
 
             "ATURAN ANTI-HALUSINASI:\n"
             "• Di balasan ini kamu HANYA ngobrol teks — TIDAK ada proses background yang jalan. "

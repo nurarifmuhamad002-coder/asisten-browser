@@ -209,14 +209,35 @@ class AgentOrchestrator:
         self.user_memories.clear()
         self._save_user_memories()
 
+    def get_agent_persona(self) -> str:
+        """Ambil baris persona custom dari memori (user bisa set nama/gaya bot lewat /persona)."""
+        for m in self.user_memories:
+            mm = re.match(r"^persona\s*[:\-]\s*(.+)$", m.strip(), flags=re.I)
+            if mm:
+                return mm.group(1).strip()
+        return ""
+
     def format_user_memory_block(self) -> str:
         if not self.user_memories:
             return ""
-        joined = "\n".join(f"- {m}" for m in self.user_memories)
-        return (
-            "=== MEMORI PROFIL & GAYA KERJA PEMILIK BOT (GUNAKAN OTOMATIS SAAT MENGISI FORM / MEMBUAT DOKUMEN / MENJAWAB) ===\n"
-            f"{joined}\n"
-        )
+        # Baris persona dipisah supaya tidak tercampur jadi "data profil"
+        profile_lines = [m for m in self.user_memories if not re.match(r"^persona\s*[:\-]", m.strip(), flags=re.I)]
+        persona = self.get_agent_persona()
+
+        parts: List[str] = []
+        if persona:
+            parts.append(
+                "=== PERSONA & GAYA BAHASA YANG DIPILIH USER (IKUTI PERSIS) ===\n"
+                f"- {persona}\n"
+                "=== AKHIR PERSONA ===\n"
+            )
+        if profile_lines:
+            joined = "\n".join(f"- {m}" for m in profile_lines)
+            parts.append(
+                "=== MEMORI PROFIL & GAYA KERJA PEMILIK BOT (GUNAKAN OTOMATIS SAAT MENGISI FORM / MEMBUAT DOKUMEN / MENJAWAB) ===\n"
+                f"{joined}\n"
+            )
+        return "\n".join(parts)
 
     @staticmethod
     def _parse_goal_kv_expectations(goal_text: str) -> Dict[str, str]:

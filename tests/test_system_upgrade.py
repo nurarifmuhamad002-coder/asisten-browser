@@ -1565,6 +1565,118 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(18, "Tahap 6: Anti 'Bot Diem Total' (Lock Macet, Listener Isolasi, Sapaan Kilat, Gaya Agent)", True, "Lock macet <=25s tetap dijawab via jalur darurat, error handler dilaporkan jujur (tidak bisu), poll loop terisolasi per-update, sapaan 0ms, & prompt gaya agent tanpa label robotik.")
 
+        # =====================================================================
+        # 19. TAHAP 7: PERCAKAPAN SEPERTI AGENT (KONTEKS PANJANG, STREAMING, PERSONA)
+        # =====================================================================
+        src_tb19 = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+        src_lp19 = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+        src_or19 = (ROOT / "agent" / "orchestrator.py").read_text(encoding="utf-8")
+
+        # 19a. Konteks riwayat: 30 pesan x 1500 char (bukan 10 x 400)
+        assert "recent_chat or [])[-30:]" in src_lp19, "Konteks wajib 30 pesan terakhir, bukan 10"
+        assert "[:1500]" in src_lp19, "Setiap pesan riwayat wajib 1500 karakter, bukan 400"
+        assert "[-10:]" not in src_lp19.split("hist_lines = []")[1].split("hist_block")[0], "Batas lama 10 pesan wajib hilang"
+        assert "RIWAYAT OBROLAN SEBELUMNYA" in src_lp19, "Riwayat wajib diberi label jelas ke AI"
+
+        # 19b. Streaming bertahap beneran ada & dipakai di jalur chat
+        assert "_stream_reply" in src_tb19, "Fungsi streaming wajib ada"
+        assert "await self._stream_reply(chat_id, reply" in src_tb19, "Jalur chat wajib pakai streaming"
+        assert "await asyncio.sleep(0.28)" in src_tb19, "Streaming wajib ada jeda bertahap (efek ngetik)"
+
+        # Streaming: teks panjang dipecah bertahap, teks pendek 1x kirim
+        stream_tg = TelegramBotBridge(state_dir=str(tmp_dir / "stream_state"))
+        stream_tg.token = "123456789:AADummySyntheticToken00000000004"
+        stream_sent: List[str] = []
+        stream_edits: List[str] = []
+
+        async def _rec_stream(cid: int, text: str, reply_markup: Any = None) -> Optional[int]:
+            stream_sent.append(text)
+            return 900 + len(stream_sent)
+
+        async def _rec_edit(cid: int, mid: int, text: str, reply_markup: Any = None) -> None:
+            stream_edits.append(text)
+
+        stream_tg.send_text = _rec_stream  # type: ignore
+        stream_tg._edit_text = _rec_edit  # type: ignore
+        await stream_tg._stream_reply(555, "Pendek aja bro.")
+        assert len(stream_sent) == 1 and not stream_edits, "Balasan pendek harus 1x kirim tanpa streaming"
+
+        stream_sent.clear()
+        stream_edits.clear()
+        long_stream_txt = " ".join(f"Kalimat nomor {i} yang isinya cukup panjang untuk menguji streaming." for i in range(1, 26))
+        assert len(long_stream_txt) > 1500
+        await stream_tg._stream_reply(555, long_stream_txt)
+        assert stream_sent, "Balasan panjang wajib dikirim (minimal pesan awal)"
+        total_shown = (stream_edits[-1] if stream_edits else stream_sent[-1])
+        assert "Kalimat nomor 25" in total_shown, f"Streaming wajib sampai kalimat terakhir, bukan terpotong: {total_shown[-120:]!r}"
+
+        # 19c. Persona: bisa diset, dibaca, dan dipisah dari data profil
+        assert "/persona" in src_tb19, "Perintah /persona wajib terdaftar"
+        assert "get_agent_persona" in src_or19, "Orchestrator wajib punya pembaca persona"
+        assert "PERSONA & GAYA BAHASA YANG DIPILIH USER" in src_or19, "Blok persona wajib dipisah dari memori profil"
+        assert "IKUTI PERSIS itu" in src_lp19, "Prompt wajib menuruti persona user di atas gaya default"
+
+        class _FakeOrchPersona:
+            user_memories = ["Nama Lengkap: Budi Santoso", "Persona: panggil gua Bos, jawab tegas tanpa basa-basi"]
+
+            def format_user_memory_block(self) -> str:
+                return AgentOrchestrator.format_user_memory_block(self)
+
+            def get_agent_persona(self) -> str:
+                return AgentOrchestrator.get_agent_persona(self)
+
+        fp = _FakeOrchPersona()
+        assert fp.get_agent_persona() == "panggil gua Bos, jawab tegas tanpa basa-basi"
+        blk = fp.format_user_memory_block()
+        assert "PERSONA & GAYA BAHASA" in blk and "panggil gua Bos" in blk
+        assert "Nama Lengkap: Budi Santoso" in blk, "Data profil wajib tetap ada"
+        assert "Persona:" not in blk.split("AKHIR PERSONA")[1], "Baris persona tidak boleh dobel di blok profil"
+
+        # 19d. Perintah /persona benar-benar menyimpan & menghapus
+        class _OrchP:
+            user_memories: List[str] = []
+            saved = 0
+
+            def get_agent_persona(self) -> str:
+                return AgentOrchestrator.get_agent_persona(self)
+
+            def _save_user_memories(self) -> None:
+                self.saved += 1
+
+            def format_user_memory_block(self) -> str:
+                return ""
+
+            class _TS:
+                def get_resumable_context(self, *a: Any, **k: Any) -> Optional[Dict[str, Any]]:
+                    return None
+
+            task_store = _TS()
+
+        p_tg = TelegramBotBridge(state_dir=str(tmp_dir / "persona_state"))
+        p_tg.token = "123456789:AADummySyntheticToken00000000005"
+        p_orch = _OrchP()
+        p_tg.orchestrator = p_orch  # type: ignore
+        p_sent: List[str] = []
+
+        async def _rec_p(cid: int, text: str, reply_markup: Any = None) -> Optional[int]:
+            p_sent.append(text)
+            return 1
+
+        p_tg.send_text = _rec_p  # type: ignore
+        await p_tg._handle_locked_message(
+            601, 601, {}, {"message_id": 1, "chat": {"id": 601}, "from": {"id": 601}, "text": "/persona lu asisten investasi kritis, selalu kasih angka"}
+        )
+        assert p_orch.user_memories and "Persona:" in p_orch.user_memories[-1], f"Persona wajib tersimpan: {p_orch.user_memories}"
+        assert p_orch.saved == 1, "Persona wajib dipersist ke disk"
+        assert any("persona baru gua pasang" in x.lower() for x in p_sent), f"Konfirmasi persona wajib dikirim: {p_sent}"
+
+        await p_tg._handle_locked_message(
+            601, 601, {}, {"message_id": 2, "chat": {"id": 601}, "from": {"id": 601}, "text": "/persona hapus"}
+        )
+        assert not any("Persona:" in m for m in p_orch.user_memories), f"Persona wajib terhapus: {p_orch.user_memories}"
+
+        record(19, "Tahap 7: Percakapan Seperti Agent (Konteks 30x1500, Streaming, Persona Custom)", True, "Riwayat 30 pesan wajib kebaca, balasan panjang dikirim bertahap (efek ngetik) sampai kalimat terakhir, & persona custom tersimpan/terhapus lewat /persona.")
+
     finally:
         if browser is not None:
             await browser.stop()

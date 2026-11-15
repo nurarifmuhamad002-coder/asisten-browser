@@ -1466,6 +1466,23 @@ class AgentOrchestrator:
                         self._record_issue(f"Field '{fkey}': {note_part}")
             return res
 
+        if act_name == "upload_file":
+            self._browser_actions_count += 1
+            idx = int(action.get("index", 0))
+            fname = str(action.get("file") or action.get("filename") or "")
+            res = await self.browser.upload_file(idx, fname, elements)
+            self._form_touched = True
+            if res.startswith("❌"):
+                self._record_issue(res.replace("❌ ", "")[:180])
+            else:
+                self._expected_fields[f"file[{idx}]"] = fname
+            return res
+
+        if act_name == "download_file":
+            self._browser_actions_count += 1
+            idx = int(action.get("index", 0))
+            return await self.browser.download_targeted(idx, elements)
+
         if act_name == "scroll":
             self._browser_actions_count += 1
             return await self.browser.scroll_page(direction=str(action.get("direction", "down")))

@@ -2699,6 +2699,115 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(31, "Tahap 19: Autonomous Recovery (CAPTCHA, Sesi Habis, Validasi, Rate Limit)", True, "Empat jenis error baru dikenali otomatis. CAPTCHA & sesi habis kini BERHENTI rapi + minta manusia (dulu dipaksa terus -> risiko IP diblokir permanen). Validasi form dibalas panduan perbaikan spesifik, rate limit ditunggu dengan jeda aman. Sinyal needs_human akhirnya DIHORMATI loop, plus tombol Telegram yang benar-benar hidup.")
 
+        # =====================================================================
+        # 32. TAHAP 20: WEB CONTROL — UPLOAD & DOWNLOAD FILE
+        # =====================================================================
+        src32_be = (ROOT / "agent" / "browser_engine.py").read_text(encoding="utf-8")
+        src32_or = (ROOT / "agent" / "orchestrator.py").read_text(encoding="utf-8")
+        src32_lp = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+
+        # 32a. Kemampuan upload wajib ada (dulu sama sekali tidak ada)
+        assert "async def upload_file" in src32_be, "upload_file wajib ada di browser engine"
+        assert "set_input_files" in src32_be, "Upload harus memakai set_input_files (bekerja walau input hidden)"
+        assert "async def download_targeted" in src32_be, "Download terverifikasi wajib ada"
+        assert "expect_download" in src32_be, "Download harus ditunggu sampai benar-benar tersimpan"
+
+        # 32b. Aksi baru harus tersambung ke orchestrator
+        assert '"upload_file"' in src32_or, "Aksi upload_file wajib ditangani orchestrator"
+        assert '"download_file"' in src32_or, "Aksi download_file wajib ditangani orchestrator"
+        assert "download_targeted" in src32_or, "Orchestrator wajib memakai download terverifikasi"
+
+        # 32c. AI harus DIBERITAHU aksi ini ada, kalau tidak akan pakai click biasa
+        assert '"name": "upload_file"' in src32_lp, "Prompt AI wajib mengenalkan aksi upload_file"
+        assert '"name": "download_file"' in src32_lp, "Prompt AI wajib mengenalkan aksi download_file"
+
+        # 32d. BUKTI HIDUP: upload sungguhan ke halaman nyata
+        import http.server as _hs32
+        import socketserver as _ss32
+        import threading as _th32
+        import functools as _ft32
+
+        _html32 = (
+            "<!doctype html><html><body><h1>Upload Test</h1><form>"
+            '<input name="nm" placeholder="Nama">'
+            '<input type="file" id="vis" name="doc">'
+            '<input type="file" id="hid" name="doc2" style="display:none">'
+            "<button type='button' id='pick' "
+            "onclick=\"document.getElementById('hid').click()\">Pilih Tersembunyi</button>"
+            "</form>"
+            '<a id="dl" href="data:text/plain;charset=utf-8,ISI-BUKTI" download="bukti.txt">Download Bukti</a>'
+            "</body></html>"
+        )
+        _dir32 = tmp_dir / "up32"
+        _dir32.mkdir(parents=True, exist_ok=True)
+        (_dir32 / "index.html").write_text(_html32, encoding="utf-8")
+
+        class _H32(_hs32.SimpleHTTPRequestHandler):
+            def log_message(self, *a: Any) -> None:
+                return None
+
+        _srv32 = _ss32.TCPServer(("127.0.0.1", 0), _ft32.partial(_H32, directory=str(_dir32)))
+        _port32 = _srv32.server_address[1]
+        _th32.Thread(target=_srv32.serve_forever, daemon=True).start()
+
+        from agent.browser_engine import CloudBrowserEngine as _CBE32
+        from agent.file_manager import WorkspaceFileManager as _WFM32
+
+        async def _bc32(ev: Any) -> None:
+            return None
+
+        _d32 = tmp_dir / "be32"
+        _d32.mkdir(parents=True, exist_ok=True)
+        _fm32 = _WFM32(base_dir=str(_d32), allow_writes=True)
+        _fm32.save_bytes("data_kepulangan.csv", b"nama,tanggal\nArif,2026-12-20\n")
+        _be32 = _CBE32(
+            file_manager=_fm32, broadcast_cb=_bc32,
+            profile_dir=str(_d32), allow_writes=True,
+        )
+        try:
+            await _be32.ensure_alive()
+            await _be32.navigate(f"http://127.0.0.1:{_port32}/index.html")
+            await asyncio.sleep(0.6)
+            _els32 = (await _be32.observe(annotated_screenshot=False)).get("elements") or []
+            assert _els32, "Halaman tes upload wajib punya elemen"
+
+            _fidx32 = next((e["index"] for e in _els32 if (e.get("type") or "") == "file"), None)
+            assert _fidx32 is not None, f"Input file wajib terdeteksi: {_els32}"
+
+            _r_up32 = await _be32.upload_file(_fidx32, "data_kepulangan.csv", _els32)
+            assert "BERHASIL dipasang" in _r_up32, f"Upload file yang ada wajib berhasil: {_r_up32}"
+
+            _r_missing32 = await _be32.upload_file(_fidx32, "nggak_ada_xyz.csv", _els32)
+            assert "tidak ditemukan" in _r_missing32, (
+                f"Upload file yang tidak ada wajib dilaporkan jujur: {_r_missing32}"
+            )
+
+            # upload lewat tombol yang membuka input tersembunyi
+            _bidx32 = next(
+                (e["index"] for e in _els32 if "tersembunyi" in (e.get("text") or "").lower()), None
+            )
+            if _bidx32 is not None:
+                _r_hid32 = await _be32.upload_file(_bidx32, "data_kepulangan.csv", _els32)
+                assert "BERHASIL dipasang" in _r_hid32 or "dipasang setelah" in _r_hid32, (
+                    f"Upload lewat input tersembunyi wajib berhasil: {_r_hid32}"
+                )
+
+            # download terverifikasi
+            _didx32 = next(
+                (e["index"] for e in _els32 if "download" in (e.get("text") or "").lower()), None
+            )
+            assert _didx32 is not None, "Tautan download wajib terdeteksi"
+            _r_dl32 = await _be32.download_targeted(_didx32, _els32, wait_ms=15000)
+            assert "BERHASIL download" in _r_dl32, f"Download wajib terverifikasi: {_r_dl32}"
+            _names32 = [f["name"] for f in _fm32.list_files()]
+            assert any("bukti" in n for n in _names32), f"File hasil download wajib tersimpan: {_names32}"
+        finally:
+            await _be32.stop()
+            _srv32.shutdown()
+
+        record(32, "Tahap 20: Web Control — Upload & Download File", True, "Kemampuan upload yang sebelumnya TIDAK ADA kini tersedia: pasang file workspace ke <input type=file> (termasuk yang tersembunyi), lapor jujur kalau file tidak ada. Download kini ditunggu sampai benar-benar tersimpan. Aksi ini juga dikenalkan ke AI agar tidak memakai klik biasa. Diuji dengan server HTTP nyata.")
+
+
 
 
     finally:

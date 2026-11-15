@@ -745,6 +745,133 @@ class CloudBrowserEngine:
                 {"type": "log", "level": "warning", "message": f"Gagal menangkap file download: {exc}"}
             )
 
+    async def upload_file(
+        self,
+        index: int,
+        file_name: str,
+        elements: List[Dict[str, Any]],
+    ) -> str:
+        """Upload file ke <input type="file"> di halaman.
+
+        Ini yang bikin bot bisa "kirim file CSV ke portal" — sebelumnya sama
+        sekali tidak ada kemampuan upload (hanya download).
+
+        Menangani 3 kasus nyata:
+        1. Input file biasa yang terlihat.
+        2. Input file TERSEMBUNYI (display:none) — sangat umum; user klik tombol
+           "Pilih File", yang sebenarnya meneruskan klik ke input hidden.
+        3. Halaman yang belum punya <input type=file> sampai sebuah tombol diklik
+           -> coba klik dulu, lalu cari ulang.
+        """
+        if not self.page:
+            raise RuntimeError("Browser belum aktif.")
+
+        # Resolusi path: cari di workspace berdasarkan nama file
+        target_path = None
+        try:
+            cand = self.file_manager.get_file_path(file_name)
+            if Path(cand).exists():
+                target_path = str(cand)
+        except Exception:
+            target_path = None
+        if not target_path:
+            # coba cocokkan sebagian nama
+            try:
+                for f in self.file_manager.list_files():
+                    if file_name.lower() in str(f.get("name", "")).lower():
+                        cand = self.file_manager.get_file_path(f["name"])
+                        if Path(cand).exists():
+                            target_path = str(cand)
+                            break
+            except Exception:
+                pass
+        if not target_path:
+            return f"❌ File '{file_name}' tidak ditemukan di workspace. Daftar file tersedia bisa dicek lewat perintah /files."
+
+        target_el = next((e for e in elements if e["index"] == index), None)
+
+        # Kandidat locator untuk input file
+        candidates: List[str] = []
+        if target_el and target_el.get("dom_selector"):
+            candidates.append(target_el["dom_selector"])
+        candidates.append(f'[data-nusa-idx="{index}"]')
+        # Semua input file yang ada di halaman (termasuk yang tersembunyi)
+        candidates.append('input[type="file"]')
+
+        for sel in candidates:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                # set_input_files bekerja walau elemen display:none
+                await loc.set_input_files(target_path, timeout=8000)
+                await asyncio.sleep(0.4)
+                await self._refresh_if_watched()
+                base = Path(target_path).name
+                size_kb = max(1, Path(target_path).stat().st_size // 1024)
+                return (
+                    f"✅ File '{base}' ({size_kb} KB) BERHASIL dipasang ke input file ({sel}). "
+                    "Lanjutkan: klik tombol Submit/Unggah, lalu verifikasi nama file muncul di halaman."
+                )
+            except Exception:
+                continue
+
+        # Kasus 3: belum ada input file -> mungkin harus klik tombol dulu
+        if target_el:
+            try:
+                await self.click_element(index, elements)
+                await asyncio.sleep(0.9)
+                loc = self.page.locator('input[type="file"]').first
+                if await loc.count() > 0:
+                    await loc.set_input_files(target_path, timeout=8000)
+                    await asyncio.sleep(0.3)
+                    base = Path(target_path).name
+                    return f"✅ File '{base}' dipasang setelah membuka dialog pilih-file."
+            except Exception:
+                pass
+
+        return (
+            f"❌ Tidak ada <input type=\"file\"> yang bisa dipakai di halaman ini. "
+            "Kalau tombol unggah membuka jendela dialog OS, itu TIDAK bisa diotomasi — "
+            "laporkan ke user bahwa upload butuh dilakukan manual."
+        )
+
+    async def download_targeted(self, index: int, elements: List[Dict[str, Any]], wait_ms: int = 25000) -> str:
+        """Klik elemen yang memicu download, TUNGGU file benar-benar tersimpan.
+
+        Dulu download hanya 'ditangkap' lewat event global tanpa konfirmasi,
+        jadi bot tidak pernah tahu apakah file berhasil turun atau tidak.
+        """
+        if not self.page:
+            raise RuntimeError("Browser belum aktif.")
+        target_el = next((e for e in elements if e["index"] == index), None)
+        if not target_el:
+            return f"❌ Elemen [{index}] tidak ditemukan."
+
+        before = {f.get("name") for f in self.file_manager.list_files()}
+        try:
+            async with self.page.expect_download(timeout=wait_ms) as dl_info:
+                await self.click_element(index, elements)
+            dl = await dl_info.value
+            suggested = dl.suggested_filename or "downloaded_file"
+            tmp = await dl.path()
+            if tmp and os.path.exists(tmp):
+                saved = self.file_manager.save_bytes(suggested, Path(tmp).read_bytes())
+                return (
+                    f"✅ BERHASIL download '{saved['name']}' ({max(1, saved['size'] // 1024)} KB). "
+                    "File sudah tersimpan di workspace dan siap dikirim ke Telegram."
+                )
+            return f"⚠️ Download '{suggested}' terpicu tetapi file tidak tersimpan."
+        except Exception as exc:
+            after = {f.get("name") for f in self.file_manager.list_files()}
+            new_files = after - before
+            if new_files:
+                return f"✅ File baru masuk lewat event download: {', '.join(sorted(new_files))}"
+            return (
+                f"⚠️ Tidak ada download terdeteksi dari klik [{index}] ({type(exc).__name__}). "
+                "Kemungkinan tombolnya bukan tombol download, atau file terbuka di tab baru."
+            )
+
     def _normalize_url(self, raw_url: str) -> str:
         url = (raw_url or "").strip()
         if not url:

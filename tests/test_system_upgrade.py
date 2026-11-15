@@ -879,7 +879,9 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
             msg_auth = await b_auth.quick_chat("Halo tes")
             assert len(calls_auth) == 1 and len(sleeps_auth) == 0, f"Auth error tidak boleh retry berulang: calls={len(calls_auth)}"
             assert b_auth.last_chat_ok is False and b_auth.last_error_kind == "auth_error"
-            assert "API Key" in msg_auth and "sibuk" not in msg_auth.lower()
+            assert ("API key" in msg_auth or "API Key" in msg_auth) and "sibuk" not in msg_auth.lower(), (
+                f"Pesan auth error wajib jujur soal API key, bukan bilang 'sibuk': {msg_auth!r}"
+            )
 
             # 13c. Sequential Fallback (404 karantina model + 429 Retry-After + 503 + sukses di model cadangan, 0 duplikasi paralel)
             calls_seq: List[str] = []

@@ -765,10 +765,7 @@ class TelegramBotBridge:
             await self._send_screen_snapshot(chat_id)
             return
         # Selain itu: jawab langsung lewat AI, potong antrean yang macet
-        await self.send_text(
-            chat_id,
-            "⚡ Antrean pesan sebelumnya sempat nyangkut, jadi gua buka jalur cepat buat jawab lu dulu...",
-        )
+
         try:
             await self.orchestrator._push_chat("user", text)
             reply = await self.orchestrator.brain.quick_chat(
@@ -1106,7 +1103,7 @@ class TelegramBotBridge:
             asyncio.create_task(self._send_chat_action(chat_id, "typing"))
             wait_mid = await self.send_text(
                 chat_id,
-                f"🟢 MESIN SEDANG MEMBUKA WEB · ⏱️ 0 dtk\n🎯 Tujuan: {text}\n📍 Aktivitas: Mencari alamat resmi & memuat halaman...",
+                f"Bentar, gua buka {text} dulu...",
             )
             target_url = await self.orchestrator.brain.resolve_website_url(text)
             asyncio.create_task(self._send_chat_action(chat_id, "upload_photo"))
@@ -1153,6 +1150,16 @@ class TelegramBotBridge:
             return
 
         if mode == "chat":
+            # SAPAAN SINGKAT -> balas manusiawi INSTAN (0 network call, 0 detik).
+            # Ini yang bikin bot kerasa "hidup", bukan kayak sistem yang mikir 5 detik buat jawab "oy".
+            if self._is_greeting_only(low):
+                await self._push_safe("user", text)
+                greet_reply = self._instant_greeting_reply(low)
+                await self._push_safe("agent", greet_reply)
+                asyncio.create_task(self._send_chat_action(chat_id, "typing"))
+                await self.send_text(chat_id, greet_reply, reply_markup=MAIN_MENU_KB)
+                return
+
             # Deteksi format file yang diminta user (Word / Excel / PDF) secara fleksibel
             req_fmt = ""
             if re.search(r"\b(pdf|\.pdf)\b", low):
@@ -1228,7 +1235,7 @@ class TelegramBotBridge:
                         chat_id,
                         fpath.name,
                         fpath.read_bytes(),
-                        f"📄 Beres dikonversi jadi .{req_fmt.upper()} asli: {fpath.name}",
+                        f"Nih, udah jadi .{req_fmt.upper()}: {fpath.name}",
                     )
                     return
 
@@ -1271,7 +1278,7 @@ class TelegramBotBridge:
                 stem_new = m_fn.group(1) if m_fn else f"dokumen_{_dt.now().strftime('%H%M%S')}"
                 saved = self.orchestrator.file_manager.export_formatted(stem_new, reply, req_fmt)
                 fpath = self.orchestrator.file_manager.get_file_path(saved["name"])
-                await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"📄 File .{req_fmt.upper()} siap dipakai: {fpath.name}")
+                await self.send_document(chat_id, fpath.name, fpath.read_bytes(), f"Nih file .{req_fmt.upper()} lu: {fpath.name}")
                 return
 
             if len(reply) >= 90:
@@ -1295,9 +1302,8 @@ class TelegramBotBridge:
         self._last_step_num = 1
         self._last_thought = "Memahami perintah & menyiapkan browser..."
         init_card = (
-            "🟢 MESIN SEDANG BEKERJA AKTIF · ⏱️ 0 dtk\n"
-            f"🎯 Tugas: {text[:130]}\n"
-            "📍 Aktivitas: Memahami perintah & menyiapkan browser..."
+            f"Oke, gua kerjain: {text[:130]}\n"
+            "Lagi gua siapin dulu..."
         )
         await self._begin_new_agent_card(chat_id, init_card, reply_markup=self._running_inline_kb())
         await self.orchestrator.start_goal(text)
@@ -1309,6 +1315,48 @@ class TelegramBotBridge:
          "bro", "bg", "bang", "bos", "min", "gan", "sis", "mas", "assalamualaikum", "salam", "pagi",
          "siang", "sore", "malam", "p", "halobro", "halo bro"}
     )
+
+    def _instant_greeting_reply(self, low: str) -> str:
+        """Balasan sapaan yang variatif & manusiawi — tanpa nunggu AI (biar kerasa responsif)."""
+        import random as _rnd
+
+        hour = __import__("datetime").datetime.now().hour
+        if hour < 11:
+            waktu = "pagi"
+        elif hour < 15:
+            waktu = "siang"
+        elif hour < 19:
+            waktu = "sore"
+        else:
+            waktu = "malam"
+
+        # Sapaan yang lebih personal kalau ada nama di memori profil
+        nama = ""
+        try:
+            for mem in (self.orchestrator.user_memories if self.orchestrator else []):
+                m = re.search(r"nama(?:\s+lengkap)?\s*[:\-]\s*([A-Za-z][A-Za-z\s\.]{1,30})", mem, flags=re.I)
+                if m:
+                    nama = m.group(1).strip().split()[0].title()
+                    break
+        except Exception:
+            nama = ""
+
+        sapa = f"{waktu}{', ' + nama if nama else ''}"
+        varian = [
+            f"Halo {sapa}! Gua di sini. Mau ngapain hari ini — ngobrol, nyari sesuatu, atau ada yang mau gua kerjain di web?",
+            f"Yo, {sapa}. Siap bantu. Ceritain aja mau lu apain.",
+            f"Halo {sapa} bro! Masih idup nih gua. Ada yang bisa dibantu?",
+            f"{waktu.title()}{', ' + nama if nama else ' bro'}! Gua on. Mau mulai dari mana?",
+        ]
+        return _rnd.choice(varian)
+
+    async def _push_safe(self, role: str, text: str) -> None:
+        """_push_chat yang tidak pernah melempar exception (biar chat history bukan penyebab bot bisu)."""
+        try:
+            if self.orchestrator is not None:
+                await self.orchestrator._push_chat(role, text)
+        except Exception:
+            pass
 
     @classmethod
     def _is_greeting_only(cls, low: str) -> bool:
@@ -1660,7 +1708,7 @@ class TelegramBotBridge:
         import time as _t
         el_s = max(1, int(_t.monotonic() - self._run_started_at)) if self._run_started_at else 1
         pulse = ("🟢", "⚡")[tick_idx % 2]
-        hdr = header_override or f"{pulse} MESIN SEDANG BEKERJA AKTIF · ⏱️ {el_s} dtk"
+        hdr = header_override or f"{pulse} Lagi jalan · {el_s} dtk"
 
         cur_u = ""
         try:

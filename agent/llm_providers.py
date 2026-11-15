@@ -503,15 +503,16 @@ class MultiLLMBrain:
 
     @staticmethod
     def _friendly_chat_error_message(kind: str) -> str:
+        """Pesan error yang kedengeran kayak orang ngomong, bukan log server."""
         if kind == "auth_error":
-            return "❌ API Key AI tidak valid atau belum aktif bro. Cek lagi lewat perintah `/apikey` atau menu pengaturan ya!"
+            return "Gua nggak bisa jawab bro — API key-nya ditolak. Ganti dulu lewat /apikey ya, nanti langsung normal lagi."
         if kind == "rate_limit":
-            return "⏳ Kuota request AI per menit lagi penuh sesaat (HTTP 429). Tunggu sekitar 5–10 detik lalu kirim ulang ya bro!"
+            return "Kuota AI-nya lagi mentok sebentar. Kasih jeda 5–10 detik terus kirim ulang, biasanya langsung masuk."
         if kind == "timeout":
-            return "⏱️ Respons server AI lewat batas waktu (timeout). Coba kirim ulang sebentar lagi ya bro!"
+            return "Servernya nggak nyaut dalam batas waktu. Coba kirim ulang aja, kemungkinan besar lagi lelet sebentar."
         if kind == "network_error":
-            return "🌐 Koneksi jaringan ke server AI sempat terputus. Coba kirim ulang barusan ya bro!"
-        return "⚠️ Server AI sedang sibuk sementara (HTTP 503). Coba kirim ulang beberapa detik lagi ya bro!"
+            return "Koneksi gua ke server AI keputus di tengah jalan. Kirim ulang pesannya ya, ini biasanya cuma sementara."
+        return "Server AI-nya lagi rame banget bro. Tunggu beberapa detik terus kirim ulang, gua langsung jawab."
 
     async def _post_gemini_single(
         self,

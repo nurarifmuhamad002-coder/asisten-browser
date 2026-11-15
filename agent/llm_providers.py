@@ -173,6 +173,161 @@ async def _fetch_single_quote(client: httpx.AsyncClient, sym: str) -> str:
     return ""
 
 
+# =========================================================================
+# MESIN RISET WEB BERLAPIS — supaya AI NYARI DATA DULU sebelum jawab,
+# bukan ngarang dari ingatan (penyebab utama jawaban terasa "dangkal").
+# =========================================================================
+_WEB_CACHE: Dict[str, Tuple[float, str]] = {}
+_RESEARCH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+)
+
+# Kata yang menandakan user butuh data SEGAR / faktual (bukan sekadar opini)
+_FRESH_INTENT_WORDS = (
+    "hari ini", "sekarang", "terbaru", "terkini", "update", "berita", "kabar", "harga",
+    "kurs", "skor", "hasil", "jadwal", "rilis", "versi", "tahun", "2025", "2026", "2027",
+    "siapa", "kapan", "berapa", "dimana", "di mana", "apa itu", "kenapa", "mengapa",
+    "bagaimana", "cara ", "bedanya", "perbedaan", "arti", "definisi", "menurut",
+    "data", "statistik", "inflasi", "pdb", "suku bunga", "bi rate", "pemilu", "presiden",
+    "saham", "bitcoin", "kripto", "emas", "ihsg", "crypto", "etf", "reksadana",
+    "cuaca", "gempa", "banjir", "kecelakaan", "virus", "obat", "resep",
+)
+
+
+async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) -> str:
+    """
+    Riset web berlapis dengan fallback berantai. Semua sumber dijalankan paralel
+    dan yang menjawab duluan dipakai. Kalau semuanya gagal, kembalikan "" (jujur kosong)
+    supaya AI tidak mengarang data.
+    """
+    q = (query or "").strip()
+    if not q:
+        return ""
+
+    cache_key = "research:" + q.lower()[:120]
+    now = _time.monotonic()
+    hit = _WEB_CACHE.get(cache_key)
+    if hit and (now - hit[0] < 240.0):  # cache 4 menit
+        return hit[1]
+
+    results: List[str] = []
+
+    async def _ddg() -> List[str]:
+        out: List[str] = []
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _RESEARCH_UA, "Accept-Language": "id-ID,id;q=0.9,en;q=0.8"}) as c:
+            r = await c.get("https://html.duckduckgo.com/html/", params={"q": q})
+            if r.status_code != 200:
+                return []
+            for m in re.finditer(r'result__a[^>]*>(.*?)</a>', r.text, re.S):
+                title = _html.unescape(re.sub(r"<[^>]+>", " ", m.group(1))).strip()
+                title = re.sub(r"\s+", " ", title)
+                if len(title) > 12:
+                    out.append(title[:150])
+                if len(out) >= max_items:
+                    break
+        return out
+
+    async def _wikipedia() -> List[str]:
+        out: List[str] = []
+        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": _RESEARCH_UA}) as c:
+            r = await c.get(
+                "https://id.wikipedia.org/w/api.php",
+                params={"action": "query", "list": "search", "srsearch": q, "format": "json", "srlimit": 4},
+            )
+            if r.status_code != 200:
+                return []
+            for item in (r.json().get("query", {}).get("search") or [])[:4]:
+                snip = _html.unescape(re.sub(r"<[^>]+>", " ", item.get("snippet") or ""))
+                snip = re.sub(r"\s+", " ", snip).strip()
+                if item.get("title"):
+                    out.append(f"Wikipedia — {item['title']}: {snip[:260]}")
+        return out
+
+    async def _google_news() -> List[str]:
+        out: List[str] = []
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _RESEARCH_UA}) as c:
+            r = await c.get(
+                "https://news.google.com/rss/search",
+                params={"q": q, "hl": "id", "gl": "ID", "ceid": "ID:id"},
+            )
+            if r.status_code != 200:
+                return []
+            for block in re.findall(r"<item>(.*?)</item>", r.text, re.S)[:max_items]:
+                mt = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", block, re.S)
+                md = re.search(r"<pubDate>(.*?)</pubDate>", block, re.S)
+                if mt:
+                    judul = _html.unescape(mt.group(1)).strip()
+                    tgl = (md.group(1)[:16] if md else "").strip()
+                    out.append(f"Berita {'(' + tgl + ')' if tgl else ''}: {judul[:220]}")
+        return out
+
+    async def _ddg_lite() -> List[str]:
+        out: List[str] = []
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _RESEARCH_UA}) as c:
+            r = await c.post("https://lite.duckduckgo.com/lite/", data={"q": q})
+            if r.status_code != 200:
+                return []
+            links = re.findall(r'class="result-link"[^>]*>(.*?)</a>', r.text, re.S)
+            for lk in links[:max_items]:
+                txt = _html.unescape(re.sub(r"<[^>]+>", " ", lk)).strip()
+                if len(txt) > 10:
+                    out.append(txt[:150])
+        return out
+
+    tasks = [
+        asyncio.create_task(_ddg()),
+        asyncio.create_task(_wikipedia()),
+        asyncio.create_task(_google_news()),
+    ]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    for g in gathered:
+        if isinstance(g, list) and g:
+            results.extend(g)
+
+    # Fallback terakhir kalau tiga sumber utama kering
+    if not results:
+        try:
+            results.extend(await _ddg_lite())
+        except Exception:
+            pass
+
+    if not results:
+        return ""
+
+    # Dedup & batasi
+    seen = set()
+    uniq: List[str] = []
+    for r_item in results:
+        key = r_item[:70].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r_item)
+        if len(uniq) >= max_items:
+            break
+
+    opsi = (
+        "=== HASIL RISET WEB (DATA EKSTERNAL, BUKAN DARI INGATANMU) ===\n"
+        + "\n".join(f"- {x}" for x in uniq)
+        + "\n=== AKHIR HASIL RISET ===\n"
+    )
+    if len(_WEB_CACHE) > 80:
+        _WEB_CACHE.clear()
+    _WEB_CACHE[cache_key] = (now, opsi)
+    return opsi
+
+
+def _needs_research(query: str) -> bool:
+    q = (query or "").lower().strip()
+    if len(q) < 4:
+        return False
+    # Sapaan / obrolan murni -> tidak perlu riset (biar responsif)
+    if q in ("oy", "p", "halo", "hi", "tes", "test", "ping", "bro"):
+        return False
+    return any(w in q for w in _FRESH_INTENT_WORDS)
+
+
 async def _fetch_live_web_context(query: str) -> str:
     """Mengambil harga saham/kripto/kurs real-time (<0.18 detik paralel + cache 45 detik) & berita terbaru."""
     q_low = (query or "").lower().strip()
@@ -622,6 +777,16 @@ class MultiLLMBrain:
         ) if hist_lines else ""
 
         live_ctx = await _fetch_live_web_context(message)
+
+        # RISET WEB: kalau pertanyaannya butuh data faktual/segar, CARI DULU sebelum jawab.
+        # Ini yang membedakan jawaban "ngarang dari ingatan" vs "berbasis sumber nyata".
+        research_ctx = ""
+        if _needs_research(message):
+            try:
+                research_ctx = await asyncio.wait_for(_research_web(message), timeout=11.0)
+            except Exception:
+                research_ctx = ""
+
         mem_part = (user_memory_block.strip() + "\n\n") if user_memory_block else ""
         chat_sys = (
             "Kamu adalah agent AI pribadi milik user, jalan di Telegram. Gaya ngomong: santai, hangat, dan to-the-point "
@@ -632,20 +797,29 @@ class MultiLLMBrain:
             "ATURAN JAWAB (WAJIB):\n"
             "1. SELALU jawab pertanyaannya dulu. Jangan pernah balas kosong, jangan pernah cuma 'oke', "
             "jangan pernah nunda jawaban ('nanti gua jelasin'), jangan pernah nanya balik kalau sebenarnya bisa dijawab.\n"
-            "2. Jawaban ringkas & padat untuk hal simpel. Untuk yang butuh detail, boleh panjang — tapi terstruktur "
-            "(poin-poin/heading pendek), bukan tembok teks.\n"
+            "2. Panjang jawaban MENGIKUTI kebutuhan, bukan dipotong demi 'ringkas'. Pertanyaan simpel -> jawab simpel. "
+            "Pertanyaan berat -> boleh panjang & terstruktur (poin-poin), asal tiap kalimat ada isinya. "
+            "Jangan pernah ngecilin jawaban cuma biar keliatan padat.\n"
             "3. Format Telegram: pakai *bold* satu bintang, dan bullet '•'. JANGAN pakai tabel markdown '|' "
             "dan JANGAN pakai heading '#' karena jelek di HP. Jangan pakai **dua bintang**.\n"
             "4. Kalau user nanya soal kondisinya/uang/investasi/pilihan hidup: jawab konkret dengan angka & langkah nyata, "
             "boleh kasih opini jujur + alasan. Jangan muter-muter atau cuma nyuruh 'konsultasi ke ahlinya'.\n"
-            "5. Kalau memang butuh data terbaru yang kamu nggak tahu, bilang jujur 'gua nggak tau pasti' lalu kasih "
-            "yang kamu yakin + cara ngeceknya. JANGAN ngarang angka, tanggal, atau link.\n"
+            "5. JANGAN NGARANG. Kalau ada 'HASIL RISET WEB', pakai itu sebagai dasar utama jawaban lu — sebut angkanya "
+            "persis seperti di sumber. Kalau riset kosong dan kamu nggak yakin, bilang jujur 'ini gua nggak tau pasti' "
+            "lalu kasih yang kamu yakin + cara ngeceknya. DILARANG ngarang angka, tanggal, nama, atau link.\n"
+            "5b. Kalau jawabanmu pakai hasil riset, akhiri dengan 1 baris sumber: 'Sumber: <nama sumber yang relevan>'. "
+            "Kalau pakai data pasar real-time, sebut itu data live.\n"
             "6. Kalau user cuma nyapa singkat ('oy', 'p', 'halo'), balas singkat & hangat, lalu tawarin bantuan konkret.\n"
             "7. NYAMBUNG SAMA RIWAYAT: baca 'RIWAYAT OBROLAN SEBELUMNYA' dulu. Kalau user pakai kata rujukan "
             "('itu', 'tadi', 'yang tadi', 'lanjut', 'terus'), sambungkan ke topik yang lagi dibahas — JANGAN nanya "
             "'maksudnya apa' kecuali benar-benar ambigu.\n"
             "8. Kalau user lagi curhat/ngobrol panjang, ikuti alurnya kayak temen ngobrol beneran: tanggepin poinnya, "
-            "kasih opini, baru tawarin langkah. Jangan balas seperti template.\n\n"
+            "kasih opini, baru tawarin langkah. Jangan balas seperti template.\n"
+            "9. KEDALAMAN: kalau topiknya teknis/analitis (investasi, kesehatan, hukum, teknologi, keputusan besar), "
+            "jangan jawab 1-2 baris. Kasih: (a) intinya dulu, (b) alasan/angka pendukung, (c) risiko atau sisi lemahnya, "
+            "(d) langkah konkret yang bisa dilakukan. Kayak analis senior yang lagi njelasin ke kolega — bukan customer service.\n"
+            "10. KALAU ADA RISIKO: selalu sebutin downside/kemungkinan buruknya, jangan cuma jual mimpi. "
+            "Kalau datanya nggak cukup buat nyimpulin, bilang butuh data apa.\n\n"
 
             "ATURAN ANTI-HALUSINASI:\n"
             "• Di balasan ini kamu HANYA ngobrol teks — TIDAK ada proses background yang jalan. "
@@ -661,7 +835,7 @@ class MultiLLMBrain:
             "buka & kendalikan browser server, isi form, login, scraping/rangkum web, bikin file Word/Excel/PDF, "
             "ingat profil user (/ingat), dan kontrol layar live."
         )
-        prompt = f"{mem_part}{hist_block}{live_ctx}USER: {message}"
+        prompt = f"{mem_part}{hist_block}{live_ctx}{research_ctx}USER: {message}"
 
         async with self._llm_semaphore:
             if self.config.provider == "gemini":
@@ -671,7 +845,7 @@ class MultiLLMBrain:
 
                 # Semua kandidat tetap dicoba (resiliensi), TAPI dibatasi deadline total ~14 detik
                 # supaya bot nggak kelihatan "diem" berjam-jam saat provider sedang gangguan.
-                deadline_chat = _time.monotonic() + 14.0
+                deadline_chat = _time.monotonic() + 30.0
                 for m_name in fast_order:
                     if _time.monotonic() >= deadline_chat and last_err is not None:
                         break
@@ -688,7 +862,7 @@ class MultiLLMBrain:
                         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                         "generationConfig": gen_cfg,
                     }
-                    data, err = await self._post_gemini_single(m_name, payload, timeout=15.0)
+                    data, err = await self._post_gemini_single(m_name, payload, timeout=30.0)
                     if data is not None:
                         ans = self._extract_gemini_text(data)
                         finish = self._gemini_finish_reason(data)

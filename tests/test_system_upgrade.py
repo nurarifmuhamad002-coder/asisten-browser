@@ -1677,6 +1677,80 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(19, "Tahap 7: Percakapan Seperti Agent (Konteks 30x1500, Streaming, Persona Custom)", True, "Riwayat 30 pesan wajib kebaca, balasan panjang dikirim bertahap (efek ngetik) sampai kalimat terakhir, & persona custom tersimpan/terhapus lewat /persona.")
 
+        # =====================================================================
+        # 20. TAHAP 8: KECERDASAN SETARA AGENT (RISET WEB SEBELUM JAWAB, ANTI NGARANG)
+        # =====================================================================
+        from agent.llm_providers import _needs_research, _research_web
+
+        # 20a. Deteksi kapan harus riset: pertanyaan faktual = YA, sapaan = TIDAK
+        for q_yes in (
+            "harga bitcoin hari ini",
+            "siapa presiden indonesia 2026",
+            "apa itu inflasi",
+            "berapa suku bunga BI sekarang",
+            "cara kerja mesin diesel",
+            "berita terbaru hari ini",
+        ):
+            assert _needs_research(q_yes), f"Pertanyaan faktual {q_yes!r} wajib memicu riset web"
+        for q_no in ("oy", "p", "halo", "ping", "tes"):
+            assert not _needs_research(q_no), f"Sapaan {q_no!r} tidak boleh memicu riset (harus responsif)"
+        assert not _needs_research(""), "Query kosong tidak boleh memicu riset"
+
+        # 20b. Mesin riset: Yahoo Search yang MATI (HTTP 500) tidak boleh jadi satu-satunya sumber
+        src_lp20 = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+        assert "html.duckduckgo.com" in src_lp20, "DDG HTML wajib jadi sumber pencarian"
+        assert "id.wikipedia.org/w/api.php" in src_lp20, "Wikipedia API wajib jadi sumber ensiklopedis"
+        assert "news.google.com/rss/search" in src_lp20, "Google News RSS wajib jadi sumber berita"
+        assert "lite.duckduckgo.com" in src_lp20, "DDG Lite wajib jadi fallback terakhir"
+        # Riset dijalankan paralel (bukan berurutan yang bikin lambat)
+        assert "asyncio.gather(*tasks, return_exceptions=True)" in src_lp20, "Sumber riset wajib dijalankan paralel"
+
+        # 20c. Riset asli benar-benar mengembalikan data dari internet (bukan string kosong)
+        research_out = await _research_web("apa itu inflasi")
+        assert research_out, "Riset 'apa itu inflasi' wajib mengembalikan data dari internet"
+        assert "HASIL RISET WEB" in research_out and "AKHIR HASIL RISET" in research_out, "Blok riset wajib berlabel jelas"
+        assert research_out.count("\n- ") >= 2, f"Riset wajib mengembalikan >=2 sumber, dapat: {research_out[:300]!r}"
+
+        # 20d. Riset di-cache supaya tidak spam sumber (pertanyaan sama berulang)
+        t_r1 = time.monotonic()
+        _ = await _research_web("apa itu inflasi")
+        dt_cached = time.monotonic() - t_r1
+        assert dt_cached < 0.5, f"Riset kedua wajib dari cache (<0.5s), bukan request ulang ({dt_cached:.2f}s)"
+
+        # 20e. Prompt wajib: anti-ngarang + wajib sitir sumber + kedalaman + risiko
+        for rule in (
+            "JANGAN NGARANG",
+            "HASIL RISET WEB",
+            "Sumber:",
+            "KEDALAMAN",
+            "downside",
+        ):
+            assert rule in src_lp20, f"Aturan wajib '{rule}' hilang dari system prompt"
+        assert "DILARANG ngarang angka, tanggal, nama, atau link" in src_lp20, "Larangan ngarang data wajib eksplisit"
+
+        # 20f. Blok riset benar-benar disisipkan ke prompt yang dikirim ke AI
+        cfg_r = LLMConfig()
+        cfg_r.update("gemini", "gemini-2.5-flash", "dummy-unit-test-key-07")
+        brain_r = MultiLLMBrain(cfg_r)
+        captured_r: Dict[str, Any] = {}
+
+        async def _fake_post_r(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            captured_r["payload"] = payload
+            return ({"candidates": [{"content": {"parts": [{"text": "Jawaban berbasis sumber."}]}, "finishReason": "STOP"}]}, None)
+
+        brain_r._post_gemini_single = _fake_post_r  # type: ignore
+        await brain_r.quick_chat("apa itu inflasi")
+        sent_prompt = captured_r["payload"]["contents"][0]["parts"][0]["text"]
+        assert "HASIL RISET WEB" in sent_prompt, "Blok riset WAJIB benar-benar terkirim ke AI, bukan cuma dibuat"
+        assert "AKHIR HASIL RISET" in sent_prompt
+
+        # 20g. Sapaan tidak memicu riset (jalur cepat tetap cepat)
+        captured_r.clear()
+        await brain_r.quick_chat("oy")
+        assert "HASIL RISET WEB" not in captured_r["payload"]["contents"][0]["parts"][0]["text"], "Sapaan tidak boleh buang waktu untuk riset"
+
+        record(20, "Tahap 8: Kecerdasan Setara Agent (Riset Web Sebelum Jawab, Anti Ngarang, Sumber Sitir)", True, "Riset 4 sumber paralel (DDG/Wikipedia/Google News/DDG Lite) nyata & ter-cache, wajib menyisip ke prompt, anti-ngarang + wajib sitir sumber + kedalaman analisis + risiko.")
+
     finally:
         if browser is not None:
             await browser.stop()

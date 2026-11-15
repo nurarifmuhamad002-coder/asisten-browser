@@ -215,20 +215,35 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
     results: List[str] = []
 
     async def _ddg() -> List[str]:
-        out: List[str] = []
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _RESEARCH_UA, "Accept-Language": "id-ID,id;q=0.9,en;q=0.8"}) as c:
-            r = await c.get("https://html.duckduckgo.com/html/", params={"q": q})
-            if r.status_code != 200:
-                return []
-            # Ambil judul + URL sekaligus supaya AI bisa memilih halaman untuk dibaca penuh
-            for title, href in _extract_result_links(r.text, limit=max_items):
-                out.append(f"{title} — {href}")
-            # Simpan URL mentah untuk pembacaan halaman berikutnya
+        """Sumber hasil utama: BING dulu (tahan blokir IP server), DuckDuckGo cadangan."""
+        headers = {"User-Agent": _RESEARCH_UA, "Accept-Language": "id-ID,id;q=0.9,en;q=0.8"}
+        pairs: List[Tuple[str, str]] = []
+
+        # Bing
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as c:
+                rb = await c.get("https://www.bing.com/search", params={"q": q, "setlang": "id"})
+            if rb.status_code == 200:
+                pairs = [(t, u) for t, u, _sn in _extract_bing_results(rb.text, limit=max_items) if u]
+        except Exception:
+            pairs = []
+
+        # DuckDuckGo kalau Bing kering
+        if not pairs:
             try:
-                _LAST_LINKS.clear()
-                _LAST_LINKS.extend([h for _t, h in _extract_result_links(r.text, limit=max_items)])
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as c:
+                    r = await c.get("https://html.duckduckgo.com/html/", params={"q": q})
+                if r.status_code == 200:
+                    pairs = _extract_result_links(r.text, limit=max_items)
             except Exception:
-                pass
+                pairs = []
+
+        out = [f"{title} — {href}" for title, href in pairs]
+        try:
+            _LAST_LINKS.clear()
+            _LAST_LINKS.extend([h for _t, h in pairs])
+        except Exception:
+            pass
         return out
 
     async def _wikipedia() -> List[str]:
@@ -266,17 +281,37 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
                     out.append(f"Berita {'(' + tgl + ')' if tgl else ''}: {judul[:220]}")
         return out
 
-    async def _ddg_lite() -> List[str]:
+    async def _fallback_extra() -> List[str]:
+        """Cadangan terakhir kalau tiga sumber utama kering.
+
+        Dulu ini DDG Lite, tapi DDG (html & lite) sama-sama membalas HTTP 202
+        "anomaly detected" ke IP datacenter, jadi hasilnya SELALU kosong.
+        Sekarang pakai Bing + Google News RSS yang jauh lebih toleran.
+        """
         out: List[str] = []
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _RESEARCH_UA}) as c:
-            r = await c.post("https://lite.duckduckgo.com/lite/", data={"q": q})
-            if r.status_code != 200:
-                return []
-            links = re.findall(r'class="result-link"[^>]*>(.*?)</a>', r.text, re.S)
-            for lk in links[:max_items]:
-                txt = _html.unescape(re.sub(r"<[^>]+>", " ", lk)).strip()
-                if len(txt) > 10:
-                    out.append(txt[:150])
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _RESEARCH_UA}) as c:
+                rb = await c.get("https://www.bing.com/search", params={"q": q, "setlang": "id"})
+            if rb.status_code == 200:
+                for title, href, snip in _extract_bing_results(rb.text, limit=max_items):
+                    if snip:
+                        out.append(f"{title} — {snip[:200]}" + (f" — {href}" if href else ""))
+        except Exception:
+            pass
+        if not out:
+            try:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _RESEARCH_UA}) as c:
+                    r = await c.get(
+                        "https://news.google.com/rss/search",
+                        params={"q": q, "hl": "id", "gl": "ID", "ceid": "ID:id"},
+                    )
+                if r.status_code == 200:
+                    for block in re.findall(r"<item>(.*?)</item>", r.text, re.S)[:max_items]:
+                        mt = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", block, re.S)
+                        if mt:
+                            out.append("Berita: " + _html.unescape(mt.group(1)).strip()[:200])
+            except Exception:
+                pass
         return out
 
     tasks = [
@@ -292,7 +327,7 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
     # Fallback terakhir kalau tiga sumber utama kering
     if not results:
         try:
-            results.extend(await _ddg_lite())
+            results.extend(await _fallback_extra())
         except Exception:
             pass
 
@@ -369,6 +404,50 @@ def _html_to_article_text(html: str) -> str:
     return re.sub(r"\s+", " ", best_txt).strip()
 
 
+def _decode_bing_redirect(href: str) -> str:
+    """Bing membungkus URL hasil jadi https://www.bing.com/ck/a?...&u=a1<base64>. Ambil URL aslinya."""
+    if "bing.com/ck/a" not in href:
+        return href
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+        u = (qs.get("u") or [""])[0]
+        if u.startswith("a1"):
+            b64 = u[2:]
+            b64 += "=" * (-len(b64) % 4)
+            import base64 as _b64
+            return _b64.urlsafe_b64decode(b64).decode("utf-8", "ignore")
+    except Exception:
+        pass
+    return href
+
+
+def _extract_bing_results(html_txt: str, limit: int = 5) -> List[Tuple[str, str, str]]:
+    """Ambil (judul, url, snippet) dari halaman hasil Bing. Bing jauh lebih tahan blokir
+    dibanding DuckDuckGo yang sekarang membalas HTTP 202 'anomaly' ke IP server."""
+    out: List[Tuple[str, str, str]] = []
+    blocks = re.findall(r'<li class="b_algo".*?(?=<li class="b_algo"|</ol>)', html_txt, re.S)
+    for blk in blocks:
+        tm = re.search(r"<h2[^>]*>(.*?)</h2>", blk, re.S)
+        if not tm:
+            continue
+        title = re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", tm.group(1)))).strip()
+        if not title:
+            continue
+        hm = re.search(r'<a[^>]+href="(https?://[^"]+)"', blk, re.S)
+        url = _html.unescape(hm.group(1)) if hm else ""
+        url = _decode_bing_redirect(url)
+        if not url.startswith("http"):
+            url = ""
+        sm = re.search(r"<p[^>]*>(.*?)</p>", blk, re.S) or re.search(
+            r'class="[^"]*b_lineclamp[^"]*"[^>]*>(.*?)</div>', blk, re.S
+        )
+        snip = re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", sm.group(1)))).strip() if sm else ""
+        out.append((title[:150], url, snip[:300]))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _extract_result_links(html: str, limit: int = 5) -> List[Tuple[str, str]]:
     """Ambil pasangan (judul, URL) dari halaman hasil DuckDuckGo."""
     out: List[Tuple[str, str]] = []
@@ -437,8 +516,34 @@ async def _fetch_page_text(url: str, max_chars: int = 4000, timeout: float = 10.
         return ""
 
 
-async def _search_with_links(query: str, limit: int = 4, timeout: float = 9.0) -> List[Tuple[str, str]]:
-    """Cari di DuckDuckGo dan kembalikan URL-nya (untuk dibaca penuh)."""
+async def _ddg_snippets(query: str, limit: int = 5, timeout: float = 7.0) -> List[str]:
+    """Ambil POTONGAN TEKS hasil pencarian (bukan hanya URL) dari DuckDuckGo HTML.
+
+    Dipakai untuk data real-time (berita, kenapa sesuatu terjadi, jadwal, skor, cuaca).
+    Menggantikan scrape Yahoo yang sudah mati total.
+    """
+    out: List[str] = []
+
+    # --- Sumber 1: BING (paling tahan blokir dari IP server) ---
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": _RESEARCH_UA, "Accept-Language": "id-ID,id;q=0.9,en;q=0.8"},
+        ) as c:
+            rb = await c.get("https://www.bing.com/search", params={"q": query, "setlang": "id"})
+        if rb.status_code == 200:
+            for title, _u, snip in _extract_bing_results(rb.text, limit=limit):
+                if snip and len(snip) > 40:
+                    out.append(f"- {snip[:260]}")
+                elif title:
+                    out.append(f"- {title[:200]}")
+        if len(out) >= 2:
+            return out[:limit]
+    except Exception:
+        pass
+
+    # --- Sumber 2: DuckDuckGo (cadangan; sering balas 202 'anomaly' ke IP datacenter) ---
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
@@ -447,8 +552,74 @@ async def _search_with_links(query: str, limit: int = 4, timeout: float = 9.0) -
         ) as c:
             r = await c.get("https://html.duckduckgo.com/html/", params={"q": query})
         if r.status_code != 200:
+            return out[:limit]
+        html_txt = r.text
+    except Exception:
+        return out[:limit]
+
+    # 1) Ambil blok judul + snippet standar DDG (result__title / result__snippet)
+    for m in re.finditer(
+        r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|td)>',
+        html_txt,
+        re.S,
+    ):
+        clean = _html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
+        clean = re.sub(r"\s+", " ", clean).strip()
+        if len(clean) > 40:
+            out.append(f"- {clean[:260]}")
+        if len(out) >= limit:
+            break
+
+    # 2) Kalau markup DDG berubah, jatuh ke judul hasil (tetap lebih baik daripada kosong)
+    if not out:
+        for title, _url in _extract_result_links(html_txt, limit=limit):
+            out.append(f"- {title[:200]}")
+    return out[:limit]
+
+
+async def _search_with_links(query: str, limit: int = 4, timeout: float = 9.0) -> List[Tuple[str, str]]:
+    """Cari hasil web dan kembalikan (judul, URL) untuk dibaca penuh.
+
+    Urutan sumber: Bing -> DuckDuckGo. Bing dipakai dulu karena DuckDuckGo kerap
+    membalas HTTP 202 "anomaly detected" ke IP datacenter (Railway/cloud), yang bikin
+    riset mendadak kosong tanpa error.
+    """
+    headers = {"User-Agent": _RESEARCH_UA, "Accept-Language": "id-ID,id;q=0.9,en;q=0.8"}
+
+    # --- Sumber 1: Bing ---
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as c:
+            rb = await c.get("https://www.bing.com/search", params={"q": query, "setlang": "id"})
+        if rb.status_code == 200:
+            links = [(t, u) for t, u, _sn in _extract_bing_results(rb.text, limit=limit) if u]
+            if links:
+                return links
+    except Exception:
+        pass
+
+    # --- Sumber 2: DuckDuckGo HTML ---
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as c:
+            r = await c.get("https://html.duckduckgo.com/html/", params={"q": query})
+        if r.status_code != 200:
             return []
         return _extract_result_links(r.text, limit=limit)
+    except Exception:
+        return []
+
+
+async def _bing_links(query: str, limit: int = 5, timeout: float = 8.0) -> List[Tuple[str, str]]:
+    """Khusus Bing, dipakai jalur riset utama."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": _RESEARCH_UA, "Accept-Language": "id-ID,id;q=0.9,en;q=0.8"},
+        ) as c:
+            r = await c.get("https://www.bing.com/search", params={"q": query, "setlang": "id"})
+        if r.status_code != 200:
+            return []
+        return [(t, u) for t, u, _sn in _extract_bing_results(r.text, limit=limit) if u]
     except Exception:
         return []
 
@@ -791,17 +962,12 @@ async def _fetch_live_web_context(query: str) -> str:
                             results = await asyncio.gather(*[_fetch_single_quote(client, s) for s in found_syms])
                             chunks.extend([r for r in results if r])
 
-        # Hanya tarik HTML search jika belum dapat harga finansial ATAU user memang tanya alasan/berita
+        # Hanya tarik hasil pencarian jika belum dapat harga finansial ATAU user memang tanya alasan/berita
+        # PENTING: pakai DuckDuckGo HTML, BUKAN Yahoo Search (Yahoo scrape sudah mati/berubah markup
+        # -> regex compText tidak pernah match, jadi bot seolah "tidak nemu apa-apa").
         if not chunks or any(w in q_low for w in ("berita", "kenapa", "knpa", "jadwal", "skor", "cuaca", "terbaru")):
-            rw = await client.get("https://search.yahoo.com/search", params={"p": query}, timeout=3.5)
-            if rw.status_code == 200:
-                for m in re.finditer(r'<div[^>]*class="[^"]*compText[^"]*"[^>]*>(.*?)</div>', rw.text, re.S):
-                    clean_s = _html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
-                    clean_s = re.sub(r"\s+", " ", clean_s).strip()
-                    if len(clean_s) > 35:
-                        chunks.append(f"- {clean_s[:240]}")
-                        if len(chunks) >= 5:
-                            break
+            snippets = await _ddg_snippets(query, limit=5, timeout=6.0)
+            chunks.extend(snippets)
     except Exception:
         pass
 
@@ -819,7 +985,7 @@ Tugasmu adalah memahami perintah user (dalam Bahasa Indonesia atau Inggris), men
 ATURAN KEAMANAN MUTLAK (HUMAN-IN-THE-LOOP):
 1. DILARANG menebak atau mengarang sendiri password, PIN, atau kode OTP/2FA. NAMUN jika user SUDAH MENULISKAN secara eksplisit Username & Password di dalam perintah chatnya (contoh: "login pakai Username: standard_user dan Password: secret_sauce"), LANGSUNG ketik menggunakan action `"type"` ke kolom Username & Password lalu `"click"` tombol Login — JANGAN panggil `"request_human_login"`! Panggil `"request_human_login"` HANYA jika halaman meminta login/OTP/CAPTCHA yang kredensialnya BELUM diberikan oleh user.
 2. Untuk tindakan sensitif (seperti: konfirmasi pembayaran/checkout, transfer uang, hapus akun/data penting, kirim email/publikasi, ubah pengaturan keamanan), pastikan form sudah siap lalu klik tombolnya atau panggil `"ask_approval"` — sistem guardrail juga akan meminta izin eksplisit ke user sebelum klik dieksekusi.
-3. Untuk pencarian web umum di browser, gunakan `"navigate"` ke `https://search.yahoo.com/search?p=kata+kunci` (hindari `google.com/search` dan `duckduckgo` agar tidak terkena CAPTCHA IP server cloud). Jika user hanya menyapa atau bertanya apakah kamu bisa melakukan sesuatu tanpa menyebutkan link/tugas spesifiknya, jawab ramah dengan gaya santai (*gua/lu/bro*) menggunakan `"done"`.
+3. Untuk pencarian web umum di browser, gunakan `"navigate"` ke `https://html.duckduckgo.com/html/?q=kata+kunci` (pakai versi `html.` karena ringan & tanpa CAPTCHA; HINDARI `google.com/search` dan `search.yahoo.com` yang sering memblokir/CAPTCHA IP server cloud). Jika user hanya menyapa atau bertanya apakah kamu bisa melakukan sesuatu tanpa menyebutkan link/tugas spesifiknya, jawab ramah dengan gaya santai (*gua/lu/bro*) menggunakan `"done"`.
 4. PROAKTIF BUKA TAB/WEB BARU: Jika user meminta masuk/membuka layanan lain yang berbeda dari halaman yang sedang terbuka (contoh: "login Konami ID", "buka e-learning", "cek GitHub", "buka baru lagi"), LANGSUNG panggil `"navigate"` ke URL resmi layanan tersebut (misal Konami ID -> `https://my.konami.net`), JANGAN pernah bilang website lama tidak mendukung layanan tersebut! Perhatikan juga RIWAYAT OBROLAN SEBELUMNYA untuk memahami maksud lanjutan user.
 
 ATURAN KETAT PENGISIAN & VERIFIKASI FORMULIR (WAJIB PATUHI 100%):

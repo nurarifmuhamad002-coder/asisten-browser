@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 import os
 import py_compile
@@ -1701,7 +1702,10 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         assert "html.duckduckgo.com" in src_lp20, "DDG HTML wajib jadi sumber pencarian"
         assert "id.wikipedia.org/w/api.php" in src_lp20, "Wikipedia API wajib jadi sumber ensiklopedis"
         assert "news.google.com/rss/search" in src_lp20, "Google News RSS wajib jadi sumber berita"
-        assert "lite.duckduckgo.com" in src_lp20, "DDG Lite wajib jadi fallback terakhir"
+        # DDG (html & lite) sekarang membalas HTTP 202 "anomaly" ke IP datacenter -> mati.
+        # Fallback terakhir wajib Bing / Google News, dan DDG Lite tidak boleh dipakai lagi.
+        assert "www.bing.com/search" in src_lp20, "Bing wajib jadi mesin pencari utama"
+        assert "_ddg_lite" not in src_lp20, "DDG Lite sudah mati (202 anomaly) dan tidak boleh dipakai"
         # Riset dijalankan paralel (bukan berurutan yang bikin lambat)
         assert "asyncio.gather(*tasks, return_exceptions=True)" in src_lp20, "Sumber riset wajib dijalankan paralel"
 
@@ -2327,6 +2331,57 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         assert not exec_calls, f"Caption 'apa isi file ini' TIDAK boleh memicu eksekusi web: {exec_calls}"
 
         record(25, "Tahap 13: File + Caption -> Eksekusi Web Otomatis", True, "Caption natural ('bikinin grup kepulangan di all indonesia') kini memicu eksekusi browser dengan data file diwariskan, sementara caption murni tanya-isi tetap hanya analisis.")
+
+        # =====================================================================
+        # 26. TAHAP 14: MESIN PENCARI — Yahoo mati, DuckDuckGo diblokir -> BING
+        # =====================================================================
+        src_llm26 = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+
+        # 26a. Tidak boleh ada lagi GET ke search.yahoo.com di jalur pencarian
+        assert "search.yahoo.com/search" not in src_llm26, (
+            "Jalur pencarian TIDAK boleh lagi memanggil search.yahoo.com "
+            "(markup berubah -> regex compText tidak match -> bot seolah tidak menemukan apa-apa)"
+        )
+        # 26b. System prompt browser tidak boleh menyuruh AI ke Yahoo
+        assert "https://search.yahoo.com/search?p=" not in src_llm26, (
+            "System prompt browser masih menyuruh AI navigasi ke Yahoo"
+        )
+        assert "html.duckduckgo.com/html/?q=" in src_llm26, (
+            "System prompt browser wajib mengarahkan pencarian ke DuckDuckGo HTML"
+        )
+        # 26c. Helper snippet wajib ada & dipakai di jalur data real-time
+        assert "async def _ddg_snippets" in src_llm26, "Helper _ddg_snippets wajib ada"
+        assert "_ddg_snippets(query" in src_llm26, "Jalur data real-time wajib memakai _ddg_snippets"
+
+        # 26d. Bing wajib jadi sumber utama (DDG membalas 202 "anomaly" ke IP datacenter)
+        assert "async def _bing_links" in src_llm26, "Helper _bing_links wajib ada"
+        assert "_extract_bing_results" in src_llm26, "Parser hasil Bing wajib ada"
+        assert "_decode_bing_redirect" in src_llm26, "Decoder redirect bing.com/ck/a wajib ada"
+        assert "www.bing.com/search" in src_llm26, "Pencarian wajib memakai Bing"
+        assert "_ddg_lite" not in src_llm26, (
+            "DDG Lite sudah mati (202 anomaly) dan tidak boleh dipakai lagi"
+        )
+        src_srch = src_llm26[src_llm26.index("async def _search_with_links"):]
+        src_srch = src_srch[: src_srch.index("async def _bing_links")]
+        assert src_srch.index("www.bing.com/search") < src_srch.index("html.duckduckgo.com"), (
+            "Bing wajib dicoba SEBELUM DuckDuckGo di _search_with_links"
+        )
+
+        # 26e. Bukti hidup: fungsi benar-benar menarik isi dari jaringan
+        _llm26 = importlib.import_module("agent.llm_providers")
+        snips26 = await _llm26._ddg_snippets("harga emas antam hari ini", limit=3, timeout=15.0)
+        assert isinstance(snips26, list) and snips26, f"_ddg_snippets harus mengembalikan hasil nyata, dapat: {snips26}"
+        assert all(s.startswith("- ") for s in snips26), "Format snippet harus diawali '- '"
+
+        # 26f. URL hasil Bing wajib URL ASLI situs, bukan link redirect bing.com/ck/a
+        links26 = await _llm26._search_with_links("apa itu inflasi", limit=3, timeout=15.0)
+        assert links26, f"_search_with_links harus mengembalikan URL nyata, dapat: {links26}"
+        assert all("bing.com/ck/a" not in u for _t, u in links26), (
+            f"Link redirect Bing bocor ke sistem (tidak bisa dibaca penuh): {links26}"
+        )
+        assert any("wikipedia.org" in u or "http" in u for _t, u in links26), "URL hasil wajib absolut"
+
+        record(26, "Tahap 14: Mesin Pencari: Yahoo Mati, DDG Diblokir -> BING", True, "Sisa Yahoo dibersihkan. Temuan baru: DuckDuckGo (html & lite) membalas HTTP 202 'anomaly' ke IP datacenter sehingga riset SELALU kosong. Bing dipindah jadi mesin utama (parser b_algo + decode redirect ck/a), DDG jadi cadangan, fallback terakhir Bing/Google News. Diuji dengan jaringan nyata.")
 
     finally:
         if browser is not None:

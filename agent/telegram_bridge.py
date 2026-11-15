@@ -1782,9 +1782,25 @@ class TelegramBotBridge:
                 await self._edit_text(chat_id, wait_mid, f"✅ File '{saved_name}' berhasil dibaca & disimpan ke Workspace!")
 
             cap_low = caption.lower()
-            wants_web_exec = any(
-                kw in cap_low
-                for kw in ("isiin ke web", "isi ke web", "masukin ke web", "isi form", "buka ", "kerjain di web")
+            # Deteksi niat eksekusi web yang jauh lebih luas: user biasanya nulis santai,
+            # bukan pakai frasa template ("isi ke web"). Kalau tidak begini, bot cuma menganalisis
+            # file lalu diam — padahal user maunya langsung dikerjain.
+            _EXEC_INTENT = (
+                "isiin ke web", "isi ke web", "masukin ke web", "isi form", "buka ", "kerjain di web",
+                "isi datanya", "isi data", "masukin data", "inputin", "input ke", "input data",
+                "kerjain", "kerjakan", "daftarin", "daftarkan", "bikinin grup", "bikin grup",
+                "bikin kepulangan", "buatin grup", "buat grup", "submit", "unggah", "upload",
+                "gas isi", "langsung isi", "tolong isi", "sikat",
+            )
+            # Nama situs/domain juga jadi penanda kuat bahwa user mau eksekusi di situs itu
+            _SITE_HINT = (
+                "all indonesia", "allindonesia", "imigrasi", "siskopatuh", "evisa", "molina",
+                "demoqa", "saucedemo", "shopee", "tokopedia", "traveloka", "wikipedia",
+                "classroom", "web", "situs", "form", "formulir", "portal",
+            )
+            wants_web_exec = any(kw in cap_low for kw in _EXEC_INTENT) or (
+                any(kw in cap_low for kw in _SITE_HINT)
+                and any(v in cap_low for v in ("bikinin", "bikin", "buatkan", "buat ", "kerjain", "isi", "daftar"))
             )
             if wants_web_exec:
                 import time as _t

@@ -2197,6 +2197,137 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(24, "Tahap 12: Fix Bug FOTO+CAPTION BISU (regresi jalur darurat)", True, "Jalur darurat kini memproses foto/document/voice lewat caption, teks kosong tidak lagi return diam-diam, & watchdog 20 detik melapor jujur kalau ada pesan tak terjawab.")
 
+        # =====================================================================
+        # 25. TAHAP 13: FILE + CAPTION -> EKSEKUSI WEB OTOMATIS (niat bahasa natural)
+        # =====================================================================
+        src_tb25 = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+
+        # 25a. Deteksi niat eksekusi wajib jauh lebih luas dari frasa template lama
+        assert "_EXEC_INTENT" in src_tb25, "Daftar niat eksekusi wajib ada sebagai konstanta"
+        assert "_SITE_HINT" in src_tb25, "Penanda nama situs wajib dipakai untuk mendeteksi niat"
+        for phrase in ("bikinin grup", "isi datanya", "masukin data", "inputin", "daftarin"):
+            assert phrase in src_tb25, f"Frasa natural {phrase!r} wajib dikenali sebagai niat eksekusi"
+
+        # 25b. Reproduksi: caption natural harus memicu mode eksekusi (dulu cuma analisis lalu diam)
+        exec_calls: List[str] = []
+
+        class _OrchExec:
+            state = "IDLE"
+            live_status = "-"
+            chat_messages: List[Dict[str, Any]] = []
+            history: List[Any] = []
+            current_plan: List[Any] = []
+            user_memories: List[str] = []
+            persistent_notes: Dict[str, str] = {}
+
+            class _TS:
+                def get_resumable_context(self, *a: Any, **k: Any) -> Optional[Dict[str, Any]]:
+                    return None
+
+            task_store = _TS()
+
+            class _B:
+                page = None
+                last_chat_ok = True
+
+                async def classify_intent(self, *a: Any, **k: Any) -> str:
+                    return "chat"
+
+                async def analyze_media(self, user_prompt: str, filename: str, raw_bytes: bytes, mime_type: str, extracted_text: str = "") -> str:
+                    return "Data kepulangan: 4 orang, tanggal 20 Des 2026."
+
+            brain = _B()
+
+            class _Br:
+                page = None
+
+                def _display_url(self, u: str) -> str:
+                    return u
+
+            browser = _Br()
+
+            class _FM:
+                def save_bytes(self, n: str, b: bytes) -> Dict[str, Any]:
+                    return {"name": n}
+
+                def read_file(self, n: str, max_chars: int = 20000) -> str:
+                    return "nama,tanggal\\nArif,2026-12-20\\nSiti,2026-12-20\\n"
+
+            file_manager = _FM()
+
+            async def _push_chat(self, role: str, text: str, meta: Any = None) -> None:
+                self.chat_messages.append({"role": role, "text": text})
+
+            def format_user_memory_block(self) -> str:
+                return ""
+
+            async def _push_safe(self, role: str, text: str) -> None:
+                self.chat_messages.append({"role": role, "text": text})
+
+            async def start_goal(self, goal: str) -> None:
+                exec_calls.append(goal)
+
+            async def stop_goal(self, silent: bool = False) -> None:
+                return None
+
+        exec_tg = TelegramBotBridge(state_dir=str(tmp_dir / "exec_state"))
+        exec_tg.token = "123456789:AADummySyntheticToken00000000102"
+        exec_orch = _OrchExec()
+        exec_tg.orchestrator = exec_orch  # type: ignore
+        exec_sent: List[str] = []
+
+        async def _rec_exec(cid: int, text: str, reply_markup: Any = None) -> Optional[int]:
+            exec_sent.append(text)
+            return 1
+
+        async def _edit_exec(cid: int, mid: int, text: str, reply_markup: Any = None) -> None:
+            exec_sent.append(text)
+
+        async def _dl_exec(fid: str) -> bytes:
+            return b"nama,tanggal\nArif,2026-12-20\n"
+
+        exec_tg.send_text = _rec_exec  # type: ignore
+        exec_tg._edit_text = _edit_exec  # type: ignore
+        exec_tg._download_telegram_file = _dl_exec  # type: ignore
+
+        await exec_tg._handle_locked_message(
+            888001,
+            888001,
+            {},
+            {
+                "message_id": 601,
+                "chat": {"id": 888001},
+                "from": {"id": 888001},
+                "document": {"file_id": "DOC1", "file_name": "data_kepulangan.csv", "mime_type": "text/csv"},
+                "caption": "bikinin grup kepulangan di all indonesia",
+            },
+        )
+        assert exec_calls, (
+            "Caption natural 'bikinin grup kepulangan di all indonesia' WAJIB memicu eksekusi web. "
+            "Bug lama: cuma analisis file lalu diam, user tidak tahu apa-apa."
+        )
+        assert "Gunakan data hasil baca dari file" in exec_calls[0], (
+            f"Data file wajib diwariskan ke tugas web: {exec_calls[0][:160]}"
+        )
+
+        # 25c. Caption yang murni minta analisis TIDAK boleh memicu eksekusi (jangan salah tembak)
+        exec_calls.clear()
+        await exec_tg._handle_locked_message(
+            888001,
+            888001,
+            {},
+            {
+                "message_id": 602,
+                "chat": {"id": 888001},
+                "from": {"id": 888001},
+                "document": {"file_id": "DOC2", "file_name": "rangkuman.pdf", "mime_type": "application/pdf"},
+                "caption": "apa isi file ini",
+            },
+        )
+        assert not exec_calls, f"Caption 'apa isi file ini' TIDAK boleh memicu eksekusi web: {exec_calls}"
+
+        record(25, "Tahap 13: File + Caption -> Eksekusi Web Otomatis", True, "Caption natural ('bikinin grup kepulangan di all indonesia') kini memicu eksekusi browser dengan data file diwariskan, sementara caption murni tanya-isi tetap hanya analisis.")
+
     finally:
         if browser is not None:
             await browser.stop()

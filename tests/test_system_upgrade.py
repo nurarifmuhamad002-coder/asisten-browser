@@ -2383,6 +2383,79 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(26, "Tahap 14: Mesin Pencari: Yahoo Mati, DDG Diblokir -> BING", True, "Sisa Yahoo dibersihkan. Temuan baru: DuckDuckGo (html & lite) membalas HTTP 202 'anomaly' ke IP datacenter sehingga riset SELALU kosong. Bing dipindah jadi mesin utama (parser b_algo + decode redirect ck/a), DDG jadi cadangan, fallback terakhir Bing/Google News. Diuji dengan jaringan nyata.")
 
+        # =====================================================================
+        # 27. TAHAP 15: PENCARIAN WEB LEWAT BROWSER SUNGGUHAN (bukan HTTP scrape)
+        # =====================================================================
+        src27 = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+
+        # 27a. Pencarian WAJIB lewat Chrome sungguhan, dengan mesin yang bisa dipilih
+        assert "async def search_via_browser" in src27, "search_via_browser wajib ada"
+        assert "SEARCH_ENGINES" in src27, "Daftar mesin pencari wajib terpusat"
+        assert "SEARCH_ORDER" in src27, "Urutan mesin pencari wajib bisa diatur"
+        assert "def set_search_engine" in src27, "Harus bisa ganti mesin (/search)"
+        assert "LAST_VISIBLE_SEARCH" in src27, "State pencarian terakhir wajib dilacak (transparansi)"
+        for _eng in ("google", "bing", "yahoo"):
+            assert f'"{_eng}":' in src27, f"Mesin {_eng} wajib terdaftar"
+
+        # 27b. KUNCI: bot wajib MENGETIK di kolom pencarian, bukan buka URL hasil.
+        # Membuka URL hasil langsung = diblokir Google ("lalu lintas tidak wajar").
+        assert "async def _type_and_search" in src27, "Fungsi ketik-di-kolom wajib ada"
+        assert "keyboard.press(\"Enter\")" in src27, "Wajib menekan Enter seperti manusia"
+        assert "await box.type(query, delay=90)" in src27, (
+            "Wajib mengetik pelan (delay) supaya tidak terdeteksi bot"
+        )
+        # Prompt browser harus MELARANG buka URL hasil (bukan memerintahkannya)
+        _prompt_line = [ln for ln in src27.split("\n") if "PENCARIAN WEB:" in ln][0]
+        assert "JANGAN" in _prompt_line, "Prompt wajib melarang buka URL hasil langsung"
+        assert "kolom pencarian" in _prompt_line, "Prompt wajib menyuruh ketik di kolom pencarian"
+        assert '"type"' in _prompt_line, "Prompt wajib memakai action type"
+
+        # 27c. Resolver redirect wajib ada (Google /goto, Bing ck/a)
+        assert "async def _resolve_real_url" in src27, "Resolver URL redirect wajib ada"
+        assert "_decode_bing_redirect" in src27, "Decoder redirect Bing wajib ada"
+        assert "/goto" in src27, "Redirect Google /goto wajib ditangani"
+
+        # 27d. Wiring: otak punya akses browser + notifikasi transparan
+        assert "self.browser: Any = None" in src27, "MultiLLMBrain wajib punya atribut browser"
+        assert "search_notice_cb" in src27, "Hook notifikasi pencarian wajib ada (transparansi)"
+        src_orch27 = (ROOT / "agent" / "orchestrator.py").read_text(encoding="utf-8")
+        assert "self.brain.browser = browser" in src_orch27, "Orchestrator wajib menyambungkan browser ke otak"
+        src_tb27 = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+        assert "brain.search_notice_cb" in src_tb27, "Bridge wajib memasang notifikasi pencarian"
+        assert '"/search"' in src_tb27, "Perintah /search wajib ada di Telegram"
+
+        # 27e. Mesin yang terbukti memblokir server TIDAK boleh dipakai sebagai SUMBER.
+        # (boleh disebut di blacklist filter / komentar, tapi tidak boleh di SEARCH_ENGINES)
+        _eng_block = src27[src27.index("SEARCH_ENGINES: Dict[str, Dict[str, str]] = {"):]
+        _eng_block = _eng_block[:_eng_block.index("}")]
+        for _bad in ("duckduckgo", "ecosia", "brave", "startpage"):
+            assert _bad not in _eng_block, (
+                f"Mesin {_bad} memblokir IP server, tidak boleh jadi sumber pencarian"
+            )
+        assert "_ddg_lite" not in src27, "DDG Lite sudah mati, tidak boleh dipakai"
+
+        # 27f. BUKTI HIDUP: pencarian lewat Chromium nyata mengembalikan hasil + URL asli
+        _llm27 = importlib.import_module("agent.llm_providers")
+        rows27 = await _llm27.search_via_browser("apa itu inflasi", limit=3)
+        assert rows27, f"search_via_browser wajib mengembalikan hasil nyata, dapat: {rows27}"
+        assert _llm27.LAST_VISIBLE_SEARCH.get("count", 0) > 0, "State pencarian wajib terisi"
+        assert _llm27.LAST_VISIBLE_SEARCH.get("engine") in ("google", "bing", "yahoo"), (
+            f"Mesin yang dipakai wajib tercatat: {_llm27.LAST_VISIBLE_SEARCH}"
+        )
+        for _t27, _u27, _s27 in rows27:
+            assert _u27.startswith("http"), f"URL wajib absolut (redirect belum di-resolve): {_u27}"
+            for _badhost in ("google.com/goto", "bing.com/ck/a", "/search?", "yahoo.com/search"):
+                assert _badhost not in _u27, f"URL masih link mesin pencari: {_u27}"
+            assert len(_t27) > 5, f"Judul wajib terbaca: {_t27!r}"
+
+        # 27g. Hasil browser wajib masuk ke konteks riset yang dipakai AI
+        ctx27 = await _llm27._research_web("apa itu inflasi", max_items=3)
+        assert ctx27, "Riset wajib mengembalikan konteks"
+        assert "HASIL RISET WEB" in ctx27 and "AKHIR HASIL RISET" in ctx27
+        assert ctx27.count("\n- ") >= 2, f"Riset wajib >=2 sumber: {ctx27[:200]!r}"
+
+        record(27, "Tahap 15: Pencarian Lewat Chrome (Ketik di Kolom, Google/Bing/Yahoo)", True, "Pencarian kini MEMBUKA Chrome sungguhan lalu MENGETIK di kolom pencarian seperti manusia — kunci yang membuat Google lolos (buka URL hasil langsung = diblokir). Redirect Google /goto & Bing ck/a di-resolve jadi URL asli. Mesin bisa diganti lewat /search. DDG/Ecosia/Brave dibuang karena memblokir IP server. User dapat notifikasi tiap browser dibuka untuk mencari.")
+
     finally:
         if browser is not None:
             await browser.stop()

@@ -196,7 +196,7 @@ _FRESH_INTENT_WORDS = (
 )
 
 
-async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) -> str:
+async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0, brain_ref: Any = None) -> str:
     """
     Riset web berlapis dengan fallback berantai. Semua sumber dijalankan paralel
     dan yang menjawab duluan dipakai. Kalau semuanya gagal, kembalikan "" (jujur kosong)
@@ -213,6 +213,20 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
         return hit[1]
 
     results: List[str] = []
+
+    # SUMBER UTAMA: buka mesin pencari di BROWSER SUNGGUHAN (Yahoo).
+    # Ini yang bikin pencarian "kelihatan" jalan di Chrome, dan Yahoo terbukti
+    # 200 OK dari IP server sementara Google/DDG/Ecosia/Brave semuanya memblokir.
+    try:
+        browser_rows = await asyncio.wait_for(
+            search_via_browser(q, browser=getattr(brain_ref, "browser", None), limit=max_items),
+            timeout=32.0,
+        )
+    except Exception:
+        browser_rows = []
+    for _t, _u, _sn in browser_rows:
+        label = _sn or _t
+        results.append(f"{label} — {_u}" if _u else label)
 
     async def _ddg() -> List[str]:
         """Sumber hasil utama: BING dulu (tahan blokir IP server), DuckDuckGo cadangan."""
@@ -314,11 +328,15 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
                 pass
         return out
 
-    tasks = [
-        asyncio.create_task(_ddg()),
-        asyncio.create_task(_wikipedia()),
-        asyncio.create_task(_google_news()),
-    ]
+    if len(results) >= 3:
+        # Browser sudah memberi hasil nyata -> cukup. Tambahan HTTP scrape tidak perlu.
+        tasks = [asyncio.create_task(_wikipedia()), asyncio.create_task(_google_news())]
+    else:
+        tasks = [
+            asyncio.create_task(_ddg()),
+            asyncio.create_task(_wikipedia()),
+            asyncio.create_task(_google_news()),
+        ]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
     for g in gathered:
         if isinstance(g, list) and g:
@@ -516,6 +534,293 @@ async def _fetch_page_text(url: str, max_chars: int = 4000, timeout: float = 10.
         return ""
 
 
+# =========================================================================
+# PENCARIAN LEWAT CHROME SUNGGUHAN (bukan HTTP scrape di belakang layar)
+# =========================================================================
+# PRINSIP: bot membuka Chromium/Chrome NYATA, lalu MENGETIK di kolom pencarian
+# seperti manusia (bukan langsung membuka URL hasil). Ini kuncinya:
+#
+#   Buka URL hasil langsung     -> Google: "lalu lintas tidak wajar" (BLOKIR)
+#   Ketik di kolom + Enter      -> Google: 200 OK, 7 hasil ✅
+#
+# Hasil uji lapangan dari IP server ini (Chromium nyata):
+#   Google      ✅ jalan kalau diketik seperti manusia
+#   Bing        ✅ jalan, 10 hasil
+#   Yahoo       ✅ jalan, 7 hasil (URL asli bersih)
+#   DuckDuckGo  ❌ 202 "anomaly", 0 hasil
+#   Ecosia      ❌ 403 CAPTCHA
+#   Brave       ❌ 429 CAPTCHA
+#   Startpage   ❌ JS challenge tanpa henti
+SEARCH_ENGINES: Dict[str, Dict[str, str]] = {
+    # nama: {home, input, result_selector, title_selector}
+    "google": {
+        "label": "Google",
+        "home": "https://www.google.com/?hl=id",
+        "input": "textarea[name=q], input[name=q]",
+        "block_marker": "lalu lintas yang tidak wajar|unusual traffic|recaptcha|verify you are human",
+        "result": "div#search a h3, div#rso a h3, a h3",
+    },
+    "bing": {
+        "label": "Bing",
+        "home": "https://www.bing.com/?setlang=id",
+        "input": "textarea#sb_form_q, input#sb_form_q",
+        "block_marker": "recaptcha|verify you are human|sedang memverifikasi",
+        "result": "li.b_algo h2",
+    },
+    "yahoo": {
+        "label": "Yahoo",
+        "home": "https://search.yahoo.com/",
+        "input": "input#yschsp, input[name=p]",
+        "block_marker": "recaptcha|are you a robot",
+        "result": "div.algo h3",
+    },
+}
+
+# Urutan percobaan. Bisa diubah user lewat /search google|bing|yahoo
+SEARCH_ORDER: List[str] = ["google", "bing", "yahoo"]
+DEFAULT_ENGINE = os.getenv("SEARCH_ENGINE_DEFAULT", "google").strip().lower()
+if DEFAULT_ENGINE in SEARCH_ENGINES:
+    SEARCH_ORDER = [DEFAULT_ENGINE] + [e for e in SEARCH_ORDER if e != DEFAULT_ENGINE]
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+LAST_VISIBLE_SEARCH: Dict[str, Any] = {
+    "query": "", "url": "", "engine": "", "count": 0, "tried": [],
+}
+
+
+def set_search_engine(name: str) -> bool:
+    """Ubah mesin pencari utama (dipakai oleh /search di Telegram)."""
+    global SEARCH_ORDER
+    n = (name or "").strip().lower()
+    if n not in SEARCH_ENGINES:
+        return False
+    SEARCH_ORDER = [n] + [e for e in SEARCH_ORDER if e != n]
+    return True
+
+
+def search_order_summary() -> str:
+    return " → ".join(SEARCH_ENGINES[e]["label"] for e in SEARCH_ORDER)
+
+
+async def _resolve_real_url(page: Any, href: str) -> str:
+    """Ubah link hasil pencarian jadi URL ASLI situs tujuan.
+
+    - Google: href relatif "/goto?url=CAES..." -> ikuti redirect (302) -> URL asli
+    - Bing:   href "https://www.bing.com/ck/a?..." -> decode param u=a1<base64>
+    """
+    if not href:
+        return ""
+    # Google /goto -> resolve lewat redirect
+    if href.startswith("/goto") or "/goto?url=" in href:
+        full = href if href.startswith("http") else ("https://www.google.com" + href)
+        try:
+            r = await page.context.request.get(full, max_redirects=0, timeout=10000)
+            loc = r.headers.get("location") or ""
+            if loc.startswith("http"):
+                return loc
+        except Exception:
+            pass
+        return ""
+    # Bing ck/a -> decode base64
+    if "bing.com/ck/a" in href:
+        return _decode_bing_redirect(href)
+    return href if href.startswith("http") else ""
+
+
+async def _extract_results_from_page(page: Any, engine: str, limit: int = 5) -> List[Tuple[str, str, str]]:
+    """Ambil hasil dari halaman hasil pencarian yang SEDANG TERBUKA di Chrome.
+
+    Dibuat berbasis locator (bukan JS innerHTML) karena tiap mesin beda struktur:
+      Google -> judul <h3> di dalam <a>, href relatif /goto?url=... (harus di-resolve)
+      Bing   -> judul di <h2>, href dibungkus ck/a (harus di-decode), domain di <cite>
+      Yahoo  -> kartu div.algo, href sudah URL asli bersih
+    """
+    out: List[Tuple[str, str, str]] = []
+    seen: set = set()
+    link_locators = {
+        "google": "div#search a:has(h3), div#rso a:has(h3), a:has(h3)",
+        "bing": "li.b_algo h2 a",
+        "yahoo": "div.algo h3 a",
+    }
+    sel = link_locators.get(engine, "a:has(h3)")
+    try:
+        links = page.locator(sel)
+        n = await links.count()
+    except Exception:
+        return []
+
+    for i in range(min(n, limit * 3)):
+        try:
+            el = links.nth(i)
+            title = (await el.inner_text(timeout=2500) or "").strip()
+            title = re.sub(r"\s+", " ", title)
+            # Google menempelkan breadcrumb URL ke dalam teks judul
+            # (mis. "Inflasi Bank Indonesia https://www.bi.go.id › fungsi-utama").
+            # Potong di kemunculan URL pertama biar judulnya bersih.
+            title = re.split(r"\s+https?://", title)[0].strip()
+            title = re.sub(r"\s+(www\.)?[a-z0-9\-]+\.(id|com|org|net|co|go\.id)\b.*$", "", title).strip()
+            if len(title) < 5:
+                continue
+            raw = await el.get_attribute("href", timeout=2500)
+            url = await _resolve_real_url(page, raw or "")
+            if not url.startswith("http"):
+                # Bing cadangan: pakai <cite> untuk tahu domainnya
+                if engine == "bing":
+                    continue
+                continue
+            # buang link internal mesin pencari
+            if any(b in url for b in (
+                "google.com/", "google.co.id/", "bing.com/", "yahoo.com/",
+                "search.brave.com", "duckduckgo.com",
+            )):
+                continue
+            key = title.lower()[:40]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((title[:150], url, ""))
+            if len(out) >= limit:
+                break
+        except Exception:
+            continue
+    return out
+
+
+async def _type_and_search(page: Any, engine: str, query: str) -> str:
+    """Buka halaman utama mesin pencari, KETIK query seperti manusia, tekan Enter.
+    Mengembalikan teks halaman hasil."""
+    cfg = SEARCH_ENGINES[engine]
+    await page.goto(cfg["home"], timeout=30000, wait_until="domcontentloaded")
+    await asyncio.sleep(0.5)
+
+    box = page.locator(cfg["input"]).first
+    await box.wait_for(state="visible", timeout=8000)
+    await box.click()
+    await asyncio.sleep(0.2)
+    # ketik pelan (delay 80-110ms per karakter) — pola ini yang lolos dari deteksi bot
+    await box.type(query, delay=90)
+    await asyncio.sleep(0.4)
+    await page.keyboard.press("Enter")
+
+    # Tunggu hasil BENAR-BENAR ter-render. Dulu cuma sleep 1.6 detik -> Google & Bing
+    # belum selesai render, hasil terbaca 0 padahal halamannya sehat (bukan diblokir).
+    try:
+        await page.wait_for_selector(cfg["result"], timeout=12000)
+    except Exception:
+        pass
+    # beri waktu tambahan supaya semua kartu hasil muncul (Google render bertahap)
+    for _ in range(6):
+        try:
+            n = await page.locator(cfg["result"]).count()
+        except Exception:
+            n = 0
+        if n >= 3:
+            break
+        await asyncio.sleep(0.5)
+    await asyncio.sleep(0.4)
+
+    try:
+        return await page.inner_text("body")
+    except Exception:
+        return ""
+
+
+async def search_via_browser(
+    query: str,
+    browser: Any = None,
+    limit: int = 5,
+    timeout_ms: int = 30000,
+    engine: Optional[str] = None,
+) -> List[Tuple[str, str, str]]:
+    """Cari lewat CHROME SUNGGUHAN: buka mesin pencari, ketik query, Enter, baca hasil.
+
+    Kalau `browser` (CloudBrowserEngine) diberikan, pakai tab bot yang SAMA —
+    user benar-benar melihat Chrome-nya bekerja. Kalau tidak, buka Chromium sekali pakai.
+
+    Kalau mesin pertama diblokir, otomatis coba mesin berikutnya (SEARCH_ORDER).
+    """
+    order = ([engine] if engine in SEARCH_ENGINES else []) + [e for e in SEARCH_ORDER if e != engine]
+    LAST_VISIBLE_SEARCH.update({"query": query, "url": "", "engine": "", "count": 0, "tried": []})
+
+    # ---- Jalur 1: pakai tab browser milik bot (TERLIHAT oleh user) ----
+    if browser is not None:
+        try:
+            await browser.ensure_alive()
+            page = getattr(browser, "page", None)
+            if page and not page.is_closed():
+                for eng in order:
+                    try:
+                        body_txt = await _type_and_search(page, eng, query)
+                        LAST_VISIBLE_SEARCH["tried"].append(eng)
+                        marker = SEARCH_ENGINES[eng]["block_marker"]
+                        if re.search(marker, (body_txt or "")[:1200], re.I):
+                            continue
+                        out = await _extract_results_from_page(page, eng, limit=limit)
+                        if out:
+                            LAST_VISIBLE_SEARCH.update({
+                                "url": page.url, "engine": eng, "count": len(out),
+                            })
+                            return out
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # ---- Jalur 2: Chromium sekali pakai (tetap browser nyata) ----
+    try:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as pw:
+            b = await pw.chromium.launch(
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+            )
+            ctx = await b.new_context(
+                user_agent=_BROWSER_UA, locale="id-ID", viewport={"width": 1366, "height": 800}
+            )
+            await ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+            )
+            pg = await ctx.new_page()
+            try:
+                for eng in order:
+                    try:
+                        body_txt = await _type_and_search(pg, eng, query)
+                        LAST_VISIBLE_SEARCH["tried"].append(eng)
+                        marker = SEARCH_ENGINES[eng]["block_marker"]
+                        if re.search(marker, (body_txt or "")[:1200], re.I):
+                            continue
+                        out2 = await _extract_results_from_page(pg, eng, limit=limit)
+                        if out2:
+                            LAST_VISIBLE_SEARCH.update({
+                                "url": pg.url, "engine": eng, "count": len(out2),
+                            })
+                            return out2
+                    except Exception:
+                        continue
+                return []
+            finally:
+                await b.close()
+    except Exception:
+        return []
+
+
+async def _browser_search_context(query: str, browser: Any = None, limit: int = 5) -> str:
+    """Jalankan pencarian lewat Chrome lalu kembalikan blok teks siap disuntik ke konteks AI."""
+    rows = await search_via_browser(query, browser=browser, limit=limit)
+    if not rows:
+        return ""
+    eng = SEARCH_ENGINES.get(LAST_VISIBLE_SEARCH.get("engine", ""), {}).get("label", "Chrome")
+    lines = [f"- {t} — {u}" for t, u, _ in rows]
+    return (
+        f"[HASIL PENCARIAN LEWAT CHROME — mesin: {eng}]\n"
+        + "\n".join(lines)
+    )
+
+
 async def _ddg_snippets(query: str, limit: int = 5, timeout: float = 7.0) -> List[str]:
     """Ambil POTONGAN TEKS hasil pencarian (bukan hanya URL) dari DuckDuckGo HTML.
 
@@ -664,7 +969,9 @@ async def _research_with_tools(
 
     # RONDE 0 (selalu): riset awal sekali jalan supaya AI punya pijakan
     try:
-        base_ctx = await asyncio.wait_for(_research_web(q, max_items=6), timeout=11.0)
+        base_ctx = await asyncio.wait_for(
+            _research_web(q, max_items=6, brain_ref=brain), timeout=40.0
+        )
     except Exception:
         base_ctx = ""
     if base_ctx:
@@ -729,7 +1036,9 @@ async def _research_with_tools(
             tried_queries.append(nq.lower())
             trail.append(f"cari: {nq[:40]}")
             try:
-                more = await asyncio.wait_for(_research_web(nq, max_items=5), timeout=10.0)
+                more = await asyncio.wait_for(
+                        _research_web(nq, max_items=5, brain_ref=brain), timeout=35.0
+                    )
             except Exception:
                 more = ""
             if more:
@@ -985,7 +1294,7 @@ Tugasmu adalah memahami perintah user (dalam Bahasa Indonesia atau Inggris), men
 ATURAN KEAMANAN MUTLAK (HUMAN-IN-THE-LOOP):
 1. DILARANG menebak atau mengarang sendiri password, PIN, atau kode OTP/2FA. NAMUN jika user SUDAH MENULISKAN secara eksplisit Username & Password di dalam perintah chatnya (contoh: "login pakai Username: standard_user dan Password: secret_sauce"), LANGSUNG ketik menggunakan action `"type"` ke kolom Username & Password lalu `"click"` tombol Login — JANGAN panggil `"request_human_login"`! Panggil `"request_human_login"` HANYA jika halaman meminta login/OTP/CAPTCHA yang kredensialnya BELUM diberikan oleh user.
 2. Untuk tindakan sensitif (seperti: konfirmasi pembayaran/checkout, transfer uang, hapus akun/data penting, kirim email/publikasi, ubah pengaturan keamanan), pastikan form sudah siap lalu klik tombolnya atau panggil `"ask_approval"` — sistem guardrail juga akan meminta izin eksplisit ke user sebelum klik dieksekusi.
-3. Untuk pencarian web umum di browser, gunakan `"navigate"` ke `https://html.duckduckgo.com/html/?q=kata+kunci` (pakai versi `html.` karena ringan & tanpa CAPTCHA; HINDARI `google.com/search` dan `search.yahoo.com` yang sering memblokir/CAPTCHA IP server cloud). Jika user hanya menyapa atau bertanya apakah kamu bisa melakukan sesuatu tanpa menyebutkan link/tugas spesifiknya, jawab ramah dengan gaya santai (*gua/lu/bro*) menggunakan `"done"`.
+3. PENCARIAN WEB: buka HALAMAN UTAMA mesin pencari (`https://www.google.com/`), lalu gunakan action `"type"` pada kolom pencariannya dan tekan Enter — JANGAN langsung `"navigate"` ke URL hasil (`google.com/search?q=...`). Mengetik seperti manusia lolos dari deteksi bot, sedangkan membuka URL hasil langsung memicu "lalu lintas tidak wajar". Jika Google memblokir, ganti ke Bing (`https://www.bing.com/`) dengan cara yang sama. HINDARI DuckDuckGo (202 anomaly), Ecosia (403), Brave (429), dan Startpage (JS challenge) — semuanya memblokir server ini. Jika user hanya menyapa atau bertanya apakah kamu bisa melakukan sesuatu tanpa menyebutkan link/tugas spesifiknya, jawab ramah dengan gaya santai (*gua/lu/bro*) menggunakan `"done"`.
 4. PROAKTIF BUKA TAB/WEB BARU: Jika user meminta masuk/membuka layanan lain yang berbeda dari halaman yang sedang terbuka (contoh: "login Konami ID", "buka e-learning", "cek GitHub", "buka baru lagi"), LANGSUNG panggil `"navigate"` ke URL resmi layanan tersebut (misal Konami ID -> `https://my.konami.net`), JANGAN pernah bilang website lama tidak mendukung layanan tersebut! Perhatikan juga RIWAYAT OBROLAN SEBELUMNYA untuk memahami maksud lanjutan user.
 
 ATURAN KETAT PENGISIAN & VERIFIKASI FORMULIR (WAJIB PATUHI 100%):
@@ -1129,6 +1438,12 @@ class MultiLLMBrain:
     def __init__(self, config: LLMConfig):
         self.config = config
         self.autopilot = SmartAutopilotPlanner()
+        # Engine browser (diisi orchestrator). Kalau ada, pencarian web dikerjakan
+        # dengan MEMBUKA mesin pencari di browser nyata, bukan HTTP scrape.
+        self.browser: Any = None
+        # Callback opsional: dipanggil tiap kali pencarian browser dimulai.
+        # Dipakai Telegram bridge untuk menampilkan "🔎 Lagi buka Yahoo di browser...".
+        self.search_notice_cb: Any = None
         self._rr_idx: int = 0
         self.last_chat_ok: bool = True
         self.last_error_kind: str = ""
@@ -1489,16 +1804,24 @@ class MultiLLMBrain:
         research_ctx = ""
         self.last_research_trail = []
         if _needs_research(message):
+            # Kabari UI bahwa pencarian web SEDANG BERJALAN DI BROWSER (transparan, bukan diam-diam)
+            if callable(self.search_notice_cb):
+                try:
+                    await self.search_notice_cb(message, _yahoo_url(message))
+                except Exception:
+                    pass
             try:
                 research_ctx, trail = await asyncio.wait_for(
                     _research_with_tools(message, self, max_rounds=3),
-                    timeout=48.0,
+                    timeout=75.0,
                 )
                 self.last_research_trail = list(trail)
             except Exception:
                 # Fallback: riset sekali jalan kalau loop gagal/timeout
                 try:
-                    research_ctx = await asyncio.wait_for(_research_web(message), timeout=11.0)
+                    research_ctx = await asyncio.wait_for(
+                        _research_web(message, brain_ref=self), timeout=50.0
+                    )
                 except Exception:
                     research_ctx = ""
 

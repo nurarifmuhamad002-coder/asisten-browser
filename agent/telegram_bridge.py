@@ -41,6 +41,7 @@ BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "status_tugas", "description": "Cek Status & Checkpoint Tugas Terakhir"},
     {"command": "lanjut", "description": "Lanjutkan Tugas dari Checkpoint Terakhir"},
     {"command": "persona", "description": "Atur Nama & Gaya Bahasa Bot"},
+    {"command": "search", "description": "Pilih Mesin Pencari di Chrome (Google/Bing/Yahoo)"},
     {"command": "model", "description": "Pilih Model AI (Pro/Flash/Lite/Auto)"},
     {"command": "kunci", "description": "Kunci Bot & Web Khusus HP Lu"},
     {"command": "stop", "description": "Hentikan Proses Saat Ini"},
@@ -229,6 +230,26 @@ class TelegramBotBridge:
 
     def attach_orchestrator(self, orchestrator: "AgentOrchestrator") -> None:
         self.orchestrator = orchestrator
+        # Pasang notifikasi transparan: tiap kali bot mau riset web, dia MEMBUKA
+        # mesin pencari di browser sungguhan. User harus lihat itu, bukan diam-diam.
+        try:
+            brain = getattr(orchestrator, "brain", None)
+            if brain is not None:
+                async def _notify_search(query: str, url: str) -> None:
+                    cid = self.owner_id
+                    if not cid:
+                        return
+                    await self.send_text(
+                        cid,
+                        f"🔎 Gua buka browser dulu buat nyari ini:\n"
+                        f"   {query[:120]}\n\n"
+                        f"🌐 {url[:180]}\n\n"
+                        f"Tunggu bentar, gua baca hasilnya.",
+                    )
+
+                brain.search_notice_cb = _notify_search
+        except Exception:
+            pass
 
     @property
     def is_configured(self) -> bool:
@@ -901,6 +922,49 @@ class TelegramBotBridge:
             text.strip(),
             flags=re.I | re.S,
         )
+        # ==================== /search — PILIH MESIN PENCARI CHROME ====================
+        if low == "/search" or low.startswith("/search ") or low in ("mesin pencari", "ganti search"):
+            from agent.llm_providers import (
+                SEARCH_ENGINES, SEARCH_ORDER, set_search_engine, search_order_summary,
+                LAST_VISIBLE_SEARCH,
+            )
+            arg = text.split(None, 1)[1].strip().lower() if len(text.split(None, 1)) > 1 else ""
+            if not arg:
+                urut = search_order_summary()
+                terakhir = LAST_VISIBLE_SEARCH.get("engine") or "-"
+                jml = LAST_VISIBLE_SEARCH.get("count") or 0
+                await self.send_text(
+                    chat_id,
+                    "🔎 MESIN PENCARI DI CHROME LU:\n\n"
+                    f"• Urutan coba : {urut}\n"
+                    f"• Terakhir dipakai : {terakhir} ({jml} hasil)\n\n"
+                    "Bot TIDAK nyari di belakang layar — dia BUKA Chrome, ngetik "
+                    "di kolom pencarian kayak manusia, lalu baca hasilnya. "
+                    "Kalau mesin pertama diblokir, otomatis ganti ke berikutnya.\n\n"
+                    "GANTI MESIN UTAMA (ketik salah satu):\n"
+                    "`/search google` → Google (paling relevan)\n"
+                    "`/search bing`   → Bing (paling tahan blokir)\n"
+                    "`/search yahoo`  → Yahoo (URL paling bersih)\n\n"
+                    "ℹ️ DuckDuckGo, Ecosia, Brave, Startpage TIDAK dipakai — "
+                    "semuanya memblokir IP server lu (202/403/429).",
+                    reply_markup=MAIN_MENU_KB,
+                )
+                return
+            if set_search_engine(arg):
+                await self.send_text(
+                    chat_id,
+                    f"✅ Mesin pencari utama sekarang: *{SEARCH_ENGINES[arg]['label']}*\n"
+                    f"Urutan lengkap: {search_order_summary()}",
+                    reply_markup=MAIN_MENU_KB,
+                )
+            else:
+                await self.send_text(
+                    chat_id,
+                    "❓ Pilihannya cuma: `/search google`, `/search bing`, `/search yahoo`",
+                    reply_markup=MAIN_MENU_KB,
+                )
+            return
+
         # ==================== /model — PILIH MODEL & MODE ROUTING ====================
         if low == "/model" or low.startswith("/model ") or low in ("model", "ganti model"):
             cfg_m = self.orchestrator.llm_config

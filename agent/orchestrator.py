@@ -45,6 +45,12 @@ class AgentOrchestrator:
         self.file_manager = file_manager
         self.llm_config = llm_config
         self.brain = MultiLLMBrain(llm_config)
+        # Beri otak akses ke engine browser supaya pencarian web BENERAN membuka
+        # mesin pencari di browser yang dilihat user (bukan HTTP diam-diam di belakang).
+        try:
+            self.brain.browser = browser
+        except Exception:
+            pass
         self.broadcast = broadcast_cb
         self.telegram = telegram
         if allow_writes is None:

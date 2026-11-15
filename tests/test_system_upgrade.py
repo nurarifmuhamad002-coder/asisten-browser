@@ -1834,23 +1834,6 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         assert "HASIL RISET BERTAHAP" in ctx_t, "Konteks wajib diberi label riset bertahap"
         assert len(ctx_t) > 1000, f"Konteks akhir wajib kaya data: {len(ctx_t)} char"
 
-        # 21f-2. REGRESI: baca halaman penuh WAJIB terjadi otomatis walau AI tidak minta.
-        # (bug lama: riset awal hanya simpan judul tanpa URL -> halaman tidak pernah dibaca)
-        cfg_auto = LLMConfig()
-        cfg_auto.update("gemini", "gemini-2.5-flash", "dummy-unit-test-key-09")
-        brain_auto = MultiLLMBrain(cfg_auto)
-
-        async def _fake_post_idle(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
-            return ({"candidates": [{"content": {"parts": [{"text": "{\"tool\":\"answer\"}"}]}, "finishReason": "STOP"}]}, None)
-
-        brain_auto._post_gemini_single = _fake_post_idle  # type: ignore
-        ctx_auto, trail_auto = await _research_with_tools("apa itu investasi", brain_auto, max_rounds=2)
-        assert "ISI HALAMAN PENUH" in ctx_auto, (
-            f"Walau AI langsung minta 'answer', sistem WAJIB baca 1 halaman penuh otomatis: trail={trail_auto}"
-        )
-        assert any("baca:" in x for x in trail_auto), f"Jejak wajib mencatat pembacaan halaman: {trail_auto}"
-        assert len(ctx_auto) > 2500, f"Konteks wajib substansial setelah baca halaman: {len(ctx_auto)} char"
-
         # 21g. Loop berhenti kalau AI minta 'answer' (tidak berputar selamanya)
         n_dec["n"] = 0
         decisions.clear()
@@ -1867,6 +1850,23 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         # 21h. Jejak riset terpublikasi ke brain (untuk transparansi/log)
         assert isinstance(brain_t.last_research_trail, list), "Brain wajib menyimpan jejak riset"
+
+        # 21i. REGRESI (dijalankan TERAKHIR di suite ini agar tidak menimpa monkeypatch): baca halaman penuh WAJIB terjadi otomatis walau AI tidak minta.
+        # (bug lama: riset awal hanya simpan judul tanpa URL -> halaman tidak pernah dibaca)
+        cfg_auto = LLMConfig()
+        cfg_auto.update("gemini", "gemini-2.5-flash", "dummy-unit-test-key-09")
+        brain_auto = MultiLLMBrain(cfg_auto)
+
+        async def _fake_post_idle(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            return ({"candidates": [{"content": {"parts": [{"text": "{\"tool\":\"answer\"}"}]}, "finishReason": "STOP"}]}, None)
+
+        brain_auto._post_gemini_single = _fake_post_idle  # type: ignore
+        ctx_auto, trail_auto = await _research_with_tools("apa itu investasi", brain_auto, max_rounds=2)
+        assert "ISI HALAMAN PENUH" in ctx_auto, (
+            f"Walau AI langsung minta 'answer', sistem WAJIB baca 1 halaman penuh otomatis: trail={trail_auto}"
+        )
+        assert any("baca:" in x for x in trail_auto), f"Jejak wajib mencatat pembacaan halaman: {trail_auto}"
+        assert len(ctx_auto) > 2500, f"Konteks wajib substansial setelah baca halaman: {len(ctx_auto)} char"
 
         record(21, "Tahap 9: Tool Loop + Baca Halaman Penuh (#1 & #2)", True, "Ekstraksi artikel bersih (buang nav/iklan/script), decode URL DDG, baca halaman Wikipedia nyata >400 char & ter-cache, AI bisa loop cari->baca->jawab lalu berhenti saat 'answer'.")
 
@@ -1970,6 +1970,74 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         assert "TOTAL=12345" in inj_prompt, "Angka hasil hitung wajib ikut terkirim ke AI"
 
         record(22, "Tahap 10: Model Frontier + Routing 3 Tingkat + Kalkulator Python", True, "Routing light/medium/heavy (heavy wajib Pro), /model bisa ganti model, kalkulator eksekusi Python nyata (14.693.281 benar) & tolak 100% kode berbahaya/jaringan.")
+
+        # =====================================================================
+        # 23. TAHAP 11: RESOLVER DOMAIN ANTI-TEBAK + DETEKSI BLOKIR IP DATACENTER
+        # =====================================================================
+        from agent.llm_providers import _host_is_reachable, _find_official_url, _DOMAIN_SYNONYMS
+
+        # 23a. Validator DNS: domain mati HARUS terdeteksi mati
+        assert await _host_is_reachable("https://allindonesia.id") is False, (
+            "allindonesia.id (domain karangan yang bikin 403/DNS gagal) wajib terdeteksi TIDAK ADA"
+        )
+        assert await _host_is_reachable("https://allindonesia.imigrasi.go.id") is True, (
+            "allindonesia.imigrasi.go.id (domain BENAR) wajib terdeteksi ada"
+        )
+        # Domain yang ada tapi memblokir bot (403) TETAP dianggap HIDUP
+        assert await _host_is_reachable("https://imigrasi.go.id") is True, (
+            "Situs yang balas 403 tetap berarti host-nya HIDUP, bukan mati"
+        )
+        # Domain ngawur total
+        assert await _host_is_reachable("https://domain-yang-pasti-tidak-ada-xyz123.id") is False
+
+        # 23b. Resolver TIDAK boleh lagi mengembalikan domain tebakan yang mati
+        cfg_res = LLMConfig()
+        cfg_res.update("gemini", "gemini-2.5-flash", "")  # tanpa API key: uji jalur non-AI
+        brain_res = MultiLLMBrain(cfg_res)
+        r1 = await brain_res.resolve_website_url("all Indonesia")
+        assert "allindonesia.imigrasi.go.id" in r1, f"'all Indonesia' wajib ke domain resmi yang BENAR: {r1}"
+        assert "allindonesia.id/" not in r1.replace("allindonesia.imigrasi.go.id", ""), (
+            f"Tidak boleh lagi menghasilkan domain karangan allindonesia.id: {r1}"
+        )
+        r2 = await brain_res.resolve_website_url("allindonesia.id")  # user salah tulis -> harus dikoreksi
+        assert "allindonesia.imigrasi.go.id" in r2, f"Domain salah dari user wajib dikoreksi ke yang benar: {r2}"
+        r3 = await brain_res.resolve_website_url("imigrasi")
+        assert "imigrasi.go.id" in r3, f"'imigrasi' wajib resolve: {r3}"
+
+        # 23c. Fallback TIDAK boleh lagi pakai Yahoo Search (sudah mati HTTP 500)
+        src_lp23 = (ROOT / "agent" / "llm_providers.py").read_text(encoding="utf-8")
+        resolve_block = src_lp23.split("async def resolve_website_url")[1].split("async def decide_next_step")[0]
+        assert "search.yahoo.com" not in resolve_block, (
+            "Fallback Yahoo Search (HTTP 500 mati) TIDAK boleh dipakai lagi di resolver"
+        )
+        assert "_find_official_url" in resolve_block, "Resolver wajib pakai pencari URL yang hidup"
+
+        # 23d. Sinonim domain: kata kunci umum wajib terpetakan ke domain benar
+        assert _DOMAIN_SYNONYMS.get("all indonesia") == "allindonesia.imigrasi.go.id"
+        assert _DOMAIN_SYNONYMS.get("imigrasi") == "imigrasi.go.id"
+        found_all = await _find_official_url("all Indonesia imigrasi")
+        assert "imigrasi.go.id" in found_all, f"Pencari URL resmi wajib menemukan domain imigrasi: {found_all}"
+
+        # 23e. Browser: deteksi blokir CloudFront jadi pesan JUJUR, bukan 'DNS tidak ketemu'
+        src_be23 = (ROOT / "agent" / "browser_engine.py").read_text(encoding="utf-8")
+        assert "[BLOCKED_BY_SITE]" in src_be23, "Browser wajib punya status khusus blokir CDN"
+        assert "request blocked" in src_be23.lower(), "Deteksi isi halaman 'Request blocked' CloudFront wajib ada"
+        assert "Situsnya hidup, tapi memblokir datacenter" in src_be23, (
+            "Pesan wajib jujur: situs hidup tapi memblokir datacenter (bukan 'DNS tidak ketemu')"
+        )
+
+        # 23f. Bot membedakan pesan 'situs mati' vs 'situs blokir'
+        src_tb23 = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+        assert "[BLOCKED_BY_SITE]" in src_tb23, "Bridge wajib menangani status blokir"
+        assert "SITUSNYA HIDUP, TAPI BLOKIR IP SERVER" in src_tb23, (
+            "Pesan ke user wajib membedakan blokir dari kegagalan DNS"
+        )
+
+        # 23g. Deteksi proxy mati (IP masih datacenter padahal proxy dipasang)
+        assert "PROXY TIDAK AKTIF" in src_be23, "Wajib ada peringatan kalau proxy dipasang tapi IP masih datacenter"
+        assert "hosting" in src_be23, "Cek flag 'hosting' ip-api wajib dipakai untuk mendeteksi IP datacenter"
+
+        record(23, "Tahap 11: Resolver Domain Anti-Tebak + Deteksi Blokir IP Datacenter", True, "Domain karangan (allindonesia.id) terdeteksi mati & dikoreksi ke domain resmi, Yahoo mati diganti pencari hidup, blokir CloudFront dilaporkan jujur sebagai 'situs hidup tapi blokir IP', & proxy mati terdeteksi.")
 
     finally:
         if browser is not None:

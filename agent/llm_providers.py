@@ -615,6 +615,114 @@ async def _research_with_tools(
     return combined, trail
 
 
+# =========================================================================
+# VALIDASI DOMAIN — supaya bot tidak pernah "menebak" domain yang tidak ada.
+# =========================================================================
+_DNS_CACHE: Dict[str, Tuple[float, bool]] = {}
+_DOMAIN_SYNONYMS = {
+    # kata kunci user -> domain resmi yang benar
+    "all indonesia": "allindonesia.imigrasi.go.id",
+    "allindonesia": "allindonesia.imigrasi.go.id",
+    "imigrasi": "imigrasi.go.id",
+    "siskopatuh": "siskopatuh.haji.go.id",
+    "haji": "haji.go.id",
+    "konami": "my.konami.net",
+    "efhub": "efootballhub.net",
+    "efootball": "efootballhub.net",
+    "classroom": "classroom.google.com",
+    "drive": "drive.google.com",
+    "gmail": "mail.google.com",
+    "demoqa": "demoqa.com",
+    "saucedemo": "saucedemo.com",
+    "toscrape": "books.toscrape.com",
+    "wikipedia": "id.wikipedia.org",
+    "traveloka": "traveloka.com",
+    "tokopedia": "tokopedia.com",
+    "shopee": "shopee.co.id",
+}
+
+
+async def _host_is_reachable(url: str, timeout: float = 4.5) -> bool:
+    """Cek apakah host benar-benar ada (DNS + HTTP). Hasil di-cache 10 menit."""
+    import socket as _socket
+
+    try:
+        host = urllib.parse.urlparse(url).netloc.split(":")[0].lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+
+    now = _time.monotonic()
+    hit = _DNS_CACHE.get(host)
+    if hit and (now - hit[0] < 600.0):
+        return hit[1]
+
+    ok = False
+
+    # Tahap 1: DNS (cepat, tidak kena blokir anti-bot)
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_socket.gethostbyname, host),
+            timeout=min(timeout, 4.0),
+        )
+        ok = True
+    except Exception:
+        ok = False
+
+    # Tahap 2: kalau DNS hidup, cek HTTP boleh 403/401 (situs blokir bot itu wajar)
+    if ok:
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                headers={"User-Agent": _RESEARCH_UA},
+            ) as c:
+                r = await c.head(url)
+                # 403/401/429 tetap berarti HOST ADA
+                ok = r.status_code < 500 or r.status_code in (401, 403, 429)
+        except Exception:
+            ok = True  # DNS hidup -> host ada, walau HTTP rewel
+
+    if len(_DNS_CACHE) > 300:
+        _DNS_CACHE.clear()
+    _DNS_CACHE[host] = (now, ok)
+    return ok
+
+
+async def _find_official_url(query: str) -> str:
+    """
+    Cari URL resmi situs lewat mesin pencari yang MASIH HIDUP, lalu validasi DNS-nya.
+    Ini pengganti fallback Yahoo Search yang sudah mati (HTTP 500).
+    """
+    q_low = (query or "").lower()
+
+    # 1) Coba sinonim yang sudah tahu domainnya
+    for key, domain in _DOMAIN_SYNONYMS.items():
+        if key in q_low:
+            url = f"https://{domain}/"
+            if await _host_is_reachable(url):
+                return url
+
+    # 2) Cari sungguhan di DuckDuckGo, ambil hasil teratas yang valid
+    try:
+        links = await _search_with_links(query, limit=5)
+    except Exception:
+        links = []
+
+    for _title, href in links:
+        try:
+            host = urllib.parse.urlparse(href).netloc.lower()
+        except Exception:
+            continue
+        # Buang agregator/pencarian
+        if any(b in host for b in ("duckduckgo", "google.", "bing.", "yahoo.", "facebook.", "pinterest.")):
+            continue
+        if await _host_is_reachable(href):
+            return href
+    return ""
+
+
 def _needs_research(query: str) -> bool:
     q = (query or "").lower().strip()
     if len(q) < 4:
@@ -1674,17 +1782,37 @@ class MultiLLMBrain:
         return f"Waduh, gagal menganalisis {filename} ({self._friendly_chat_error_message(self.last_error_kind)})"
 
     async def resolve_website_url(self, raw_query: str) -> str:
-        """Mengubah nama layanan (misal 'login Konami ID' atau 'elearning UT') menjadi URL resmi."""
+        """
+        Ubah permintaan jadi URL resmi — TAPI divalidasi dulu supaya bot tidak menebak domain ngawur.
+        Urutan: URL eksplisit -> domain eksplisit (diuji DNS) -> situs dikenal -> tebakan AI (diuji DNS)
+        -> pencarian web (DuckDuckGo, bukan Yahoo yang sudah mati).
+        """
         q = (raw_query or "").strip()
         if q.startswith(("http://", "https://", "/demo-portal")):
             return q
-        # Cek apakah sudah berbentuk domain (contoh: allindonesia.imigrasi.go.id)
         if "." in q and " " not in q:
-            return f"https://{q}"
+            candidate = f"https://{q}"
+            if await _host_is_reachable(candidate):
+                return candidate
+            # domain eksplisit tapi mati -> lanjut cari yang benar di bawah
 
-        if "siskopatuh" in q.lower():
-            return "https://siskopatuh.haji.go.id/web/"
+        q_low = q.lower()
 
+        # Situs yang sudah pasti (tidak perlu tebak)
+        KNOWN = {
+            "siskopatuh": "https://siskopatuh.haji.go.id/web/",
+            "all indonesia": "https://allindonesia.imigrasi.go.id/",
+            "allindonesia": "https://allindonesia.imigrasi.go.id/",
+            "imigrasi": "https://imigrasi.go.id/",
+            "konami": "https://my.konami.net",
+            "efhub": "https://efootballhub.net",
+            "classroom": "https://classroom.google.com",
+        }
+        for key, url in KNOWN.items():
+            if key in q_low and await _host_is_reachable(url):
+                return url
+
+        # Tebakan AI — WAJIB divalidasi DNS sebelum dipakai
         if self.config.has_api_key and self.config.provider == "gemini":
             payload = {
                 "system_instruction": {
@@ -1694,7 +1822,8 @@ class MultiLLMBrain:
                                 "Ubah permintaan website dari user menjadi SATU URL resmi HTTPS yang paling tepat. "
                                 "Contoh: 'efhub' -> 'https://efootballhub.net', 'Konami ID' -> 'https://my.konami.net', "
                                 "'SISKOPATUH' -> 'https://siskopatuh.haji.go.id/web/', 'Google Classroom' -> 'https://classroom.google.com'. "
-                                "Jika tidak yakin URL pastinya, kembalikan URL pencarian Yahoo: 'https://search.yahoo.com/search?p=...'. "
+                                "PENTING: jika tidak 100% yakin URL resminya, balas dengan {\"url\": \"\"} (kosong) — "
+                                "JANGAN menebak domain karangan. "
                                 "Balas HANYA JSON: {\"url\": \"https://...\"}"
                             )
                         }
@@ -1704,19 +1833,24 @@ class MultiLLMBrain:
                 "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
             }
             for model in self._gemini_candidate_models(light_first=True)[:3]:
-                data, err = await self._post_gemini_single(model, payload, timeout=5.0)
+                data, err = await self._post_gemini_single(model, payload, timeout=6.0)
                 if data is not None:
                     try:
                         parsed = _extract_json(self._extract_gemini_text(data))
-                        if parsed.get("url"):
-                            return str(parsed["url"]).strip()
+                        cand = str(parsed.get("url") or "").strip()
+                        if cand.startswith("http") and await _host_is_reachable(cand):
+                            return cand
                     except Exception:
                         continue
                 if err and err.kind == "auth_error":
                     break
 
-        from urllib.parse import quote_plus
-        return f"https://search.yahoo.com/search?p={quote_plus(q)}"
+        # JALAN TERAKHIR: cari situs resminya lewat mesin pencari yang masih hidup
+        found = await _find_official_url(q)
+        if found:
+            return found
+
+        return f"https://duckduckgo.com/?q={urllib.parse.quote_plus(q)}"
 
     async def decide_next_step(
         self,

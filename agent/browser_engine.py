@@ -230,17 +230,41 @@ class CloudBrowserEngine:
         return {"enabled": bool(parsed), "server": (parsed or {}).get("server", ""), "ip_info": ip_info}
 
     async def check_exit_ip(self) -> str:
-        """Mengecek alamat IP publik, negara, kota, dan ISP yang dipakai browser saat ini."""
+        """
+        Cek IP publik + negara + ISP browser saat ini.
+        Kalau proxy dipasang tapi ISP-nya masih datacenter (AWS/Railway/GCP), berarti proxy TIDAK jalan
+        — ini penyebab umum situs .go.id tetap 403 walau user sudah pasang proxy.
+        """
         await self.ensure_alive()
         if not self.page:
             return "Browser belum aktif"
         try:
-            resp = await self.page.goto("http://ip-api.com/json/?fields=status,message,country,city,isp,query", wait_until="commit", timeout=8000)
+            resp = await self.page.goto(
+                "http://ip-api.com/json/?fields=status,message,country,city,isp,org,query,hosting",
+                wait_until="commit",
+                timeout=8000,
+            )
             if resp:
                 txt = await asyncio.wait_for(self.page.inner_text("body"), timeout=3500)
                 data = json.loads(txt.strip())
                 if data.get("status") == "success":
-                    return f"{data.get('query')} ({data.get('country')} · {data.get('city')} · {data.get('isp')})"
+                    ip = data.get("query")
+                    country = data.get("country") or "?"
+                    city = data.get("city") or "?"
+                    isp = data.get("isp") or "?"
+                    org = data.get("org") or ""
+                    is_hosting = bool(data.get("hosting"))
+                    base = f"{ip} ({country} · {city} · {isp})"
+                    # Proxy dipasang tapi masih hosting -> proxy mati / gagal
+                    if self.proxy_config and is_hosting:
+                        return (
+                            f"{base} — ⚠️ PROXY TIDAK AKTIF "
+                            "(IP masih datacenter, jadi situs .go.id akan tetap menolak). "
+                            "Cek kode/kuota proxy lalu pasang ulang lewat /proxy."
+                        )
+                    if is_hosting:
+                        return f"{base} — ⚠️ IP datacenter (banyak situs .go.id memblokir ini). Pasang proxy Indonesia lewat /proxy."
+                    return base
         except Exception as exc:
             return f"Gagal mengecek IP lewat proxy ({str(exc)[:70]}) — pastikan kode/kuota proxy aktif!"
         return "IP tidak terdeteksi"
@@ -848,6 +872,35 @@ class CloudBrowserEngine:
         try:
             resp = await self.page.goto(target, wait_until="commit", timeout=9000)
             status_code = resp.status if resp else None
+            # DETEKSI BLOKIR IP DATACENTER (CloudFront/CDN): status 403 + pesan khas.
+            # Ini beda dengan "situs mati" — situsnya hidup, tapi menolak IP server cloud.
+            if status_code in (403, 429, 451):
+                try:
+                    body_txt = await asyncio.wait_for(self.page.inner_text("body"), timeout=2.5)
+                except Exception:
+                    body_txt = ""
+                low_body = (body_txt or "").lower()
+                is_cdn_block = any(
+                    kw in low_body
+                    for kw in ("request blocked", "could not be satisfied", "akses ditolak", "access denied", "forbidden")
+                ) or status_code in (429, 451)
+                if is_cdn_block:
+                    from urllib.parse import urlparse as _up
+                    host = _up(target).netloc
+                    proxy_on = bool(self.proxy_config)
+                    saran = (
+                        "\n\n👉 Situs ini MEMBLOKIR IP server/datacenter (bukan situs mati). "
+                        + (
+                            "Proxy Indonesia lu sedang AKTIF tapi tetap ditolak — coba ganti ke proxy lain lewat /proxy."
+                            if proxy_on
+                            else "Solusinya: pasang proxy Indonesia lewat perintah /proxy host:port:user:pass, "
+                                 "supaya browser keluar pakai IP Indonesia."
+                        )
+                    )
+                    return (
+                        f"[BLOCKED_BY_SITE] {host} menolak akses dari IP server cloud "
+                        f"(HTTP {status_code} · CloudFront/CDN). Situsnya hidup, tapi memblokir datacenter.{saran}"
+                    )
         except Exception as exc:
             err_s = str(exc) or type(exc).__name__
             # JANGAN restart seluruh Chromium hanya karena 1 situs timeout / menolak koneksi cloud!

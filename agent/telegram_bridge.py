@@ -1211,24 +1211,24 @@ class TelegramBotBridge:
             el_open = max(1, int(_t.monotonic() - t_open))
             nav_failed = (
                 nav_msg.startswith("[UNREACHABLE_SITE]")
+                or nav_msg.startswith("[BLOCKED_BY_SITE]")
                 or nav_msg.startswith("❌")
                 or "menolak koneksi" in nav_msg.lower()
                 or "tidak merespons" in nav_msg.lower()
             )
             if nav_failed:
-                clean_nav = nav_msg.replace("[UNREACHABLE_SITE]", "").strip()
-                if wait_mid:
-                    await self._edit_text(
-                        chat_id,
-                        wait_mid,
-                        f"❌ GAGAL MEMBUKA WEB ({el_open} dtk)\n🌐 {clean_nav}",
-                    )
+                # Bedakan pesan: situs mati vs situs memblokir IP datacenter
+                if nav_msg.startswith("[BLOCKED_BY_SITE]"):
+                    clean_nav = nav_msg.replace("[BLOCKED_BY_SITE]", "").strip()
+                    head_txt = f"🚫 SITUSNYA HIDUP, TAPI BLOKIR IP SERVER ({el_open} dtk)"
                 else:
-                    await self.send_text(
-                        chat_id,
-                        f"❌ GAGAL MEMBUKA WEB ({el_open} dtk)\n🌐 {clean_nav}",
-                        reply_markup=MAIN_MENU_KB,
-                    )
+                    clean_nav = nav_msg.replace("[UNREACHABLE_SITE]", "").strip()
+                    head_txt = f"❌ GAGAL MEMBUKA WEB ({el_open} dtk)"
+                full_err = f"{head_txt}\n{clean_nav}"
+                if wait_mid:
+                    await self._edit_text(chat_id, wait_mid, full_err)
+                else:
+                    await self.send_text(chat_id, full_err, reply_markup=MAIN_MENU_KB)
                 return
 
             b64 = await self.orchestrator.browser.refresh_frame()

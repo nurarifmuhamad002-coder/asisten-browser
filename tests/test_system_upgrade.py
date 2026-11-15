@@ -1751,6 +1751,108 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(20, "Tahap 8: Kecerdasan Setara Agent (Riset Web Sebelum Jawab, Anti Ngarang, Sumber Sitir)", True, "Riset 4 sumber paralel (DDG/Wikipedia/Google News/DDG Lite) nyata & ter-cache, wajib menyisip ke prompt, anti-ngarang + wajib sitir sumber + kedalaman analisis + risiko.")
 
+        # =====================================================================
+        # 21. TAHAP 9: TOOL LOOP + BACA HALAMAN PENUH (#1 & #2)
+        # =====================================================================
+        from agent.llm_providers import (
+            _extract_result_links,
+            _fetch_page_text,
+            _html_to_article_text,
+            _research_with_tools,
+            _search_with_links,
+        )
+
+        # 21a. Ekstraksi teks artikel: buang nav/script/iklan, ambil isi utama
+        sample_html = """
+        <html><head><style>.x{color:red}</style><script>var a=1;</script></head>
+        <body>
+          <nav>Home | About | Contact | Login</nav>
+          <article>
+            <h1>Inflasi Indonesia Naik</h1>
+            <p>Badan Pusat Statistik mencatat inflasi tahunan sebesar 3,2 persen pada November 2026.</p>
+            <p>Kenaikan ini dipicu oleh harga pangan dan transportasi yang melonjak.</p>
+          </article>
+          <aside>Iklan: beli sekarang!</aside>
+          <footer>Copyright 2026</footer>
+        </body></html>
+        """
+        article = _html_to_article_text(sample_html)
+        assert "3,2 persen" in article, f"Isi artikel wajib terekstrak: {article[:200]!r}"
+        assert "Iklan: beli sekarang" not in article, "Aside/iklan wajib dibuang"
+        assert "var a=1" not in article, "Script wajib dibuang"
+        assert "Home | About" not in article, "Nav wajib dibuang"
+
+        # 21b. Ekstraksi URL hasil pencarian (termasuk URL DDG yang dibungkus uddg=)
+        ddg_html = (
+            '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fid.wikipedia.org%2Fwiki%2FInflasi&rut=x">Inflasi - Wikipedia</a>'
+            '<a class="result__a" href="https://www.bi.go.id/id/statistik">BI Rate - Bank Indonesia</a>'
+        )
+        links = _extract_result_links(ddg_html, limit=5)
+        urls = [u for _, u in links]
+        assert any("wikipedia.org/wiki/Inflasi" in u for u in urls), f"URL DDG terenkode wajib di-decode: {urls}"
+        assert any("bi.go.id" in u for u in urls), f"URL langsung wajib diambil: {urls}"
+        assert all(u.startswith("http") for u in urls), "Semua URL wajib absolute http(s)"
+
+        # 21c. Baca halaman penuh NYATA dari internet (bukan snippet)
+        page_txt = await _fetch_page_text("https://id.wikipedia.org/wiki/Inflasi", max_chars=1500)
+        assert page_txt, "Baca halaman Wikipedia wajib berhasil"
+        assert len(page_txt) > 400, f"Isi halaman wajib substansial (bukan snippet): {len(page_txt)} char"
+        assert "inflasi" in page_txt.lower(), "Isi halaman wajib relevan"
+
+        # 21d. Host tidak terbaca (youtube/instagram) dilewati cepat, bukan menggantung
+        t_skip = time.monotonic()
+        assert await _fetch_page_text("https://www.youtube.com/watch?v=xxx") == ""
+        assert (time.monotonic() - t_skip) < 1.0, "Host tak terbaca wajib di-skip tanpa request"
+
+        # 21e. Cache halaman: baca kedua kali harus instan
+        t_c1 = time.monotonic()
+        _ = await _fetch_page_text("https://id.wikipedia.org/wiki/Inflasi", max_chars=1500)
+        assert (time.monotonic() - t_c1) < 0.3, "Pembacaan kedua wajib dari cache"
+
+        # 21f. TOOL LOOP: AI bisa minta cari -> baca -> jawab (bukan 1 tembakan)
+        cfg_t = LLMConfig()
+        cfg_t.update("gemini", "gemini-2.5-flash", "dummy-unit-test-key-08")
+        brain_t = MultiLLMBrain(cfg_t)
+        decisions = [
+            json.dumps({"thought": "butuh data baru", "tool": "search", "query": "inflasi indonesia BPS"}),
+            json.dumps({"thought": "baca wikipedia", "tool": "read", "url": "https://id.wikipedia.org/wiki/Inflasi"}),
+            json.dumps({"thought": "cukup", "tool": "answer"}),
+        ]
+        n_dec = {"n": 0}
+
+        async def _fake_post_t(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            i = min(n_dec["n"], len(decisions) - 1)
+            n_dec["n"] += 1
+            return ({"candidates": [{"content": {"parts": [{"text": decisions[i]}]}, "finishReason": "STOP"}]}, None)
+
+        brain_t._post_gemini_single = _fake_post_t  # type: ignore
+        ctx_t, trail_t = await _research_with_tools("berapa inflasi indonesia sekarang?", brain_t, max_rounds=3)
+        assert n_dec["n"] >= 3, f"AI wajib ambil >=3 keputusan (cari/baca/jawab), dapat {n_dec['n']}"
+        assert any("cari:" in x for x in trail_t), f"Loop wajib melakukan pencarian tambahan: {trail_t}"
+        assert any("baca:" in x for x in trail_t), f"Loop wajib membaca halaman: {trail_t}"
+        assert "ISI HALAMAN PENUH" in ctx_t, "Konteks wajib memuat isi halaman penuh, bukan cuma judul"
+        assert "HASIL RISET BERTAHAP" in ctx_t, "Konteks wajib diberi label riset bertahap"
+        assert len(ctx_t) > 1000, f"Konteks akhir wajib kaya data: {len(ctx_t)} char"
+
+        # 21g. Loop berhenti kalau AI minta 'answer' (tidak berputar selamanya)
+        n_dec["n"] = 0
+        decisions.clear()
+        decisions.append(json.dumps({"thought": "cukup", "tool": "answer"}))
+
+        async def _fake_post_ans(m_name: str, payload: Dict[str, Any], timeout: float = 0.0) -> Tuple[Optional[Dict[str, Any]], None]:
+            n_dec["n"] += 1
+            return ({"candidates": [{"content": {"parts": [{"text": decisions[0]}]}, "finishReason": "STOP"}]}, None)
+
+        brain_t._post_gemini_single = _fake_post_ans  # type: ignore
+        _ctx_a, trail_a = await _research_with_tools("apa itu inflasi", brain_t, max_rounds=3)
+        assert n_dec["n"] == 1, f"Setelah 'answer' loop wajib BERHENTI (1 keputusan), dapat {n_dec['n']}"
+        assert "putuskan jawab" in trail_a
+
+        # 21h. Jejak riset terpublikasi ke brain (untuk transparansi/log)
+        assert isinstance(brain_t.last_research_trail, list), "Brain wajib menyimpan jejak riset"
+
+        record(21, "Tahap 9: Tool Loop + Baca Halaman Penuh (#1 & #2)", True, "Ekstraksi artikel bersih (buang nav/iklan/script), decode URL DDG, baca halaman Wikipedia nyata >400 char & ter-cache, AI bisa loop cari->baca->jawab lalu berhenti saat 'answer'.")
+
     finally:
         if browser is not None:
             await browser.stop()

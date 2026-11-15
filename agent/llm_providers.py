@@ -5,6 +5,7 @@ import os
 import random
 import re
 import time as _time
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
@@ -318,6 +319,287 @@ async def _research_web(query: str, max_items: int = 6, timeout: float = 9.0) ->
     return opsi
 
 
+# =========================================================================
+# PEMBACA HALAMAN PENUH (#2) — bukan cuma judul/snippet, tapi isi artikelnya.
+# =========================================================================
+_PAGE_CACHE: Dict[str, Tuple[float, str]] = {}
+_UNREADABLE_HOSTS = (
+    "youtube.com", "youtu.be", "facebook.com", "instagram.com", "twitter.com", "x.com",
+    "tiktok.com", "linkedin.com", "whatsapp.com", "t.me", "pinterest.com",
+)
+
+
+def _html_to_article_text(html: str) -> str:
+    """Ekstrak teks artikel bersih dari HTML: buang nav/iklan/sidebar/script, ambil blok utama."""
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+    except Exception:
+        # Fallback tanpa bs4: regex kasar
+        body = re.sub(r"(?is)<(script|style|nav|footer|header|aside|form|noscript)[^>]*>.*?</\1>", " ", html)
+        body = re.sub(r"(?s)<[^>]+>", " ", body)
+        return re.sub(r"\s+", " ", _html.unescape(body)).strip()
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "noscript", "iframe", "svg", "button"]):
+        tag.decompose()
+    for sel in (".nav", ".navbar", ".menu", ".sidebar", ".ads", ".advertisement", ".cookie", ".popup", ".related"):
+        for el in soup.select(sel):
+            el.decompose()
+
+    # Cari kontainer artikel paling padat teksnya
+    best_txt = ""
+    for sel in ("article", "main", "[role=main]", ".post-content", ".entry-content", ".article-body", ".content", "div"):
+        for node in soup.select(sel):
+            txt = node.get_text(" ", strip=True)
+            if len(txt) > len(best_txt):
+                best_txt = txt
+        if len(best_txt) > 600:
+            break
+
+    if not best_txt:
+        best_txt = soup.get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", best_txt).strip()
+
+
+def _extract_result_links(html: str, limit: int = 5) -> List[Tuple[str, str]]:
+    """Ambil pasangan (judul, URL) dari halaman hasil DuckDuckGo."""
+    out: List[Tuple[str, str]] = []
+    # DDG membungkus URL: //duckduckgo.com/l/?uddg=<encoded>&rut=...
+    for m in re.finditer(
+        r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        html,
+        re.S,
+    ):
+        raw_href, raw_title = m.group(1), m.group(2)
+        href = _html.unescape(raw_href)
+        if "uddg=" in href:
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                href = qs.get("uddg", [href])[0]
+            except Exception:
+                pass
+            # kadang masih ter-encode sekali lagi
+            if href.startswith("//duckduckgo.com/l/"):
+                continue
+        if not href.startswith("http"):
+            continue
+        title = re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", raw_title))).strip()
+        if title and len(title) > 8:
+            out.append((title[:150], href))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _fetch_page_text(url: str, max_chars: int = 4000, timeout: float = 10.0) -> str:
+    """Buka satu URL dan kembalikan isi artikelnya sebagai teks bersih."""
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return ""
+    host = urllib.parse.urlparse(u).netloc.lower()
+    if any(bad in host for bad in _UNREADABLE_HOSTS):
+        return ""
+
+    now = _time.monotonic()
+    hit = _PAGE_CACHE.get(u)
+    if hit and (now - hit[0] < 600.0):  # cache 10 menit
+        return hit[1]
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": _RESEARCH_UA, "Accept-Language": "id-ID,id,q=0.9,en;q=0.8"},
+        ) as c:
+            r = await c.get(u)
+        if r.status_code != 200:
+            return ""
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "html" not in ctype and "text" not in ctype:
+            return ""
+        txt = _html_to_article_text(r.text)
+        if len(txt) < 200:
+            return ""
+        txt = txt[:max_chars]
+        if len(_PAGE_CACHE) > 60:
+            _PAGE_CACHE.clear()
+        _PAGE_CACHE[u] = (now, txt)
+        return txt
+    except Exception:
+        return ""
+
+
+async def _search_with_links(query: str, limit: int = 4, timeout: float = 9.0) -> List[Tuple[str, str]]:
+    """Cari di DuckDuckGo dan kembalikan URL-nya (untuk dibaca penuh)."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": _RESEARCH_UA, "Accept-Language": "id-ID,id;q=0.9,en;q=0.8"},
+        ) as c:
+            r = await c.get("https://html.duckduckgo.com/html/", params={"q": query})
+        if r.status_code != 200:
+            return []
+        return _extract_result_links(r.text, limit=limit)
+    except Exception:
+        return []
+
+
+# =========================================================================
+# TOOL LOOP (#1) — AI boleh MINTA riset berulang sebelum menjawab.
+# Beda dengan riset sekali jalan: kalau hasil pertama kurang, dia bisa minta lagi.
+# =========================================================================
+_TOOL_SCHEMA_HINT = (
+    "Kamu sedang dalam MODE RISET. Kamu BOLEH minta gua nyari/baca info dulu sebelum jawab.\n\n"
+    "Balas HANYA JSON murni, salah satu dari:\n"
+    '1. {"thought":"<alasan singkat 1 kalimat>","tool":"search","query":"<kata kunci pencarian baru>"}\n'
+    '2. {"thought":"<alasan>","tool":"read","url":"<URL lengkap http...>"}\n'
+    '3. {"thought":"<alasan>","tool":"answer"}   <- kalau data sudah cukup untuk menjawab\n\n'
+    "ATURAN:\n"
+    "- Maksimal 3 kali minta tool. Jangan berputar-putar.\n"
+    "- Pakai 'search' kalau butuh sudut pandang/data baru. Pakai 'read' kalau ada URL yang isinya perlu dibaca utuh.\n"
+    "- Kalau data yang ada sudah cukup, pilih 'answer'.\n"
+    "- DILARANG mengarang URL. Hanya pakai URL yang muncul di catatan riset.\n"
+    "Balas JSON saja, tanpa penjelasan di luar JSON."
+)
+
+
+async def _research_with_tools(
+    query: str,
+    brain: Any,
+    max_rounds: int = 3,
+    model_timeout: float = 14.0,
+) -> Tuple[str, List[str]]:
+    """
+    Loop riset bertahap: cari -> baca -> evaluasi -> cari lagi kalau kurang -> jawab.
+    Mengembalikan (blok_konteks_untuk_jawaban_final, daftar_jejak_langkah).
+    """
+    q = (query or "").strip()
+    if not q:
+        return "", []
+
+    notes: List[str] = []
+    trail: List[str] = []
+    tried_queries: List[str] = [q.lower()]
+    read_urls: List[str] = []
+
+    # RONDE 0 (selalu): riset awal sekali jalan supaya AI punya pijakan
+    try:
+        base_ctx = await asyncio.wait_for(_research_web(q, max_items=6), timeout=11.0)
+    except Exception:
+        base_ctx = ""
+    if base_ctx:
+        notes.append(base_ctx)
+        trail.append("riset awal")
+
+    # Kumpulkan kandidat URL dari hasil awal (kalau ada)
+    candidate_urls: List[Tuple[str, str]] = []
+    for ln in (base_ctx or "").splitlines():
+        if ln.startswith("- ") and "http" in ln:
+            m = re.search(r"(https?://[^\s)]+)", ln)
+            if m:
+                candidate_urls.append(("", m.group(1)))
+
+    for rnd in range(max_rounds):
+        # Minta AI memutuskan langkah berikutnya
+        decision = ""
+        try:
+            brief = "\n".join(notes)[:6000]
+            ask = (
+                f"PERTANYAAN USER: {q}\n\n"
+                f"CATATAN RISET SEJAUH INI:\n{brief or '(belum ada)'}\n\n"
+                f"URL yang sudah dibaca: {', '.join(read_urls) if read_urls else '(belum ada)'}\n\n"
+                "Putuskan langkah berikutnya."
+            )
+            payload = {
+                "system_instruction": {"parts": [{"text": _TOOL_SCHEMA_HINT}]},
+                "contents": [{"role": "user", "parts": [{"text": ask}]}],
+                "generationConfig": {
+                    "temperature": 0.0,
+                    "maxOutputTokens": 200,
+                    "responseMimeType": "application/json",
+                },
+            }
+            data, _err = await brain._post_gemini_single(
+                brain._gemini_candidate_models(light_first=True)[0], payload, timeout=model_timeout
+            )
+            if data is not None:
+                decision = brain._extract_gemini_text(data)
+        except Exception:
+            decision = ""
+
+        if not decision:
+            break
+
+        try:
+            parsed = _extract_json(decision)
+        except Exception:
+            break
+        if not isinstance(parsed, dict):
+            break
+
+        tool = str(parsed.get("tool") or "").strip().lower()
+        if tool in ("answer", "done", "finish", ""):
+            trail.append("putuskan jawab")
+            break
+
+        if tool == "search":
+            nq = str(parsed.get("query") or "").strip()
+            if not nq or nq.lower() in tried_queries:
+                break
+            tried_queries.append(nq.lower())
+            trail.append(f"cari: {nq[:40]}")
+            try:
+                more = await asyncio.wait_for(_research_web(nq, max_items=5), timeout=10.0)
+            except Exception:
+                more = ""
+            if more:
+                notes.append(f"--- riset tambahan ({nq[:50]}) ---\n{more}")
+                for ln in more.splitlines():
+                    if ln.startswith("- ") and "http" in ln:
+                        mm = re.search(r"(https?://[^\s)]+)", ln)
+                        if mm:
+                            candidate_urls.append(("", mm.group(1)))
+            continue
+
+        if tool == "read":
+            url = str(parsed.get("url") or "").strip()
+            if not url.startswith("http") or url in read_urls:
+                break
+            read_urls.append(url)
+            trail.append(f"baca: {url[:40]}")
+            txt = await _fetch_page_text(url, max_chars=3500)
+            if txt:
+                notes.append(f"--- ISI HALAMAN PENUH: {url} ---\n{txt}")
+            continue
+
+        break
+
+    # Kalau perjalanan loop tidak menghasilkan tambahan apa pun, coba baca 1 URL dari hasil riset awal
+    if not read_urls and candidate_urls:
+        for _, u in candidate_urls[:1]:
+            txt = await _fetch_page_text(u, max_chars=3000)
+            if txt:
+                read_urls.append(u)
+                trail.append("baca: (otomatis)")
+                notes.append(f"--- ISI HALAMAN PENUH: {u} ---\n{txt}")
+                break
+
+    if not notes:
+        return "", trail
+
+    combined = (
+        "=== HASIL RISET BERTAHAP (DATA EKSTERNAL, PAKAI INI SEBAGAI DASAR JAWABAN) ===\n"
+        + "\n\n".join(notes)
+        + "\n=== AKHIR HASIL RISET ===\n"
+    )
+    return combined, trail
+
+
 def _needs_research(query: str) -> bool:
     q = (query or "").lower().strip()
     if len(q) < 4:
@@ -562,6 +844,7 @@ class MultiLLMBrain:
         self.last_chat_ok: bool = True
         self.last_error_kind: str = ""
         self.last_error_detail: str = ""
+        self.last_research_trail: List[str] = []
         self._unavailable_models: Dict[str, float] = {}
         self._llm_semaphore = asyncio.Semaphore(2)
         self._sleep_fn: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep
@@ -778,14 +1061,23 @@ class MultiLLMBrain:
 
         live_ctx = await _fetch_live_web_context(message)
 
-        # RISET WEB: kalau pertanyaannya butuh data faktual/segar, CARI DULU sebelum jawab.
-        # Ini yang membedakan jawaban "ngarang dari ingatan" vs "berbasis sumber nyata".
+        # RISET WEB BERTAHAP (#1 + #2): cari -> baca halaman penuh -> kalau kurang, cari lagi.
+        # Ini yang bikin dia bisa "ngejar" informasi, bukan cuma sekali cari lalu ngarang.
         research_ctx = ""
+        self.last_research_trail = []
         if _needs_research(message):
             try:
-                research_ctx = await asyncio.wait_for(_research_web(message), timeout=11.0)
+                research_ctx, trail = await asyncio.wait_for(
+                    _research_with_tools(message, self, max_rounds=3),
+                    timeout=48.0,
+                )
+                self.last_research_trail = list(trail)
             except Exception:
-                research_ctx = ""
+                # Fallback: riset sekali jalan kalau loop gagal/timeout
+                try:
+                    research_ctx = await asyncio.wait_for(_research_web(message), timeout=11.0)
+                except Exception:
+                    research_ctx = ""
 
         mem_part = (user_memory_block.strip() + "\n\n") if user_memory_block else ""
         chat_sys = (

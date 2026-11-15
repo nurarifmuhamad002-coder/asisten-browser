@@ -1056,6 +1056,47 @@ class AgentOrchestrator:
                                         rec_out["strategy"],
                                         "recovered",
                                     )
+
+                                # === PILAR 2: HORMATI SINYAL "BUTUH MANUSIA" ===
+                                # Dulu sinyal ini CUMA jadi teks; loop tetap lanjut memaksa
+                                # (klik ulang terus di CAPTCHA = IP diblokir permanen).
+                                # Sekarang: berhenti rapi, simpan checkpoint, tunggu user.
+                                if rec_out.get("needs_human"):
+                                    for _pl in self.current_plan:
+                                        if _pl.get("status") == "in_progress":
+                                            _pl["status"] = "pending"
+                                    self.state = "WAITING_HUMAN_TAKEOVER"
+                                    self.takeover_reason = err_cause[:200]
+                                    self.live_status = "Menunggu kamu di layar browser"
+                                    await self._sync_state()
+                                    await self._push_chat("agent", result_text)
+                                    if self.telegram:
+                                        try:
+                                            await self.telegram.notify_need_human(
+                                                result_text, reason=err_cause[:160]
+                                            )
+                                        except Exception:
+                                            try:
+                                                await self.telegram.send_text(
+                                                    result_text,
+                                                    reply_markup=self._running_inline_kb(),
+                                                )
+                                            except Exception:
+                                                pass
+                                    # Tunggu user menekan "Lanjut" / mengetik 'lanjut'
+                                    self._resume_event.clear()
+                                    try:
+                                        await asyncio.wait_for(self._resume_event.wait(), timeout=900)
+                                    except asyncio.TimeoutError:
+                                        pass
+                                    self.manual_takeover = False
+                                    self.state = "RUNNING"
+                                    self.live_status = "Melanjutkan setelah kamu selesai di layar"
+                                    await self._sync_state()
+                                    result_text = (
+                                        "♻️ [LANJUT SETELAH USER] User sudah menangani layar browser. "
+                                        "Periksa kondisi halaman sekarang dan lanjutkan tugas dari titik ini."
+                                    )
                             elif self._active_task_id:
                                 self.task_store.record_recovery(
                                     self._active_task_id,

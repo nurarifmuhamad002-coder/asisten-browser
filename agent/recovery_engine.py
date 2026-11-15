@@ -116,6 +116,26 @@ class ErrorRecoveryEngine:
         if "timeout" in low or "timed out" in low or "tidak merespons" in low:
             return ("browser_timeout", redact_secrets(txt))
 
+        # --- ERROR YANG BUTUH MANUSIA (jangan dipaksa terus, nanti diblokir permanen) ---
+        if any(k in low for k in ("captcha", "recaptcha", "verify you are human", "are you a robot",
+                                  "verifikasi bahwa anda bukan robot", "challenge")):
+            return ("captcha_block", redact_secrets(txt[:220]))
+
+        if any(k in low for k in ("rate limit", "too many requests", "429", "terlalu banyak permintaan")):
+            return ("rate_limited", redact_secrets(txt[:220]))
+
+        # --- SESI LOGIN HABIS (solusi: user login ulang, bukan AI nebak password) ---
+        if any(k in low for k in ("session expired", "sesi berakhir", "silakan login", "please sign in",
+                                  "please log in", "login required", "harus login", "unauthorized",
+                                  "tidak memiliki akses", "access denied", "401")):
+            return ("session_expired", redact_secrets(txt[:220]))
+
+        # --- VALIDASI FORM DITOLAK WEBSITE (bisa AUTO-DIPERBAIKI) ---
+        if any(k in low for k in ("wajib diisi", "required", "harus diisi", "tidak valid", "invalid",
+                                  "format salah", "must be", "minimal", "maksimal", "exceeds",
+                                  "melebihi", "kurang dari")):
+            return ("form_validation_error", redact_secrets(txt[:260]))
+
         if txt.startswith("❌"):
             if "tidak ditemukan" in low or "not found" in low:
                 return ("element_not_found", redact_secrets(txt.lstrip("❌ ").strip()))
@@ -185,6 +205,86 @@ class ErrorRecoveryEngine:
                     }
                 )
                 return None
+
+        # 1B. CAPTCHA / BOT-CHECK -> JANGAN dipaksa, serahkan ke manusia (aman & sopan)
+        if error_type == "captcha_block":
+            strategy = "Menghentikan percobaan otomatis & meminta user menyelesaikan verifikasi manual"
+            self.recovery_events.append({
+                "error_type": error_type, "cause": cause, "strategy": strategy,
+                "outcome": "needs_human",
+            })
+            return {
+                "recovered": True,
+                "strategy": strategy,
+                "needs_human": True,
+                "new_result": (
+                    "🛑 [BUTUH MANUSIA] Website memunculkan CAPTCHA/verifikasi anti-bot. "
+                    "Gua BERHENTI di sini — bukan gagal, tapi situsnya minta manusia. "
+                    "Buka layar browser, selesaikan verifikasinya, lalu balas 'lanjut'. "
+                    "Memaksa terus hanya akan bikin IP diblokir permanen."
+                ),
+            }
+
+        # 1C. RATE LIMIT -> tunggu & coba lagi (bukan spam)
+        if error_type == "rate_limited":
+            strategy = "Menunggu jeda aman lalu mencoba sekali lagi (anti-spam)"
+            try:
+                await asyncio.sleep(6 if used == 0 else 15)
+            except Exception:
+                pass
+            self.recovery_events.append({
+                "error_type": error_type, "cause": cause, "strategy": strategy,
+                "outcome": "waited_and_retry",
+            })
+            return {
+                "recovered": True,
+                "strategy": strategy,
+                "new_result": (
+                    "⏳ [AUTO-RECOVERY] Website membatasi jumlah permintaan. "
+                    "Gua sudah menunggu jeda aman. Coba lagi sekarang dengan tempo lebih pelan."
+                ),
+            }
+
+        # 1D. SESI LOGIN HABIS -> minta user login, JANGAN nebak kredensial
+        if error_type == "session_expired":
+            strategy = "Menghentikan & meminta user login ulang (tidak menebak kredensial)"
+            self.recovery_events.append({
+                "error_type": error_type, "cause": cause, "strategy": strategy,
+                "outcome": "needs_human_login",
+            })
+            return {
+                "recovered": True,
+                "strategy": strategy,
+                "needs_human": True,
+                "new_result": (
+                    "🔐 [BUTUH LOGIN] Sesi login di situs ini sudah habis / akses ditolak. "
+                    "Gua TIDAK akan menebak password atau OTP. "
+                    "Login dulu di layar browser, lalu balas 'lanjut'."
+                ),
+            }
+
+        # 1E. VALIDASI FORM DITOLAK -> baca pesan error nyata & arahkan perbaikan spesifik
+        if error_type == "form_validation_error":
+            strategy = "Membaca pesan validasi dari website & mengarahkan perbaikan field yang tepat"
+            try:
+                await browser.dismiss_obstructions()
+            except Exception:
+                pass
+            detail = redact_secrets(cause)[:260]
+            self.recovery_events.append({
+                "error_type": error_type, "cause": detail, "strategy": strategy,
+                "outcome": "guidance_issued",
+            })
+            return {
+                "recovered": True,
+                "strategy": strategy,
+                "new_result": (
+                    "⚠️ [AUTO-RECOVERY VALIDASI] Website menolak isi form. Pesan aslinya: "
+                    f"\"{detail}\"\n"
+                    "Baca pesan itu, cari field yang disebut, perbaiki nilainya, baru submit lagi. "
+                    "JANGAN mengulang submit tanpa memperbaiki field tersebut."
+                ),
+            }
 
         # 2. Pemulihan Elemen Tidak Ditemukan -> Scroll + Tutup Pop-up Penghalang + Re-Inspect DOM Segar
         if error_type == "element_not_found" and act_name in ("click", "type", "select"):

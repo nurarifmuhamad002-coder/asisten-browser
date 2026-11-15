@@ -2636,6 +2636,70 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(30, "Tahap 18: Self Verification (Bukti Per-Aksi)", True, "Klik kini WAJIB punya bukti (URL/judul/modal/DOM berubah). Diuji nyata: tombol berfungsi -> TERBUKTI, tombol disabled -> TIDAK ADA PERUBAHAN, tombol no-op -> BELUM ADA BUKTI. Ditambah gerbang anti-klaim-palsu: bot ditolak selesai kalau data penting tidak ditemukan di halaman.")
 
+        # =====================================================================
+        # 31. TAHAP 19: AUTONOMOUS RECOVERY (CAPTCHA, sesi habis, validasi, rate limit)
+        # =====================================================================
+        src31_re = (ROOT / "agent" / "recovery_engine.py").read_text(encoding="utf-8")
+        src31_or = (ROOT / "agent" / "orchestrator.py").read_text(encoding="utf-8")
+        src31_tb = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+
+        # 31a. Empat jenis error baru wajib dikenali
+        for _et in ("captcha_block", "rate_limited", "session_expired", "form_validation_error"):
+            assert _et in src31_re, f"Klasifikasi error '{_et}' wajib ada"
+
+        # 31b. Sinyal needs_human wajib DIHORMATI loop, bukan cuma jadi teks
+        assert "needs_human" in src31_re, "Recovery wajib bisa menandai butuh manusia"
+        assert 'rec_out.get("needs_human")' in src31_or, (
+            "Loop WAJIB memeriksa needs_human (dulu cuma ganti teks lalu tetap memaksa)"
+        )
+        assert "WAITING_HUMAN_TAKEOVER" in src31_or, "Loop wajib masuk mode menunggu manusia"
+        assert "_resume_event" in src31_or, "Loop wajib menunggu sinyal lanjut dari user"
+
+        # 31c. CAPTCHA/login TIDAK boleh dipaksa terus (bahaya blokir IP)
+        assert "BUTUH MANUSIA" in src31_re, "CAPTCHA wajib menyerah ke manusia"
+        assert "TIDAK akan menebak password" in src31_re, "Sesi habis wajib minta login, bukan nebak"
+        assert "jeda aman" in src31_re, "Rate limit wajib menunggu, bukan spam"
+
+        # 31d. Notifikasi "butuh manusia" wajib sampai ke Telegram dengan tombol yang HIDUP
+        assert "def notify_need_human" in src31_tb, "Notifikasi butuh-manusia wajib ada"
+        _nh_block = src31_tb[src31_tb.index("async def notify_need_human"):]
+        _nh_block = _nh_block[:_nh_block.index("async def notify_done")]
+        for _cb in ("resume_login", "stop_running", "snap_screen"):
+            assert _cb in _nh_block, f"Tombol '{_cb}' wajib ada & sudah punya handler"
+        # Tidak boleh memakai callback yang tidak punya handler
+        for _dead in ("agent:resume", "agent:stop", "act:screen"):
+            assert _dead not in _nh_block, f"Callback '{_dead}' tidak punya handler -> tombol mati"
+
+        # 31e. BUKTI HIDUP: klasifikasi & pemulihan nyata
+        from agent.recovery_engine import ErrorRecoveryEngine as _ERE31
+        _cases31 = [
+            ("Terdeteksi CAPTCHA, silakan verifikasi", "captcha_block"),
+            ("429 Too Many Requests", "rate_limited"),
+            ("Your session expired, please sign in again", "session_expired"),
+            ("Field Email wajib diisi", "form_validation_error"),
+            ("❌ Elemen [5] tidak ditemukan", "element_not_found"),
+            ("Semua normal tanpa masalah", None),
+        ]
+        for _txt, _expect in _cases31:
+            _got = _ERE31.classify_error(_txt)
+            _got_t = _got[0] if _got else None
+            assert _got_t == _expect, f"Klasifikasi '{_txt[:35]}' harus {_expect}, dapat {_got_t}"
+
+        _r31 = _ERE31()
+        _c31 = await _r31.attempt_browser_recovery(None, {"name": "click", "index": 1},
+                                                   "captcha_block", "ada captcha")
+        assert _c31 and _c31.get("needs_human") is True, "CAPTCHA wajib butuh manusia"
+        assert "BUTUH MANUSIA" in _c31["new_result"]
+
+        _r31b = _ERE31()
+        _s31 = await _r31b.attempt_browser_recovery(None, {"name": "click", "index": 1},
+                                                    "session_expired", "login habis")
+        assert _s31 and _s31.get("needs_human") is True, "Sesi habis wajib butuh manusia"
+        assert "TIDAK akan menebak password" in _s31["new_result"]
+
+        record(31, "Tahap 19: Autonomous Recovery (CAPTCHA, Sesi Habis, Validasi, Rate Limit)", True, "Empat jenis error baru dikenali otomatis. CAPTCHA & sesi habis kini BERHENTI rapi + minta manusia (dulu dipaksa terus -> risiko IP diblokir permanen). Validasi form dibalas panduan perbaikan spesifik, rate limit ditunggu dengan jeda aman. Sinyal needs_human akhirnya DIHORMATI loop, plus tombol Telegram yang benar-benar hidup.")
+
+
 
     finally:
         if browser is not None:

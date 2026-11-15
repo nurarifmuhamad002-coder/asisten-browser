@@ -2340,6 +2340,43 @@ class TelegramBotBridge:
         for cid in targets:
             await self.send_document(cid, filename, file_bytes, f"📄 File selesai dibuat: {filename}")
 
+    async def notify_need_human(self, message: str, reason: str = "") -> None:
+        """Beri tahu user bahwa bot BERHENTI dengan sengaja dan menunggu manusia.
+
+        Dipakai saat: CAPTCHA/anti-bot muncul, sesi login habis, atau situs minta
+        verifikasi manual. Bot TIDAK memaksa (biar IP tidak diblokir permanen),
+        lalu menampilkan tombol Lanjut/Stop + foto layar terakhir.
+        """
+        if not self.is_configured:
+            return
+        targets = {self.owner_id} if self.is_locked and self.owner_id else set(self.active_chat_ids)
+        if not targets:
+            return
+        clean = redact_secrets(message).replace("**", "").strip()
+        alasan = f"\n\n📌 Alasan: {redact_secrets(reason)[:200]}" if reason else ""
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "▶️ Lanjut (gua udah beresin di layar)", "callback_data": "resume_login"},
+                    {"text": "⏹️ Stop", "callback_data": "stop_running"},
+                ],
+                [{"text": "🖥️ Lihat Layar Sekarang", "callback_data": "snap_screen"}],
+            ]
+        }
+        for cid in targets:
+            try:
+                b64 = await self.orchestrator.browser.refresh_frame()
+                if b64:
+                    await self.send_photo_b64(cid, b64, "🖥️ Layar terakhir sebelum gua berhenti:")
+            except Exception:
+                pass
+            await self.send_text(
+                cid,
+                f"⏸️ GUA BERHENTI DULU — BUTUH LU\n\n{clean}{alasan}\n\n"
+                "Setelah lu selesai di layar browser, tekan tombol di bawah atau balas `lanjut`.",
+                reply_markup=kb,
+            )
+
     async def notify_done(
         self,
         summary: str,

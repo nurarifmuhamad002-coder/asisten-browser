@@ -1633,6 +1633,105 @@ class AgentOrchestrator:
                     pass
             return f"✅ File '{saved['name']}' berhasil disimpan di disk ({saved['size']} bytes){extra_sheet_info}."
 
+        # ================= PDF EDITOR: potong / hapus / TULIS di file PDF =================
+        if act_name in (
+            "pdf_extract_pages", "pdf_delete_pages", "pdf_write_text",
+            "pdf_fill_form", "pdf_add_page", "pdf_read_page",
+        ):
+            from agent import pdf_editor as _pdfe
+            try:
+                src_name = str(action.get("filename") or action.get("source") or "").strip()
+                if not src_name:
+                    return "❌ Nama file PDF kosong. Pakai list_files dulu buat lihat nama persisnya."
+                # get_file_path MELEMPAR kalau file tidak ada, jadi dibungkus dulu.
+                try:
+                    src_path = self.file_manager.get_file_path(src_name)
+                except FileNotFoundError:
+                    return f"❌ File '{src_name}' tidak ada di workspace."
+
+                out_name = str(action.get("output") or "").strip()
+                if not out_name:
+                    stem = src_path.stem
+                    suffix = {
+                        "pdf_extract_pages": "_potong",
+                        "pdf_delete_pages": "_tanpa_hal",
+                        "pdf_write_text": "_ditulisi",
+                        "pdf_fill_form": "_terisi",
+                        "pdf_add_page": "_plus_hal",
+                        "pdf_read_page": "",
+                    }[act_name]
+                    out_name = f"{stem}{suffix}.pdf"
+                # File OUTPUT belum ada di disk, jadi pakai _safe_path (validasi path saja)
+                out_path = self.file_manager._safe_path(out_name)
+
+                if act_name == "pdf_extract_pages":
+                    res = _pdfe.extract_pages(src_path, out_path, str(action.get("pages", "")))
+                    msg = (
+                        f"✅ PDF dipotong NYATA: '{src_name}' ({res['source_pages']} hal) -> "
+                        f"'{res['file']}' ({res['kept_pages']} hal: lembar {', '.join(map(str, res['page_numbers']))}), "
+                        f"{res['size_bytes']} bytes."
+                    )
+                elif act_name == "pdf_delete_pages":
+                    res = _pdfe.delete_pages(src_path, out_path, str(action.get("pages", "")))
+                    msg = (
+                        f"✅ Halaman dibuang NYATA: lembar {', '.join(map(str, res['removed_pages']))} dibuang, "
+                        f"sisanya {res['kept_pages']} hal -> '{res['file']}' ({res['size_bytes']} bytes)."
+                    )
+                elif act_name == "pdf_write_text":
+                    entries = action.get("texts") or action.get("entries") or []
+                    if isinstance(entries, dict):
+                        entries = [entries]
+                    if not entries and action.get("text"):
+                        entries = [{
+                            "page": action.get("page", 1),
+                            "text": action.get("text"),
+                            "x": action.get("x", 60),
+                            "y": action.get("y", 760),
+                            "size": action.get("size", 12),
+                            "bold": action.get("bold", False),
+                        }]
+                    res = _pdfe.overlay_text(src_path, out_path, entries)
+                    msg = (
+                        f"✅ Menulis di PDF NYATA: {res['texts_written']} teks ditempel di atas "
+                        f"halaman -> '{res['file']}' ({res['size_bytes']} bytes)."
+                    )
+                elif act_name == "pdf_fill_form":
+                    values = action.get("values") or action.get("fields") or {}
+                    res = _pdfe.fill_form_fields(src_path, out_path, values)
+                    msg = f"✅ Isian PDF terisi: {', '.join(res['filled'])} -> '{res['file']}'."
+                elif act_name == "pdf_add_page":
+                    res = _pdfe.add_blank_page(
+                        src_path, out_path,
+                        size=str(action.get("size", "a4")),
+                        entries=action.get("texts") or None,
+                    )
+                    msg = f"✅ Halaman baru ditambahkan -> '{res['file']}' ({res['pages']} hal)."
+                else:  # pdf_read_page
+                    r = _pdfe.read_page_text(src_path, int(action.get("page", 1)))
+                    if r["is_scanned"]:
+                        return (
+                            f"⚠️ Halaman {r['page']} dari '{src_name}' TIDAK punya lapisan teks "
+                            f"(kemungkinan hasil scan/gambar). {r['note']}"
+                        )
+                    return f"Isi halaman {r['page']}/{r['total_pages']} '{src_name}':\n\n{r['text'][:4000]}"
+
+                # Kabari user + kirim filenya kalau berhasil
+                if out_path.exists():
+                    if out_name not in self._created_files_this_run:
+                        self._created_files_this_run.append(out_name)
+                    await self.broadcast({"type": "files_updated", "files": self.file_manager.list_files()})
+                    await self._push_chat(
+                        "file", f"File siap: {out_name}",
+                        {"filename": out_name, "size": out_path.stat().st_size},
+                    )
+                    if self.telegram and "/" not in out_name:
+                        await self.telegram.notify_file(out_name, out_path.read_bytes())
+                return msg
+            except _pdfe.PdfEditError as exc:
+                return f"❌ {exc}"
+            except Exception as exc:
+                return f"❌ Gagal mengolah PDF: {str(exc)[:160]}"
+
         if act_name in ("delete_file", "remove_file"):
             fname = str(action.get("filename") or action.get("path") or "").strip()
             if not fname:

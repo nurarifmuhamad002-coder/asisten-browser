@@ -3129,6 +3129,155 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         except Exception as exc:
             record(36, "Tahap 24: Verdict Proxy — Flag hosting ip-api Tidak Bisa Dipercaya", False, f"ERROR: {exc}")
 
+        # ============ SUITE 37: PDF Editor — potong & TULIS di file nyata ============
+        print("\n>>> Tahap 25: PDF Editor — Potong Halaman & Menulis di File")
+        try:
+            import os as _os37, tempfile as _tf37
+            import asyncio as _a37
+            from reportlab.pdfgen import canvas as _cv37
+            from reportlab.lib.pagesizes import A4 as _A4_37
+            from agent import pdf_editor as _pdfe37
+            from agent.pdf_editor import page_count as _pcount37, read_page_text as _pread37
+
+            _tmp37 = _tf37.mkdtemp()
+            _src37 = _os37.path.join(_tmp37, "Surat Valas 2.pdf")
+            _c37 = _cv37.Canvas(_src37, pagesize=_A4_37)
+            for _i in (1, 2, 3):
+                _c37.setFont("Helvetica-Bold", 24)
+                _c37.drawString(80, 700, f"LEMBAR {_i}")
+                _c37.showPage()
+            _c37.save()
+            assert _pcount37(_src37) == 3
+
+            # --- A. Potong: sisain lembar 2 (keluhan asli user) ---
+            _out37 = _os37.path.join(_tmp37, "lembar2.pdf")
+            _r37 = _pdfe37.extract_pages(_src37, _out37, "2")
+            assert _r37["source_pages"] == 3 and _r37["kept_pages"] == 1
+            assert _r37["page_numbers"] == [2]
+            assert _os37.path.exists(_out37) and _os37.path.getsize(_out37) > 0
+            assert "LEMBAR 2" in _pread37(_out37, 1)["text"], "hasil potong bukan lembar 2!"
+
+            # --- B. Hapus halaman: buang 1 dan 3 ---
+            _out37b = _os37.path.join(_tmp37, "tanpa13.pdf")
+            _r37b = _pdfe37.delete_pages(_src37, _out37b, "1,3")
+            assert _r37b["kept_pages"] == 1 and _r37b["removed_pages"] == [1, 3]
+            assert "LEMBAR 2" in _pread37(_out37b, 1)["text"]
+
+            # --- C. TULIS teks di atas halaman, lalu buktikan terbaca ---
+            _out37c = _os37.path.join(_tmp37, "ditulis.pdf")
+            _r37c = _pdfe37.overlay_text(_out37, _out37c, [
+                {"page": 1, "text": "DISETUJUI", "x": 400, "y": 760, "size": 16,
+                 "bold": True, "color": [1, 0, 0]},
+                {"page": 1, "text": "Nama: ARIF MUHAMAD", "x": 80, "y": 200, "size": 12},
+            ])
+            assert _r37c["texts_written"] == 2, _r37c
+            _txt37 = _pread37(_out37c, 1)["text"]
+            assert "DISETUJUI" in _txt37, f"teks yang ditulis tidak ada di PDF -> {_txt37!r}"
+            assert "ARIF MUHAMAD" in _txt37
+            assert "LEMBAR 2" in _txt37, "isi asli hilang setelah ditulisi!"
+
+            # --- D. Menulis DI ATAS PDF SCAN (halaman tanpa lapisan teks) ---
+            from PIL import Image as _Im37
+            from reportlab.lib.utils import ImageReader as _IR37
+            _png37 = _os37.path.join(_tmp37, "scan.png")
+            _Im37.new("RGB", (1240, 1754), "white").save(_png37)
+            _scan37 = _os37.path.join(_tmp37, "scan.pdf")
+            _c2_37 = _cv37.Canvas(_scan37, pagesize=_A4_37)
+            _c2_37.drawImage(_IR37(_png37), 0, 0, width=595, height=842)
+            _c2_37.showPage(); _c2_37.save()
+            assert _pread37(_scan37, 1)["is_scanned"] is True, "PDF gambar harus terdeteksi scan"
+            _out37d = _os37.path.join(_tmp37, "scan_ditulis.pdf")
+            _pdfe37.overlay_text(_scan37, _out37d, [
+                {"page": 1, "text": "TANDA TANGAN: ARIF", "x": 80, "y": 120, "size": 18}])
+            assert "TANDA TANGAN: ARIF" in _pread37(_out37d, 1)["text"]
+
+            # --- E. Halaman tidak ada HARUS ditolak, bukan diabaikan ---
+            _rejected37 = False
+            try:
+                _pdfe37.extract_pages(_out37, _os37.path.join(_tmp37, "x.pdf"), "5")
+            except _pdfe37.PdfEditError as _exc37:
+                _rejected37 = "5" in str(_exc37) and "1 halaman" in str(_exc37)
+            assert _rejected37, "minta halaman 5 dari PDF 1 halaman harus DITOLAK dengan pesan jelas"
+
+            # --- F. Orchestrator benar-benar memanggil aksi & mengirim file ---
+            from agent.orchestrator import AgentOrchestrator as _AO37
+            from agent.file_manager import WorkspaceFileManager as _WFM37
+
+            async def _run_orch37():
+                _orch = _AO37.__new__(_AO37)
+                _orch.file_manager = _WFM37(base_dir=_tmp37)
+                _orch._created_files_this_run = []
+                _orch._created_top_dirs = []
+                _orch.memory_notes = {}
+                _orch.telegram = None
+                _sent = []
+
+                async def _push(role, text, meta=None):
+                    _sent.append((role, meta))
+
+                async def _bc(payload):
+                    return None
+
+                _orch._push_chat = _push
+                _orch.broadcast = _bc
+
+                _a = await _orch._execute_with_guardrails(
+                    1,
+                    {"name": "pdf_extract_pages", "filename": "Surat Valas 2.pdf",
+                     "pages": "2", "output": "kirim_lembar2.pdf"},
+                    {"elements": []},
+                )
+                _b = await _orch._execute_with_guardrails(
+                    2,
+                    {"name": "pdf_write_text", "filename": "kirim_lembar2.pdf",
+                     "texts": [{"page": 1, "text": "TTD: ARIF", "x": 80, "y": 300}]},
+                    {"elements": []},
+                )
+                _c = await _orch._execute_with_guardrails(
+                    3, {"name": "pdf_extract_pages", "filename": "kirim_lembar2.pdf", "pages": "9"},
+                    {"elements": []},
+                )
+                return _a, _b, _c, _sent
+
+            _ra37, _rb37, _rc37, _sent37 = await _run_orch37()
+            assert _ra37.startswith("✅"), _ra37
+            assert "1 hal: lembar 2" in _ra37, _ra37
+            assert _rb37.startswith("✅"), _rb37
+            assert _rc37.startswith("❌"), f"halaman 9 tidak ada harus ❌ -> {_rc37}"
+            _files37 = [m["filename"] for r, m in _sent37 if r == "file"]
+            assert len(_files37) == 2, f"file hasil harus dikirim ke Telegram -> {_files37}"
+
+            # --- G. Prompt AI mengenal aksi ini (anti-ngarang) ---
+            import agent.llm_providers as _lp37
+            import inspect as _insp37
+            _psrc37 = _insp37.getsource(_lp37)
+            for _nm37 in ("pdf_extract_pages", "pdf_write_text", "pdf_delete_pages"):
+                assert _nm37 in _psrc37, f"aksi {_nm37} tidak dikenalkan ke AI"
+
+            record(
+                37,
+                "Tahap 25: PDF Editor — Potong Halaman & Menulis di File (Anti-Ngarang)",
+                True,
+                "MASALAH ASLI: bot mengaku 'gua potong PDF-nya, cuma sisain lembar ke-2' "
+                "padahal fungsi potong PDF SAMA SEKALI TIDAK ADA (grep PdfWriter/extract_pages "
+                "= 0 hasil). Bot juga bilang 'file bakal dikirim, tinggal download' padahal "
+                "tidak ada file yang pernah dibuat. Perbaikan: modul agent/pdf_editor.py nyata "
+                "dengan 6 operasi — potong halaman (pypdf PdfWriter), hapus halaman, TULIS teks "
+                "di atas halaman (reportlab + merge_page), isi AcroForm, tambah halaman, baca "
+                "teks halaman. Diuji: potong 3->1 halaman berisi 'LEMBAR 2' benar; hapus "
+                "halaman 1&3 benar; tulis 'DISETUJUI' + nama lalu terbaca kembali & isi asli "
+                "utuh; MENULIS DI ATAS PDF SCAN (gambar tanpa lapisan teks) tetap berhasil; "
+                "minta halaman 5 dari PDF 1 halaman DITOLAK dengan pesan jelas, bukan diabaikan. "
+                "Orchestrator memanggil aksi nyata, mengirim 2 file ke Telegram, dan prompt AI "
+                "kini mewajibkan memanggil aksi sebelum mengaku file siap — ditambah aturan "
+                "keras 'DILARANG mengaku sudah dipotong tanpa memanggil aksi'.",
+            )
+        except AssertionError as exc:
+            record(37, "Tahap 25: PDF Editor — Potong Halaman & Menulis di File (Anti-Ngarang)", False, str(exc))
+        except Exception as exc:
+            record(37, "Tahap 25: PDF Editor — Potong Halaman & Menulis di File (Anti-Ngarang)", False, f"ERROR: {exc}")
+
+
 
 
 

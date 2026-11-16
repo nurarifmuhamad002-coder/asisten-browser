@@ -2940,6 +2940,109 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(34, "Tahap 22: Pilar 4 — Laporan Progres Menenangkan", True, "Kartu progres kini menampilkan estimasi sisa waktu (dari rata-rata detik per langkah) dan 3 aksi terakhir yang BERHASIL (aksi gagal tidak ditampilkan sebagai capaian). Saat selesai kartu kembali bersih. DIY: pesan progres diperbarui tiap 4 detik tanpa spam.")
 
+        # ================= SUITE 35: WaroengProxy username dash bug =================
+        print("\n>>> Tahap 23: WaroengProxy — Kode Akun Bertanda Hubung Ditolak Gateway")
+        try:
+            from agent.browser_engine import CloudBrowserEngine as _CBE35
+            import urllib.request as _ur35
+            import base64 as _b64_35
+
+            _WX_HOST = "proxy.waroengproxy.com"
+            _WX_PORT = "8000"
+
+            # --- A. Unit: normalisasi username bertanda hubung ---
+            _c35_a = _CBE35.parse_proxy_input(f"http://WX-LL44U4Q:rahasia@{_WX_HOST}:{_WX_PORT}")
+            assert _c35_a["username"] == "WXLL44U4Q-cc-ID-s-bot01-ttl-3600", (
+                f"Kode akun 'WX-LL44U4Q' wajib dinormalkan jadi 'WXLL44U4Q-...', dapat: {_c35_a['username']}"
+            )
+            assert _c35_a["server"] == f"http://{_WX_HOST}:{_WX_PORT}"
+
+            # --- B. Unit: parameter targeting yang sudah benar tidak dirusak ---
+            _c35_b = _CBE35.parse_proxy_input(f"http://WX-LL44U4Q-cc-ID-isp-telkomsel:pw@{_WX_HOST}:{_WX_PORT}")
+            assert _c35_b["username"] == "WXLL44U4Q-cc-ID-isp-telkomsel", _c35_b["username"]
+
+            _c35_b2 = _CBE35.parse_proxy_input(f"http://WXLL44U4Q-cc-SG-s-job42-ttl-600:pw@{_WX_HOST}:{_WX_PORT}")
+            assert _c35_b2["username"] == "WXLL44U4Q-cc-SG-s-job42-ttl-600", _c35_b2["username"]
+
+            # --- C. Unit: host LAIN tidak boleh ikut diubah (anti-regresi) ---
+            _c35_c = _CBE35.parse_proxy_input("http://user-1:pass@1.2.3.4:8080")
+            assert _c35_c["username"] == "user-1", f"Host non-WaroengProxy berubah jadi {_c35_c['username']!r}"
+
+            # --- D. Unit: format host:port:user:pass (toko proxy Indo) ---
+            _c35_d = _CBE35.parse_proxy_input(f"{_WX_HOST}:{_WX_PORT}:WX-LL44U4Q:rahasia")
+            assert _c35_d["username"] == "WXLL44U4Q-cc-ID-s-bot01-ttl-3600", _c35_d["username"]
+            assert _c35_d["password"] == "rahasia"
+
+            # --- E. LIVE: buktikan gateway menolak '-' dan menerima tanpa '-' ---
+            def _wx_probe(username: str) -> str:
+                """LEWATI gateway sebagai proxy (bukan konek ke gateway-nya langsung).
+
+                Gateway hanya memvalidasi kredensial kalau request-nya berupa
+                permintaan proxy ke host lain. Kalau dihubungi langsung, ia cuma
+                membalas "Ini alamat proxy, bukan situs web".
+                """
+                proxy_url = f"http://{username}:probepass@{_WX_HOST}:{_WX_PORT}"
+                opener = _ur35.build_opener(
+                    _ur35.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                )
+                try:
+                    with opener.open("http://ip-api.com/json", timeout=12) as r:
+                        return r.read().decode("utf-8", "ignore")[:400]
+                except _ur35.HTTPError as exc:
+                    try:
+                        return exc.read().decode("utf-8", "ignore")[:400]
+                    except Exception:
+                        return f"__ERR__ HTTP {exc.code}"
+                except Exception as exc:
+                    return f"__ERR__ {exc}"
+
+            _raw_dash = ""
+            _raw_plain = ""
+            _live_ok = True
+            try:
+                _raw_dash = _wx_probe("WX-LL44U4Q")
+                _raw_plain = _wx_probe("WXLL44U4Q")
+            except Exception as exc:
+                _live_ok = False
+                _raw_dash = _raw_plain = f"__ERR__ {exc}"
+
+            if _live_ok and "__ERR__" not in _raw_dash and "__ERR__" not in _raw_plain:
+                assert "Format username tidak valid" in _raw_dash, (
+                    f"Gateway mesti MENOLAK 'WX-LL44U4Q' (dash = pemisah parameter). Balasan: {_raw_dash!r}"
+                )
+                assert "Format username tidak valid" not in _raw_plain, (
+                    f"Gateway mesti MENERIMA 'WXLL44U4Q' (lolos parsing). Balasan: {_raw_plain!r}"
+                )
+                assert "salah" in _raw_plain.lower() or "wrong" in _raw_plain.lower(), (
+                    f"Tanpa dash semestinya lolos ke tahap cek password. Balasan: {_raw_plain!r}"
+                )
+                _proof35 = (
+                    "Terbukti live: 'WX-LL44U4Q' -> 'Format username tidak valid', "
+                    "'WXLL44U4Q' -> 'Username atau password proxy salah' (lolos parsing)."
+                )
+            else:
+                # Gateway tidak terjangkau: unit test di atas tetap sah, tapi jangan mengklaim bukti live.
+                _proof35 = "Gateway tidak terjangkau saat uji; validasi live dilewati (unit test tetap lulus)."
+
+            record(
+                35,
+                "Tahap 23: WaroengProxy — Kode Akun Bertanda Hubung Ditolak Gateway",
+                True,
+                "AKAR MASALAH: WaroengProxy memakai '-' sebagai PEMISAH parameter targeting "
+                "(username-cc-ID-s-label-ttl-sec), sementara kode akun yang dikirim bot Telegram "
+                "mereka berbentuk 'WX-LL44U4Q'. Gateway menolak dengan 'Format username tidak "
+                "valid' sehingga proxy tidak pernah menyala walau kredensial benar. "
+                "Perbaikan: parse_proxy_input kini membersihkan '-' dari bagian nama akun khusus "
+                "host proxy.waroengproxy.com ('WX-LL44U4Q' -> 'WXLL44U4Q'), mempertahankan "
+                "parameter targeting yang sudah valid, otomatis menambah -cc-ID sticky kalau "
+                "negara belum dipilih, dan TIDAK menyentuh host lain. " + _proof35,
+            )
+        except AssertionError as exc:
+            record(35, "Tahap 23: WaroengProxy — Kode Akun Bertanda Hubung Ditolak Gateway", False, str(exc))
+        except Exception as exc:
+            record(35, "Tahap 23: WaroengProxy — Kode Akun Bertanda Hubung Ditolak Gateway", False, f"ERROR: {exc}")
+
+
 
 
 

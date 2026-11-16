@@ -157,13 +157,42 @@ class CloudBrowserEngine:
 
         cdn_bypass = "*.cloudflare.com,unpkg.com,*.unpkg.com,*.googleapis.com,*.gstatic.com,*.jsdelivr.net"
 
+        # Kunci parameter targeting yang dipakai WaroengProxy (docs: username-key-value...)
+        _WX_KEYS = ("cc", "co", "st", "ct", "pc", "dma", "gid", "geo", "asn", "isp", "tz", "s", "ttl")
+
+        def _wx_normalize_username(usr: str) -> str:
+            """WaroengProxy memakai '-' sebagai PEMISAH parameter.
+
+            Kode akun yang ditampilkan bot Telegram mereka mengandung '-'
+            (contoh: WX-LL44U4Q) dan itu DITOLAK gateway dengan
+            "Format username tidak valid. Pola: username-kunci-nilai…".
+            Jadi bagian nama akun harus dibersihkan dari '-' lebih dulu:
+                WX-LL44U4Q   -> WXLL44U4Q          (diterima)
+                WX-LL44U4Q-cc-ID -> WXLL44U4Q-cc-ID (diterima)
+            """
+            u = (usr or "").strip()
+            if not u:
+                return u
+            # Pisahkan bagian akun dari parameter yang sudah benar (cari '-<key>-' pertama)
+            cut = len(u)
+            for k in _WX_KEYS:
+                idx = u.find(f"-{k}-")
+                if idx > 0 and idx < cut:
+                    cut = idx
+            head, tail = u[:cut], u[cut:]
+            head_clean = re.sub(r"[^A-Za-z0-9]", "", head)
+            return f"{head_clean}{tail}" if head_clean else u
+
         def _enrich_id_proxy(c: Dict[str, str]) -> Dict[str, str]:
             c["bypass"] = cdn_bypass
-            # Jika user menempel kode mentah WaroengProxy tanpa kode negara, otomatis kunci ke IP Indonesia Sticky!
             srv_l = c.get("server", "").lower()
-            usr = c.get("username", "")
-            if "waroengproxy.com" in srv_l and usr and "-cc-" not in usr:
-                c["username"] = f"{usr}-cc-ID-s-bot01-ttl-3600"
+            usr = c.get("username", "") or ""
+            if "waroengproxy.com" in srv_l and usr:
+                usr = _wx_normalize_username(usr)
+                # Tanpa kode negara -> otomatis kunci ke IP Indonesia Sticky
+                if not any(f"-{k}-" in usr for k in ("cc", "co", "gid", "geo", "tz", "asn", "isp", "st", "ct")):
+                    usr = f"{usr}-cc-ID-s-bot01-ttl-3600"
+                c["username"] = usr
             return c
 
         if "://" in s:

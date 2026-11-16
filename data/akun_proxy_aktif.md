@@ -3,9 +3,20 @@
 ## Akun BARU (dipakai)
 - Kode akun bot   : WX-JMJRY5U
 - Username proxy  : WXJMJRY5U          <-- TANPA tanda hubung
-- Password proxy  : (ambil via API, lihat bawah)
+- Password proxy  : 16 karakter hex (JANGAN ditulis di file ini)
 - Deposit         : Rp10.000 masuk 16 Nov 2026 11.21 WIB
-- Kuota          : 0 GB  -> WAJIB beli GB dulu
+- Kuota           : 1 GB dibeli 16 Nov 2026
+- STATUS          : ✅ PROXY JALAN — IP Indonesia terbukti
+
+### Bukti uji nyata (16 Nov 2026)
+    username tanpa -cc-ID  -> IP India (New Delhi) — negara acak
+    -cc-ID rotating        -> timeout / TLS reset (tidak stabil)
+    -cc-ID-s-label-ttl-N   -> IP 140.213.99.38 Bandung, XL Axiata  ✅
+    -cc-ID-ct-jakarta      -> 502 (terlalu sempit)
+    -cc-ID-isp-telkomsel   -> 502 (terlalu sempit)
+
+    allindonesia.imigrasi.go.id -> HTTP 200 "All Indonesia"   (dulu 403)
+    evisa.imigrasi.go.id        -> HTTP 200 "Official eVisa"  (dulu 403)
 
 ## Akun LAMA (tinggal Rp10.000 nyangkut, token hilang)
 - Kode akun bot   : WX-LL44U4Q

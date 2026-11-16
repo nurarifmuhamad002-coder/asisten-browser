@@ -910,6 +910,12 @@ class TelegramBotBridge:
                 "/ingat\n\n"
                 "🇮🇩 Cara pasang IP Indonesia (buat tembus web .go.id):\n"
                 "/proxy host:port:username:password\n\n"
+                "🧩 Punya akun WaroengProxy? Urus dari sini, nggak perlu dashboard:\n"
+                "/wx — saldo & kuota GB\n"
+                "/wxkey — simpan API key (sekali doang, aman)\n"
+                "/wxdepo 10000 — tagihan QRIS langsung dikirim ke chat\n"
+                "/wxbeli 1 — tukar saldo jadi kuota\n"
+                "/wxpasang — proxy langsung nyala, password diambil otomatis\n\n"
                 "Cara ganti API Key Gemini:\n"
                 "/apikey KODE_API_KEY_BARU\n\n"
                 "Cara segarin ulang browser:\n"
@@ -1177,6 +1183,7 @@ class TelegramBotBridge:
                     if not rest:
                         await self.send_text(chat_id, "Format: `/wxkey wxk_live_xxxxxxxx`")
                         return
+                    register_runtime_secret(rest)
                     _wx().save_api_key(rest)
                     try:
                         await self._delete_msg(chat_id, msg_id)
@@ -1201,6 +1208,7 @@ class TelegramBotBridge:
                             "`/data` biar nggak ilang lagi kayak kemarin.",
                         )
                         return
+                    register_runtime_secret(rest)
                     _wx().save_token(rest)
                     try:
                         await self._delete_msg(chat_id, msg_id)

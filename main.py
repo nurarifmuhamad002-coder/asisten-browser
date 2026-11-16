@@ -561,12 +561,22 @@ async def websocket_endpoint(websocket: WebSocket):
             ev_type = data.get("type")
 
             if ev_type == "human_click":
-                await browser_engine.human_click(
-                    x=float(data.get("x", 0)),
-                    y=float(data.get("y", 0)),
-                    button=str(data.get("button", "left")),
-                    click_count=int(data.get("click_count", 1)),
-                )
+                # nx/ny = posisi relatif 0..1 dari frontend (cara baru, benar).
+                # x/y dipertahankan sebagai fallback untuk klien lama.
+                if "nx" in data or "ny" in data:
+                    await browser_engine.human_click_norm(
+                        nx=float(data.get("nx", 0)),
+                        ny=float(data.get("ny", 0)),
+                        button=str(data.get("button", "left")),
+                        click_count=int(data.get("click_count", 1)),
+                    )
+                else:
+                    await browser_engine.human_click(
+                        x=float(data.get("x", 0)),
+                        y=float(data.get("y", 0)),
+                        button=str(data.get("button", "left")),
+                        click_count=int(data.get("click_count", 1)),
+                    )
             elif ev_type == "human_wheel":
                 await browser_engine.human_wheel(
                     dx=float(data.get("dx", 0)),

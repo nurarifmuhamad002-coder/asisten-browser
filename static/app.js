@@ -571,11 +571,14 @@ function toggleZoom() {
 /* ================= TOUCH & KEYBOARD IN BROWSER SHEET ================= */
 
 function canvasCoords(clientX, clientY) {
+  // PENTING: kirim POSISI RELATIF (0..1), bukan piksel canvas.
+  // Dulu dikirim dalam skala canvas (1280x800) padahal viewport Chromium hanya 800x600,
+  // sehingga setiap klik mendarat 1.6x terlalu kanan & 1.33x terlalu bawah — inilah
+  // penyebab checkbox "I'm not a robot" tidak pernah bisa diklik dari CCTV.
   const rect = canvas.getBoundingClientRect();
-  return {
-    x: ((clientX - rect.left) / rect.width) * canvas.width,
-    y: ((clientY - rect.top) / rect.height) * canvas.height,
-  };
+  const nx = Math.min(1, Math.max(0, (clientX - rect.left) / Math.max(1, rect.width)));
+  const ny = Math.min(1, Math.max(0, (clientY - rect.top) / Math.max(1, rect.height)));
+  return { x: nx, y: ny, nx, ny };
 }
 
 let lastTapTs = 0;
@@ -615,7 +618,7 @@ canvas.addEventListener('touchend', (ev) => {
     lastTapTs = Date.now();
     const t = ev.changedTouches[0];
     const { x, y } = canvasCoords(t.clientX, t.clientY);
-    wsSend({ type: 'human_click', x, y, button: 'left', click_count: 1 });
+    wsSend({ type: 'human_click', x, y, nx: x, ny: y, button: 'left', click_count: 1 });
   }
 });
 
@@ -623,7 +626,7 @@ canvas.addEventListener('mousedown', (ev) => {
   if (Date.now() - lastTapTs < 500) return;
   canvas.focus();
   const { x, y } = canvasCoords(ev.clientX, ev.clientY);
-  wsSend({ type: 'human_click', x, y, button: ev.button === 2 ? 'right' : 'left', click_count: ev.detail || 1 });
+  wsSend({ type: 'human_click', x, y, nx: x, ny: y, button: ev.button === 2 ? 'right' : 'left', click_count: ev.detail || 1 });
 });
 
 canvas.addEventListener(

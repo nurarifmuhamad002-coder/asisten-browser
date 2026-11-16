@@ -2271,9 +2271,35 @@ class CloudBrowserEngine:
         px = max(0, min(self.VIEWPORT_WIDTH - 1, int(round(x))))
         py = max(0, min(self.VIEWPORT_HEIGHT - 1, int(round(y))))
         btn = button if button in ("left", "right", "middle") else "left"
-        await self.page.mouse.click(px, py, button=btn, click_count=click_count)
+        # Gerakkan kursor dulu, baru tekan-lepas dengan jeda kecil.
+        # reCAPTCHA/Cloudflare menolak klik "instan" tanpa pergerakan kursor.
+        try:
+            await self.page.mouse.move(px, py, steps=6)
+            await asyncio.sleep(0.06)
+        except Exception:
+            pass
+        await self.page.mouse.down(button=btn, click_count=click_count)
+        await asyncio.sleep(0.07)
+        await self.page.mouse.up(button=btn, click_count=click_count)
         await asyncio.sleep(0.12)
         await self.refresh_frame()
+
+    async def human_click_norm(
+        self, nx: float, ny: float, button: str = "left", click_count: int = 1
+    ) -> None:
+        """Klik dari CCTV memakai posisi RELATIF (0..1) lalu dipetakan ke viewport asli.
+
+        Ini memperbaiki bug lama: frontend mengirim piksel canvas 1280x800 sementara
+        viewport Chromium 800x600, sehingga klik selalu meleset (checkbox reCAPTCHA
+        "I'm not a robot" tidak pernah kena).
+        """
+        if not self.page:
+            return
+        fx = min(1.0, max(0.0, float(nx)))
+        fy = min(1.0, max(0.0, float(ny)))
+        px = int(round(fx * (self.VIEWPORT_WIDTH - 1)))
+        py = int(round(fy * (self.VIEWPORT_HEIGHT - 1)))
+        await self.human_click(px, py, button=button, click_count=click_count)
 
     async def human_wheel(self, dx: float, dy: float) -> None:
         if not self.page:

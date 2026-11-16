@@ -2807,6 +2807,85 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(32, "Tahap 20: Web Control — Upload & Download File", True, "Kemampuan upload yang sebelumnya TIDAK ADA kini tersedia: pasang file workspace ke <input type=file> (termasuk yang tersembunyi), lapor jujur kalau file tidak ada. Download kini ditunggu sampai benar-benar tersimpan. Aksi ini juga dikenalkan ke AI agar tidak memakai klik biasa. Diuji dengan server HTTP nyata.")
 
+        # =====================================================================
+        # 33. TAHAP 21: FIX KLIK CCTV (canvas 1280x800 vs viewport 800x600)
+        # =====================================================================
+        src33_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        src33_main = (ROOT / "main.py").read_text(encoding="utf-8")
+        src33_be = (ROOT / "agent" / "browser_engine.py").read_text(encoding="utf-8")
+        src33_html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
+        # 33a. Frontend WAJIB mengirim koordinat relatif, bukan piksel canvas
+        assert "nx" in src33_js and "ny" in src33_js, "Frontend wajib mengirim nx/ny relatif"
+        assert "relatif" in src33_js.lower(), (
+            "Harus ada penjelasan bahwa koordinat dikirim relatif 0..1"
+        )
+        assert "Math.min(1" in src33_js, "Koordinat wajib di-clamp ke 0..1"
+
+        # 33b. Backend wajib punya jalur baru human_click_norm
+        assert "human_click_norm" in src33_main, "Handler WS wajib memakai human_click_norm"
+        assert "human_click_norm" in src33_be, "Engine wajib punya human_click_norm"
+
+        # 33c. Klik harus menyerupai manusia (gerak kursor + tekan/lepas terpisah)
+        assert "mouse.move" in src33_be, "Klik wajib menggerakkan kursor dulu"
+        assert "mouse.down" in src33_be and "mouse.up" in src33_be, (
+            "Klik wajib tekan & lepas terpisah (reCAPTCHA menolak klik instan)"
+        )
+
+        # 33d. BUKTI HIDUP: klik relatif TEPAT ke sasaran, klik skala canvas MELESET
+        from agent.browser_engine import CloudBrowserEngine as _CBE33
+        from agent.file_manager import WorkspaceFileManager as _WFM33
+        import pathlib as _pl33
+
+        _html33 = (
+            "<!doctype html><html><body style='margin:0'>"
+            "<div id='target' style='position:absolute;left:100px;top:100px;"
+            "width:40px;height:40px;background:red' "
+            "onclick=\"document.getElementById('out').innerText='KENA'\"></div>"
+            "<div id='out' style='position:absolute;left:10px;top:300px'></div>"
+            "</body></html>"
+        )
+        _d33 = tmp_dir / "click33"
+        _d33.mkdir(parents=True, exist_ok=True)
+        _f33 = _d33 / "t.html"
+        _f33.write_text(_html33, encoding="utf-8")
+
+        async def _bc33(ev: Any) -> None:
+            return None
+
+        _be33 = _CBE33(
+            file_manager=_WFM33(base_dir=str(_d33), allow_writes=True),
+            broadcast_cb=_bc33, profile_dir=str(_d33), allow_writes=True,
+        )
+        try:
+            await _be33.ensure_alive()
+            await _be33.page.goto(f"file://{_f33}")
+            await asyncio.sleep(0.4)
+            assert (_be33.VIEWPORT_WIDTH, _be33.VIEWPORT_HEIGHT) == (800, 600), "Viewport engine 800x600"
+
+            # Klik pusat kotak (120,120) memakai koordinat RELATIF (cara baru)
+            await _be33.human_click_norm(120 / 800, 120 / 600)
+            await asyncio.sleep(0.4)
+            _hit33 = await _be33.page.locator("#out").inner_text()
+            assert _hit33 == "KENA", (
+                f"Klik relatif WAJIB tepat sasaran (bug lama: meleset 1.6x), dapat: {_hit33!r}"
+            )
+
+            # Klik memakai skala canvas 1280x800 (cara lama) -> wajib MELESET
+            await _be33.page.reload()
+            await asyncio.sleep(0.4)
+            await _be33.human_click((120 / 800) * 1280, (120 / 600) * 800)
+            await asyncio.sleep(0.4)
+            _miss33 = await _be33.page.locator("#out").inner_text()
+            assert _miss33 != "KENA", (
+                "Klik skala canvas seharusnya meleset — kalau kena, bug lama tidak tereproduksi"
+            )
+        finally:
+            await _be33.stop()
+
+        record(33, "Tahap 21: Fix Klik CCTV (checkbox reCAPTCHA tidak bisa disentuh)", True, "AKAR MASALAH: canvas CCTV 1280x800 sementara viewport Chromium 800x600, jadi setiap klik dari HP mendarat 1.6x terlalu kanan & 1.33x terlalu bawah — checkbox 'I'm not a robot' tidak pernah kena. Kini frontend kirim koordinat relatif 0..1, backend memetakan ke viewport asli, plus gerak kursor & tekan-lepas terpisah agar menyerupai manusia.")
+
+
 
 
 

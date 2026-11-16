@@ -3042,6 +3042,94 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         except Exception as exc:
             record(35, "Tahap 23: WaroengProxy — Kode Akun Bertanda Hubung Ditolak Gateway", False, f"ERROR: {exc}")
 
+        # ============ SUITE 36: Verdict proxy tidak boleh pakai flag `hosting` ============
+        print("\n>>> Tahap 24: Verdict Proxy — Flag hosting ip-api Tidak Bisa Dipercaya")
+        try:
+            from agent.browser_engine import CloudBrowserEngine as _CBE36
+            import asyncio as _aio36
+
+            def _mk36(payload):
+                """Bikin engine tanpa browser; check_exit_ip dipalsukan."""
+                eng = _CBE36.__new__(_CBE36)
+                eng.proxy_config = {"server": "http://proxy.waroengproxy.com:8000"}
+
+                class _Resp:
+                    pass
+
+                class _FakePage:
+                    async def goto(self, *a, **k):
+                        return _Resp()
+
+                    async def inner_text(self, *a, **k):
+                        import json as _j
+                        return _j.dumps(payload)
+
+                eng.page = _FakePage()
+                eng.ensure_alive = lambda: _aio36.sleep(0)
+                return eng
+
+            # --- A. Kasus nyata hari ini: IP rumahan Indonesia yang ditandai hosting=true ---
+            eng_a = _mk36({
+                "status": "success", "query": "203.83.40.26", "country": "Indonesia",
+                "city": "Sungguminasa", "isp": "PT. Eka Mas Republik",
+                "org": "GWK", "hosting": True,
+            })
+            res_a = await eng_a.check_exit_ip()
+            assert "PROXY TIDAK AKTIF" not in res_a, f"Salah lagi: IP Indonesia dituduh datacenter -> {res_a}"
+            assert "Indonesia" in res_a, res_a
+
+            # --- B. Railway yang ditandai hosting=FALSE tetap harus dianggap datacenter ---
+            eng_b = _mk36({
+                "status": "success", "query": "152.55.180.55", "country": "United States",
+                "city": "Ashburn", "isp": "Railway", "org": "Railway", "hosting": False,
+            })
+            res_b = await eng_b.check_exit_ip()
+            assert "PROXY TIDAK AKTIF" in res_b, f"Railway lolos padahal datacenter -> {res_b}"
+            assert "railway" in res_b.lower(), res_b
+
+            # --- C. Luar negeri tapi bukan datacenter -> jujur bilang bukan Indonesia ---
+            eng_c = _mk36({
+                "status": "success", "query": "103.170.85.127", "country": "India",
+                "city": "New Delhi", "isp": "Anonet Network", "org": "AS132116", "hosting": False,
+            })
+            res_c = await eng_c.check_exit_ip()
+            assert "Bukan Indonesia" in res_c, res_c
+
+            # --- D. Verdict di telegram: Indonesia + hosting=true -> PROXY JALAN ---
+            _low_d = res_a.lower()
+            _is_id_d = "indonesia" in _low_d
+            assert _is_id_d, "Deteksi negara dari teks check_exit_ip gagal"
+
+            _DC_NAMES_D = (
+                "railway", "amazon", "aws", "google cloud", "gcp", "azure",
+                "digitalocean", "linode", "ovh", "hetzner", "vultr",
+                "contabo", "oracle cloud", "alibaba cloud",
+            )
+            assert not any(k in _low_d for k in _DC_NAMES_D), (
+                f"Teks IP Indonesia masih memicu kata datacenter -> {_low_d}"
+            )
+
+            record(
+                36,
+                "Tahap 24: Verdict Proxy — Flag hosting ip-api Tidak Bisa Dipercaya",
+                True,
+                "AKAR MASALAH: ip-api menandai IP rumahan Indonesia 203.83.40.26 "
+                "(PT Eka Mas Republik / MyRepublic, Sungguminasa) sebagai hosting=true, "
+                "sementara IP Railway 152.55.180.55 yang benar-benar server cloud justru "
+                "hosting=false. Bot memakai flag itu untuk verdict, jadi proxy Indonesia "
+                "yang SUDAH JALAN dilaporkan 'PROXY BELUM AKTIF' — user dikira salah pasang "
+                "padahal situs .go.id sudah HTTP 200. Perbaikan: negara jadi penentu utama, "
+                "daftar ISP datacenter dikenal dipakai sebagai cadangan, kata 'hosting' & "
+                "'datacenter' tidak lagi dicocokkan sebagai substring. Diuji 3 kasus: "
+                "Indonesia+hosting=true -> tidak dituduh datacenter; Railway+hosting=false "
+                "-> tetap ditandai datacenter; India -> jujur 'Bukan Indonesia'.",
+            )
+        except AssertionError as exc:
+            record(36, "Tahap 24: Verdict Proxy — Flag hosting ip-api Tidak Bisa Dipercaya", False, str(exc))
+        except Exception as exc:
+            record(36, "Tahap 24: Verdict Proxy — Flag hosting ip-api Tidak Bisa Dipercaya", False, f"ERROR: {exc}")
+
+
 
 
 

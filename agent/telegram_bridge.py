@@ -1385,17 +1385,33 @@ class TelegramBotBridge:
                 ip_now = await self.orchestrator.browser.check_exit_ip()
                 px_stat = self.orchestrator.browser.proxy_summary()
                 _low_ip = (ip_now or "").lower()
+                # NEGARA adalah penentu utama. Daftar ISP datacenter hanya dipakai
+                # sebagai cadangan, dan kata "hosting"/"datacenter" TIDAK lagi dicocokkan
+                # karena ip-api memberi flag hosting=false untuk Railway dan
+                # hosting=true untuk IP rumahan MyRepublic Indonesia.
                 _is_id = "indonesia" in _low_ip
-                _is_dc = any(k in _low_ip for k in ("railway", "amazon", "aws", "google", "azure", "hosting", "datacenter", "digitalocean", "ovh", "hetzner"))
-                if _is_id and not _is_dc:
+                _DC_NAMES = (
+                    "railway", "amazon", "aws", "google cloud", "gcp", "azure",
+                    "digitalocean", "linode", "ovh", "hetzner", "vultr",
+                    "contabo", "oracle cloud", "alibaba cloud",
+                )
+                _dc_hit = next((k for k in _DC_NAMES if k in _low_ip), "")
+                _proxy_on = bool(getattr(self.orchestrator.browser, "proxy_config", None))
+                if _is_id:
                     _verdict = (
                         "✅ PROXY JALAN — IP Indonesia terdeteksi.\n"
                         "Web .go.id (termasuk All Indonesia) harusnya bisa dibuka."
                     )
-                else:
+                elif _dc_hit or not _proxy_on:
                     _verdict = (
                         "❌ PROXY BELUM AKTIF — IP lu masih server luar/datacenter.\n"
                         "Situs .go.id seperti All Indonesia AKAN TETAP DITOLAK (403) sampai proxy Indonesia terpasang."
+                    )
+                else:
+                    _verdict = (
+                        "⚠️ PROXY AKTIF TAPI BUKAN INDONESIA — IP keluar di luar Indonesia.\n"
+                        "Ganti kode proxy dengan yang dikunci Indonesia, contoh:\n"
+                        "  `/proxy host:port:user-cc-ID-s-sesi1-ttl-3600:pass`"
                     )
                 msg_px = (
                     "🇮🇩 STATUS JALUR IP BROWSER:\n\n"

@@ -298,17 +298,42 @@ class CloudBrowserEngine:
                     isp = data.get("isp") or "?"
                     org = data.get("org") or ""
                     is_hosting = bool(data.get("hosting"))
+                    country_l = (country or "").lower()
+                    org_l = f"{isp or ''} {org or ''}".lower()
+
+                    # Provider datacenter yang benar-benar dikenal. Sengaja DIBATASI ke
+                    # daftar ini, bukan flag `hosting` dari ip-api.
+                    #
+                    # KENAPA: flag `hosting` ip-api TERBUKTI TIDAK BISA DIPERCAYA.
+                    # IP rumahan Indonesia 203.83.40.26 (PT Eka Mas Republik /
+                    # MyRepublic, Sungguminasa) ditandai hosting=true, sementara IP
+                    # Railway 152.55.180.55 yang benar-benar server cloud justru
+                    # hosting=false. Memakai flag itu membuat bot salah menyimpulkan
+                    # "proxy belum aktif" padahal IP-nya sudah Indonesia.
+                    KNOWN_DC = (
+                        "railway", "amazon", "aws", "google cloud", "gcp", "azure",
+                        "digitalocean", "linode", "ovh", "hetzner", "vultr",
+                        "contabo", "oracle cloud", "alibaba cloud", "cloudflare",
+                    )
+                    known_dc_hit = next((k for k in KNOWN_DC if k in org_l), "")
+                    is_indonesia = country_l in ("indonesia", "id") or "indonesia" in country_l
+
                     base = f"{ip} ({country} · {city} · {isp})"
-                    # Proxy dipasang tapi masih hosting -> proxy mati / gagal
-                    if self.proxy_config and is_hosting:
-                        return (
-                            f"{base} — ⚠️ PROXY TIDAK AKTIF "
-                            "(IP masih datacenter, jadi situs .go.id akan tetap menolak). "
-                            "Cek kode/kuota proxy lalu pasang ulang lewat /proxy."
-                        )
-                    if is_hosting:
+                    if is_indonesia:
+                        # IP Indonesia = tujuan tercapai. Flag hosting diabaikan.
+                        note = ""
+                        if is_hosting and not known_dc_hit:
+                            note = " — ℹ️ ip-api menandai IP ini 'hosting', tapi ISP-nya operator rumahan Indonesia jadi itu false positive."
+                        return f"{base}{note}"
+                    if known_dc_hit:
+                        if self.proxy_config:
+                            return (
+                                f"{base} — ⚠️ PROXY TIDAK AKTIF "
+                                f"(IP masih {known_dc_hit} = datacenter, jadi situs .go.id akan tetap menolak). "
+                                "Cek kuota proxy lalu pasang ulang lewat /proxy."
+                            )
                         return f"{base} — ⚠️ IP datacenter (banyak situs .go.id memblokir ini). Pasang proxy Indonesia lewat /proxy."
-                    return base
+                    return f"{base} — ⚠️ Bukan Indonesia. Situs .go.id akan menolak. Pasang proxy Indonesia lewat /proxy."
         except Exception as exc:
             return f"Gagal mengecek IP lewat proxy ({str(exc)[:70]}) — pastikan kode/kuota proxy aktif!"
         return "IP tidak terdeteksi"

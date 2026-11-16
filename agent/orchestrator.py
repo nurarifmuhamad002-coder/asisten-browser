@@ -1758,6 +1758,149 @@ class AgentOrchestrator:
             except Exception as exc:
                 return f"❌ Gagal mengolah PDF: {str(exc)[:160]}"
 
+        # ================== SURAT BARU RAPI DARI DATA (KTP / FORM) ==================
+        if act_name in ("build_letter", "buat_surat", "build_valas_statement"):
+            from agent import letter_builder as _lb
+            from agent import pdf_editor as _pe
+
+            def _parse_nik_block(text: str) -> dict:
+                """Ambil pasangan 'Kunci : Nilai' dari teks bebas (hasil OCR KTP)."""
+                import re as _re
+                out = {}
+                keymap = {
+                    "NIK": "NIK", "NAMA": "Nama",
+                    "TEMPAT/TGL LAHIR": "Tempat/Tgl Lahir",
+                    "TEMPAT TGL LAHIR": "Tempat/Tgl Lahir",
+                    "JENIS KELAMIN": "Jenis Kelamin",
+                    "ALAMAT": "Alamat", "RT/RW": "RT/RW",
+                    "KELURAHAN/DESA": "Kelurahan/Desa", "KEL/DESA": "Kelurahan/Desa",
+                    "KECAMATAN": "Kecamatan", "AGAMA": "Agama",
+                    "PEKERJAAN": "Pekerjaan",
+                    "KEWARGANEGARAAN": "Kewarganegaraan",
+                    "BERLAKU HINGGA": "Berlaku Hingga",
+                    "GOLONGAN DARAH": "Golongan Darah",
+                    "STATUS PERKAWINAN": "Status Perkawinan",
+                }
+                for line in text.splitlines():
+                    ln = line.strip().lstrip("•-*").strip()
+                    if ":" not in ln:
+                        continue
+                    k, _, v = ln.partition(":")
+                    k_norm = _re.sub(r"[*_\s]+", " ", k).strip().upper()
+                    v = v.strip().strip("*").strip()
+                    for ck, canon in keymap.items():
+                        if k_norm == ck or k_norm.startswith(ck):
+                            if v and canon not in out:
+                                out[canon] = v
+                            break
+                return out
+            try:
+                dest_name = str(action.get("output") or action.get("filename") or "").strip()
+                if not dest_name:
+                    dest_name = "Surat_Pernyataan.pdf"
+                if not dest_name.lower().endswith(".pdf"):
+                    dest_name += ".pdf"
+                out_path = self.file_manager._safe_path(dest_name)
+
+                # Kumpulkan data: bisa dari dict langsung, atau dari file yang sudah dibaca
+                raw_data = action.get("data") or action.get("ktp") or {}
+                if not raw_data:
+                    src_know = action.get("source_file") or action.get("from_file") or ""
+                    if src_know:
+                        memo_key = f"ocr_{src_know}"
+                        blob = self.memory_notes.get(memo_key) or self.memory_notes.get(str(src_know)) or ""
+                        if blob:
+                            raw_data = _parse_nik_block(blob)
+                    # fallback: cari di memori mana pun yang punya NIK
+                    if not raw_data:
+                        for k, v in self.memory_notes.items():
+                            if isinstance(v, str) and "NIK" in v.upper():
+                                raw_data = _parse_nik_block(v)
+                                if raw_data:
+                                    break
+                if isinstance(raw_data, list):
+                    raw_data = {str(i): x for i, x in enumerate(raw_data)}
+
+
+                if raw_data:
+                    is_valas = bool(
+                        action.get("nilai") or action.get("kurs") or action.get("bank")
+                        or "valas" in str(action.get("template", "")).lower()
+                        or bool(action.get("valas"))
+                    )
+                    if is_valas:
+                        res = _lb.build_valas_statement(
+                            out_path,
+                            raw_data,
+                            nilai=str(action.get("nilai") or ""),
+                            kurs=str(action.get("kurs") or ""),
+                            mata_uang=str(action.get("mata_uang") or "USD"),
+                            bank=str(action.get("bank") or ""),
+                            rekening=str(action.get("rekening") or ""),
+                            kota=str(action.get("kota") or ""),
+                            tanggal=action.get("tanggal") or None,
+                            nomor=str(action.get("nomor") or ""),
+                            page_format=str(action.get("page_format") or "a4"),
+                            extra_rows=[
+                                (str(k), str(v))
+                                for k, v in (action.get("extra_rows") or {}).items()
+                            ] if isinstance(action.get("extra_rows"), dict) else None,
+                        )
+                    else:
+                        rows = [(str(k), str(v)) for k, v in raw_data.items()]
+                        res = _lb.build_letter(
+                            out_path,
+                            title=str(action.get("title") or "SURAT KETERANGAN"),
+                            kop_nama=str(action.get("kop_nama") or ""),
+                            kop_alamat=str(action.get("kop_alamat") or ""),
+                            nomor=str(action.get("nomor") or ""),
+                            data=rows,
+                            pembuka=str(action.get("pembuka") or ""),
+                            penutup=str(action.get("penutup") or ""),
+                            kota=str(action.get("kota") or ""),
+                            tanggal=action.get("tanggal") or None,
+                            jabatan_ttd=str(action.get("jabatan_ttd") or ""),
+                            nama_ttd=str(action.get("nama_ttd") or raw_data.get("Nama") or ""),
+                            catatan=str(action.get("catatan") or ""),
+                            page_format=str(action.get("page_format") or "a4"),
+                        )
+                else:
+                    return (
+                        "❌ Tidak ada data untuk dijadikan surat. Baca dulu file KTP-nya "
+                        "(aksi pdf_ocr) atau kirim datanya langsung."
+                    )
+
+                if dest_name not in self._created_files_this_run:
+                    self._created_files_this_run.append(dest_name)
+                await self.broadcast({"type": "files_updated", "files": self.file_manager.list_files()})
+
+                # === BUKTI VISUAL: render halaman 1 dan kirim ke Telegram ===
+                preview_ok = False
+                try:
+                    png = _pe._render_pdf_page_png(out_path, 1, dpi=130)
+                    import base64 as _b64
+                    if self.telegram and hasattr(self.telegram, "send_photo_b64"):
+                        await self.telegram.send_photo_b64(
+                            self.telegram.active_chat_ids[0] if self.telegram.active_chat_ids else 0,
+                            _b64.b64encode(png).decode(),
+                            f"👁️ Preview surat: {dest_name} — cek dulu, kalau ada yang salah bilang.",
+                        )
+                        preview_ok = True
+                except Exception:
+                    preview_ok = False
+
+                if self.telegram and "/" not in dest_name:
+                    await self.telegram.notify_file(dest_name, out_path.read_bytes())
+
+                return (
+                    f"✅ Surat dibuat RAPI: '{res['file']}' ({res['rows']} baris data, "
+                    f"{res['size_bytes']} bytes, 1 halaman). "
+                    + ("Preview gambar sudah dikirim ke user. " if preview_ok else "")
+                    + "FILE INI NYATA DAN SUDAH ADA DI DISK — boleh dikatakan siap."
+                )
+            except Exception as exc:
+                return f"❌ Gagal membuat surat: {str(exc)[:180]}"
+
         if act_name in ("delete_file", "remove_file"):
             fname = str(action.get("filename") or action.get("path") or "").strip()
             if not fname:

@@ -3399,6 +3399,153 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         except Exception as exc:
             record(38, "Tahap 26: OCR — Membaca PDF Hasil Scan (Tesseract + Bahasa Indonesia)", False, f"ERROR: {exc}")
 
+        # ============ SUITE 39: Surat baru rapi dari data KTP (anti-tempel) ============
+        print("\n>>> Tahap 27: Build Letter — Surat Baru Rapi dari Data KTP")
+        try:
+            import os as _os39, tempfile as _tf39
+            from agent import letter_builder as _lb39
+            from agent.pdf_editor import page_count as _pc39, read_page_text as _prt39, _render_pdf_page_png as _rnd39
+
+            _ocr39 = (
+                "DATA KTP\n"
+                "NIK : 3275062810910019\n"
+                "Nama : MUHAMMAD DHIYAA EL HAQ\n"
+                "Tempat/Tgl Lahir : BEKASI, 28-10-1991\n"
+                "Jenis Kelamin : LAKI-LAKI\n"
+                "Alamat : KP. GAGA PERMAI, RT/RW 005/002\n"
+                "Kelurahan/Desa : CILUTER\n"
+                "Kecamatan : MEDAN SATRIA\n"
+                "Agama : ISLAM\n"
+                "Pekerjaan : KARYAWAN SWASTA\n"
+            )
+            _d39 = _tf39.mkdtemp()
+
+            # ---------- A. Surat terbangun & isinya benar ----------
+            _ktp39 = {
+                "NIK": "3275062810910019", "Nama": "MUHAMMAD DHIYAA EL HAQ",
+                "Tempat/Tgl Lahir": "BEKASI, 28-10-1991", "Jenis Kelamin": "LAKI-LAKI",
+                "Alamat": "KP. GAGA PERMAI, RT/RW 005/002", "Kelurahan/Desa": "CILUTER",
+                "Kecamatan": "MEDAN SATRIA", "Agama": "ISLAM",
+                "Pekerjaan": "KARYAWAN SWASTA",
+            }
+            _out39 = _os39.path.join(_d39, "Surat_Valas.pdf")
+            _res39 = _lb39.build_valas_statement(
+                _out39, _ktp39, nilai="IDR 250.000.000", kurs="16.250",
+                mata_uang="USD", bank="PT BANK CENTRAL ASIA", rekening="1234567890",
+                kota="BEKASI", tanggal="16 November 2026", nomor="001/SPJBV/XI/2026",
+            )
+            assert _os39.path.exists(_out39) and _os39.path.getsize(_out39) > 1000, _res39
+            assert _pc39(_out39) == 1, f"surat harus 1 halaman, dapat {_pc39(_out39)}"
+
+            _t39 = _prt39(_out39, 1)["text"]
+            for _w39 in ("MUHAMMAD DHIYAA EL HAQ", "3275062810910019", "BEKASI",
+                         "CILUTER", "MEDAN SATRIA", "250.000.000", "16.250",
+                         "PT BANK CENTRAL ASIA", "16 November 2026"):
+                assert _w39 in _t39, f"'{_w39}' tidak ada di surat -> {_t39[:300]!r}"
+
+            # ---------- B. Anti-bug mata uang dobel (IDR ... USD) ----------
+            assert "IDR 250.000.000 USD" not in _t39, "mata uang dobel: 'IDR 250.000.000 USD'"
+            _out39b = _os39.path.join(_d39, "ccy.pdf")
+            _lb39.build_valas_statement(_out39b, {"Nama": "X"}, nilai="250.000.000",
+                                        kurs="16.250", mata_uang="USD")
+            _t39b = _prt39(_out39b, 1)["text"]
+            assert "USD 250.000.000" in _t39b, f"nilai tanpa kode mata uang harus diberi awalan USD -> {_t39b[:200]!r}"
+
+            # ---------- C. Teks panjang TIDAK keluar halaman (wrap benar) ----------
+            _panjang39 = "KP. GAGA PERMAI, RT/RW 005/002, KELURAHAN CILUTER, KECAMATAN MEDAN SATRIA, KOTA BEKASI, JAWA BARAT, KODE POS 17132, INDONESIA"
+            _out39c = _os39.path.join(_d39, "panjang.pdf")
+            _lb39.build_letter(
+                _out39c, title="SURAT KETERANGAN",
+                data=[("Alamat Lengkap", _panjang39), ("Catatan", "A" * 400)],
+                nama_ttd="PEMOHON",
+            )
+            assert _pc39(_out39c) == 1, "teks panjang tidak boleh meluber jadi halaman baru tanpa sebab"
+            _t39c = _prt39(_out39c, 1)["text"]
+            assert "INDONESIA" in _t39c, "ujung alamat panjang terpotong -> wrap gagal"
+            import re as _re39
+            _aruns39 = [len(x) for x in _re39.findall(r"A{10,}", _t39c)]
+            assert sum(_aruns39) >= 390, (
+                f"catatan 400 karakter harus utuh setelah di-wrap, total 'A' terbaca {sum(_aruns39)}"
+            )
+            assert max(_aruns39) < 100, "wrap gagal: satu baris kepanjangan"
+
+            # ---------- D. Dari teks OCR -> surat, lewat orchestrator asli ----------
+            from agent.orchestrator import AgentOrchestrator as _AO39
+            from agent.file_manager import WorkspaceFileManager as _WFM39
+
+            async def _run39():
+                _o = _AO39.__new__(_AO39)
+                _o.file_manager = _WFM39(base_dir=_d39)
+                _o._created_files_this_run = []
+                _o._created_top_dirs = []
+                _o.memory_notes = {"ocr_ktp.jpg": _ocr39}
+                _o.telegram = None
+                _sent = []
+
+                async def _push(r, t, m=None):
+                    return None
+
+                async def _bc(p):
+                    return None
+
+                _o._push_chat = _push
+                _o.broadcast = _bc
+                _r = await _o._execute_with_guardrails(1, {
+                    "name": "build_letter",
+                    "output": "Surat_Dari_KTP.pdf",
+                    "source_file": "ktp.jpg",
+                    "nilai": "IDR 250.000.000", "kurs": "16.250", "mata_uang": "USD",
+                    "kota": "BEKASI", "tanggal": "16 November 2026",
+                    "nomor": "001/SPJBV/XI/2026",
+                }, {"elements": []})
+                return _r, _o.file_manager._safe_path("Surat_Dari_KTP.pdf")
+
+            _ret39, _path39 = await _run39()
+            assert _ret39.startswith("✅"), _ret39
+            assert _path39.exists(), "surat dari OCR harus benar-benar ada di disk"
+            _t39d = _prt39(_path39, 1)["text"]
+            # data harus diambil OTOMATIS dari memori OCR, bukan dari AI
+            assert "3275062810910019" in _t39d, f"NIK tidak terambil dari OCR -> {_t39d[:300]!r}"
+            assert "MUHAMMAD DHIYAA EL HAQ" in _t39d
+            assert "CILUTER" in _t39d
+
+            # ---------- E. Bukti visual bisa dirender (kirim ke Telegram) ----------
+            _png39 = _rnd39(_path39, 1, dpi=100)
+            assert len(_png39) > 5000, "render preview gagal"
+            assert _png39[:4] == b"\x89PNG", "preview bukan PNG valid"
+
+            # ---------- F. Prompt AI: build_letter wajib dikenal ----------
+            import agent.llm_providers as _lp39, inspect as _insp39
+            _psrc39 = _insp39.getsource(_lp39)
+            assert "build_letter" in _psrc39, "aksi build_letter tidak dikenalkan ke AI"
+            assert "JANGAN memakai pdf_write_text untuk membuat surat baru" in _psrc39, (
+                "aturan anti-tempel tidak ada di prompt"
+            )
+
+            record(
+                39,
+                "Tahap 27: Build Letter — Surat Baru Rapi dari Data KTP (anti-tempel)",
+                True,
+                "MASALAH ASLI: user minta 'masukan ke pdf yang tadi'. Bot memakai pdf_write_text "
+                "yang menempelkan SEMUA data di satu titik default (x=60, y=760) — persis di kop "
+                "surat — tanpa text wrapping, sehingga teks panjang keluar tepi halaman. Hasilnya "
+                "rusak total, tapi bot tetap melaporkan '3 langkah berhasil, 0 gagal' karena tidak "
+                "pernah melihat hasilnya sendiri. Perbaikan: modul agent/letter_builder.py membuat "
+                "DOKUMEN BARU yang tersusun rapi dengan reportlab platypus — judul, nomor, tabel "
+                "label-nilai (wrap otomatis sesuai lebar kolom), paragraf justify, dan blok tanda "
+                "tangan. Aksi build_letter mengambil data KTP OTOMATIS dari memori hasil OCR "
+                "(bukan dari tebakan AI), mendukung template Surat Pernyataan Jual Beli Valas, dan "
+                "mengirim preview PNG ke Telegram supaya user bisa memeriksa sebelum percaya. "
+                "Prompt AI melarang pdf_write_text untuk membuat surat baru. Terbukti: data KTP "
+                "NIK 3275062810910019 terbaca & tercetak benar, alamat panjang di-wrap tanpa "
+                "terpotong, catatan 400 karakter utuh, dan bug 'IDR 250.000.000 USD' diperbaiki.",
+            )
+        except AssertionError as exc:
+            record(39, "Tahap 27: Build Letter — Surat Baru Rapi dari Data KTP (anti-tempel)", False, str(exc))
+        except Exception as exc:
+            record(39, "Tahap 27: Build Letter — Surat Baru Rapi dari Data KTP (anti-tempel)", False, f"ERROR: {exc}")
+
+
 
 
 

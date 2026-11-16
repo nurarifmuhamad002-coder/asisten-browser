@@ -80,6 +80,7 @@ class TelegramBotBridge:
             if allow_writes is None:
                 allow_writes = True
 
+        self._sec_dir: str = str(sec_dir)
         self.allow_writes: bool = bool(allow_writes)
         self.write_block_reason: str = (
             write_block_reason
@@ -1134,6 +1135,240 @@ class TelegramBotBridge:
                 reply_markup=MAIN_MENU_KB,
             )
             return
+
+        # ============================================================== #
+        # WAROENGPROXY — kelola akun proxy langsung dari Telegram
+        # (tanpa dashboard, tanpa token yang bisa hilang)
+        # ============================================================== #
+        if low.startswith("/wx"):
+            from agent.waroengproxy import (
+                WaroengProxy,
+                WaroengProxyError,
+                format_rupiah,
+                render_qris_png,
+            )
+
+            sec_dir = getattr(self, "_sec_dir", None) or os.getenv("BROWSER_PROFILE_DIR", "") or "/data"
+
+            def _wx():
+                return WaroengProxy(sec_dir)
+
+            _WX_HELP = (
+                "🧩 **WaroengProxy — kontrol penuh dari sini**\n\n"
+                "`/wx` — ringkasan saldo & kuota GB\n"
+                "`/wxkey <API_KEY>` — simpan API key (sekali, aman)\n"
+                "`/wxtoken <TOKEN>` — simpan token akses (sekali)\n"
+                "`/wxbeli <GB>` — tukar saldo jadi kuota\n"
+                "`/wxdepo <nominal>` — tagihan QRIS (min Rp10.000)\n"
+                "`/wxpasang` — ambil password + langsung pasang proxy\n"
+                "`/wxcek` — status deposit & IP keluar\n\n"
+                "💡 API key dibuat di dashboard menu **Akses API**. "
+                "Setelah disimpan, password proxy nggak perlu lu ingat lagi."
+            )
+
+            try:
+                arg = text[len("/wx"):].strip()
+                sub, _, rest = arg.partition(" ")
+                sub = sub.lower().strip()
+                rest = rest.strip()
+
+                # ---------- /wxkey ----------
+                if sub == "key":
+                    if not rest:
+                        await self.send_text(chat_id, "Format: `/wxkey wxk_live_xxxxxxxx`")
+                        return
+                    _wx().save_api_key(rest)
+                    try:
+                        await self._delete_msg(chat_id, msg_id)
+                    except Exception:
+                        pass
+                    info = _wx().snapshot()
+                    await self.send_text(
+                        chat_id,
+                        "✅ API key tersimpan di volume `/data`. Pesan berisi key-nya udah gua hapus.\n\n"
+                        f"Saldo: **{format_rupiah(info.get('balance'))}**\n"
+                        f"Kuota sisa: **{info.get('gb_left')} GB**",
+                    )
+                    return
+
+                # ---------- /wxtoken ----------
+                if sub == "token":
+                    if not rest:
+                        await self.send_text(
+                            chat_id,
+                            "Format: `/wxtoken TOKEN_AKSES_LU`\n\n"
+                            "Token ini yang dipakai login ke dashboard. Gua simpan di volume "
+                            "`/data` biar nggak ilang lagi kayak kemarin.",
+                        )
+                        return
+                    _wx().save_token(rest)
+                    try:
+                        await self._delete_msg(chat_id, msg_id)
+                    except Exception:
+                        pass
+                    await self.send_text(
+                        chat_id,
+                        "✅ Token akses tersimpan permanen di volume `/data`. Pesan berisi tokennya udah gua hapus.",
+                    )
+                    return
+
+                # ---------- /wxpasang (ambil kredensial + langsung pasang) ----------
+                if sub in ("pasang", "install", "pakai"):
+                    client = _wx()
+                    code = client.ready_proxy_code()
+                    res = await self.orchestrator.browser.configure_proxy(code)
+                    ip_info = res.get("ip_info") or "?"
+
+                    used = res.get("username") or ""
+                    await self.send_text(
+                        chat_id,
+                        "🔌 **Proxy WaroengProxy dipasang otomatis**\n\n"
+                        "Kredensial diambil langsung dari API mereka — nggak perlu "
+                        "lu salin password manual.\n\n"
+                        f"🌍 IP keluar: `{ip_info}`\n"
+                        f"🏷️ Sesi: `{used}`",
+                    )
+                    if "Indonesia" in ip_info or "ID ·" in ip_info:
+                        await self.send_text(
+                            chat_id,
+                            "✅ **PROXY JALAN.** Coba lagi buka situs .go.id sekarang — "
+                            "403 CloudFront-nya harusnya udah hilang.",
+                        )
+                    else:
+                        await self.send_text(
+                            chat_id,
+                            "⚠️ Proxy terpasang tapi IP keluar belum Indonesia. "
+                            "Pakai `/wx` buat cek kuota — kalau 0 GB, lu harus beli dulu.",
+                        )
+                    return
+
+                # ---------- /wxbeli ----------
+                if sub in ("beli", "buy", "gb"):
+                    if not rest:
+                        await self.send_text(chat_id, "Format: `/wxbeli 1` (harga Rp10.000/GB)")
+                        return
+                    try:
+                        gb = float(rest.replace(",", "."))
+                    except ValueError:
+                        await self.send_text(chat_id, "❌ Jumlah GB harus angka. Contoh: `/wxbeli 1`")
+                        return
+                    client = _wx()
+                    try:
+                        res = client.buy_gb(gb)
+                    except WaroengProxyError as exc:
+                        msg = str(exc)
+                        if "402" in msg or "Saldo kurang" in msg:
+                            await self.send_text(
+                                chat_id,
+                                f"💸 {msg}\n\n"
+                                "Isi saldo dulu pakai `/wxdepo 10000` — gua kirim QRIS-nya ke sini.",
+                            )
+                        else:
+                            await self.send_text(chat_id, f"❌ Gagal beli GB: {msg}")
+                        return
+                    await self.send_text(
+                        chat_id,
+                        "✅ **Kuota kebeli.**\n\n"
+                        f"+{res.get('gb_added')} GB · kepotong {format_rupiah(res.get('charged'))}\n"
+                        f"Saldo sisa: **{format_rupiah(res.get('balance'))}**\n\n"
+                        "Lanjut `/wxpasang` biar proxy langsung nyala.",
+                    )
+                    return
+
+                # ---------- /wxdepo ----------
+                if sub in ("depo", "deposit", "topup", "isi"):
+                    amount = 10000
+                    if rest:
+                        try:
+                            amount = int(re.sub(r"[^\d]", "", rest) or "10000")
+                        except ValueError:
+                            amount = 10000
+                    if amount < 10000:
+                        await self.send_text(chat_id, "❌ Deposit minimal Rp10.000.")
+                        return
+                    dep = _wx().create_qris_deposit(amount)
+                    pay_url = dep.get("pay_url") or ""
+                    qr_payload = dep.get("qris") or ""
+                    caption = (
+                        f"💳 **Tagihan QRIS {format_rupiah(amount)}**\n\n"
+                        f"ID: `{dep.get('id')}`\n"
+                        "Scan pakai e-wallet / m-banking apa pun.\n"
+                        "Berlaku **30 menit**.\n\n"
+                        "Habis bayar, saldo masuk otomatis. Cek pakai `/wx`."
+                    )
+                    qr_path = render_qris_png(
+                        qr_payload or pay_url, os.path.join("/tmp", f"qris_{dep.get('id')}.png")
+                    )
+                    if qr_path and Path(qr_path).exists():
+                        try:
+                            _qr_b64 = base64.b64encode(Path(qr_path).read_bytes()).decode()
+                            await self.send_photo_b64(chat_id, _qr_b64, caption)
+                            return
+                        except Exception:
+                            pass
+                    await self.send_text(chat_id, caption + (f"\n\n🔗 {pay_url}" if pay_url else ""))
+                    return
+
+                # ---------- /wxcek ----------
+                if sub in ("cek", "status", "check"):
+                    client = _wx()
+                    deps = client.deposits()[:3]
+                    lines = ["🧾 **Deposit terakhir**\n"]
+                    for d in deps:
+                        status_icon = {"paid": "✅", "pending": "⏳", "expired": "⌛", "cancelled": "❌"}.get(
+                            str(d.get("status")), "•"
+                        )
+                        lines.append(
+                            f"{status_icon} `{d.get('id')}` · {format_rupiah(d.get('amount'))} · {d.get('status')}"
+                        )
+                    if not deps:
+                        lines.append("Belum ada deposit.")
+                    try:
+                        ip_info = await self.orchestrator.browser.check_exit_ip()
+                    except Exception:
+                        ip_info = "tidak dicek"
+                    lines.append(f"\n🌍 IP keluar sekarang: `{ip_info}`")
+                    await self.send_text(chat_id, "\n".join(lines))
+                    return
+
+                # ---------- /wx & /wxhelp ----------
+                if sub in ("", "help", "status", "akun"):
+                    client = _wx()
+                    if not client.load_api_key():
+                        await self.send_text(chat_id, _WX_HELP)
+                        return
+                    info = client.snapshot()
+                    total = info.get("gb_purchased")
+                    left = info.get("gb_left")
+                    balance = info.get("balance")
+                    warn = ""
+                    try:
+                        if float(left or 0) <= 0:
+                            warn = (
+                                "\n\n⚠️ **Kuota 0 GB — proxy nggak bisa jalan.**\n"
+                                f"Saldo lu {format_rupiah(balance)}. "
+                                "Kalau cukup, `/wxbeli 1` langsung ngisi kuota."
+                            )
+                    except Exception:
+                        pass
+                    await self.send_text(
+                        chat_id,
+                        "🧩 **Akun WaroengProxy**\n\n"
+                        f"🆔 `{info.get('id')}`\n"
+                        f"💰 Saldo: **{format_rupiah(balance)}**\n"
+                        f"📦 Kuota: **{left} GB** sisa (dari {total} GB)\n"
+                        f"📉 Terpakai: {info.get('gb_used')} GB" + warn,
+                    )
+                    return
+
+                await self.send_text(chat_id, _WX_HELP)
+                return
+            except WaroengProxyError as exc:
+                await self.send_text(chat_id, f"❌ {exc}")
+                return
+            except Exception as exc:
+                await self.send_text(chat_id, f"❌ Error WaroengProxy: {str(exc)[:200]}")
+                return
 
         if low == "/proxy" or low.startswith("/proxy "):
             arg = text[6:].strip() if len(text) > 6 else ""

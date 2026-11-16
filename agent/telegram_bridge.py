@@ -2011,7 +2011,54 @@ class TelegramBotBridge:
             step_prefix = f"Langkah {self._last_step_num}: " if self._last_step_num > 0 else ""
             pos_line = f"📍 {step_prefix}{act_txt[:185]}"
         url_line = f"\n🌐 Web: {cur_u}" if cur_u else ""
-        return f"{hdr}{url_line}\n{pos_line}{plan_block}"
+
+        # === PILAR 4: INFORMASI YANG BIKIN USER TENANG ===
+        # 1) Estimasi sisa waktu — dari rata-rata detik per langkah yang SUDAH terjadi.
+        # 2) "Udah dilakuin apa aja" — 3 aksi terakhir, bukan cuma aksi sekarang.
+        extra_lines: List[str] = []
+        try:
+            hist = (self.orchestrator.history if self.orchestrator else None) or []
+            done_steps = len(hist)
+            if not header_override.startswith("✅") and done_steps >= 2:
+                avg = el_s / max(1, done_steps)
+                total_plan = max(len(plan), done_steps + 1)
+                sisa = max(0, total_plan - done_steps)
+                eta_s = int(avg * sisa)
+                if eta_s > 0:
+                    if eta_s >= 60:
+                        eta_txt = f"~{eta_s // 60} mnt {eta_s % 60} dtk"
+                    else:
+                        eta_txt = f"~{eta_s} dtk"
+                    extra_lines.append(
+                        f"⏱️ Estimasi sisa: {eta_txt} ({done_steps} langkah selesai, "
+                        f"{avg:.1f} dtk/langkah)"
+                    )
+        except Exception:
+            pass
+
+        # Riwayat singkat: apa yang BARU SAJA berhasil dilakukan
+        try:
+            hist2 = (self.orchestrator.history if self.orchestrator else None) or []
+            done_acts: List[str] = []
+            for h in reversed(hist2):
+                res = str(h.get("result") or "")
+                if res.startswith("❌") or res.startswith("⛔") or not res:
+                    continue
+                act = str(h.get("action_name") or "")
+                if act in ("verify_gate", "done", ""):
+                    continue
+                clean_res = res.replace("✅ ", "").replace("\n", " ")[:58]
+                if clean_res and clean_res not in done_acts:
+                    done_acts.append(clean_res)
+                if len(done_acts) >= 3:
+                    break
+            if done_acts and not header_override.startswith("✅"):
+                extra_lines.append("📌 Baru aja: " + " · ".join(done_acts))
+        except Exception:
+            pass
+
+        extra_block = ("\n\n" + "\n".join(extra_lines)) if extra_lines else ""
+        return f"{hdr}{url_line}\n{pos_line}{extra_block}{plan_block}"
 
     def start_progress_heartbeat(self) -> None:
         """Detak indikator live setiap 4 detik selama bot bekerja: 'sedang mengetik...' nonstop + stopwatch berjalan!"""

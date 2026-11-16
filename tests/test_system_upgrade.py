@@ -2885,6 +2885,62 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
 
         record(33, "Tahap 21: Fix Klik CCTV (checkbox reCAPTCHA tidak bisa disentuh)", True, "AKAR MASALAH: canvas CCTV 1280x800 sementara viewport Chromium 800x600, jadi setiap klik dari HP mendarat 1.6x terlalu kanan & 1.33x terlalu bawah — checkbox 'I'm not a robot' tidak pernah kena. Kini frontend kirim koordinat relatif 0..1, backend memetakan ke viewport asli, plus gerak kursor & tekan-lepas terpisah agar menyerupai manusia.")
 
+        # =====================================================================
+        # 34. TAHAP 22: PILAR 4 — LAPORAN PROGRES YANG MENENANGKAN
+        # =====================================================================
+        src34_tb = (ROOT / "agent" / "telegram_bridge.py").read_text(encoding="utf-8")
+
+        # 34a. Estimasi sisa waktu wajib ada di kartu progres
+        assert "Estimasi sisa" in src34_tb, "Kartu progres wajib menampilkan estimasi sisa waktu"
+        assert "dtk/langkah" in src34_tb, "Estimasi wajib berbasis rata-rata detik per langkah"
+
+        # 34b. Riwayat aksi terakhir wajib ditampilkan
+        assert "Baru aja" in src34_tb, "Kartu progres wajib menampilkan aksi yang baru dilakukan"
+
+        # 34c. BUKTI HIDUP: kartu progres benar-benar memuat info baru
+        from agent.telegram_bridge import TelegramBotBridge as _TBB34
+        import time as _t34
+
+        class _FakeOrch34:
+            state = "RUNNING"
+            history = [
+                {"action_name": "navigate", "result": "Membuka halaman form"},
+                {"action_name": "click", "result": "✅ Elemen [3] diklik"},
+                {"action_name": "type", "result": "✅ Field Nama terisi 'Arif'"},
+                {"action_name": "type", "result": "❌ Field Email gagal"},
+                {"action_name": "select", "result": "✅ Dropdown Kota -> Jakarta"},
+            ]
+            current_plan = [
+                {"step": "Buka halaman", "status": "completed"},
+                {"step": "Isi nama", "status": "in_progress"},
+                {"step": "Isi kota", "status": "pending"},
+                {"step": "Submit", "status": "pending"},
+            ]
+            live_status = "mengisi form"
+
+            class browser:
+                page = None
+
+        _tg34 = _TBB34(state_dir=str(tmp_dir / "tb34"))
+        _tg34.orchestrator = _FakeOrch34()  # type: ignore
+        _tg34._run_started_at = _t34.monotonic() - 42
+        _tg34._last_step_num = 5
+        _tg34._last_thought = "Mengisi field Email"
+        _card34 = _tg34._build_progress_card_text(tick_idx=1)
+
+        assert "Estimasi sisa" in _card34, f"Kartu wajib memuat estimasi: {_card34}"
+        assert "Baru aja" in _card34, f"Kartu wajib memuat riwayat: {_card34}"
+        assert "Rencana Tahap Kerja" in _card34, "Rencana kerja wajib tetap ada"
+        assert "❌ Field Email" not in _card34, "Aksi GAGAL tidak boleh ditampilkan sebagai 'baru aja'"
+        assert "Jakarta" in _card34, "Aksi yang berhasil wajib muncul di riwayat"
+
+        # saat selesai, estimasi & riwayat tidak ditampilkan (biar bersih)
+        _card_done34 = _tg34._build_progress_card_text(header_override="✅ Selesai", tick_idx=2)
+        assert "Estimasi sisa" not in _card_done34, "Saat selesai tidak perlu estimasi sisa"
+
+        record(34, "Tahap 22: Pilar 4 — Laporan Progres Menenangkan", True, "Kartu progres kini menampilkan estimasi sisa waktu (dari rata-rata detik per langkah) dan 3 aksi terakhir yang BERHASIL (aksi gagal tidak ditampilkan sebagai capaian). Saat selesai kartu kembali bersih. DIY: pesan progres diperbarui tiap 4 detik tanpa spam.")
+
+
 
 
 

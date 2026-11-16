@@ -1636,7 +1636,7 @@ class AgentOrchestrator:
         # ================= PDF EDITOR: potong / hapus / TULIS di file PDF =================
         if act_name in (
             "pdf_extract_pages", "pdf_delete_pages", "pdf_write_text",
-            "pdf_fill_form", "pdf_add_page", "pdf_read_page",
+            "pdf_fill_form", "pdf_add_page", "pdf_read_page", "pdf_ocr",
         ):
             from agent import pdf_editor as _pdfe
             try:
@@ -1659,6 +1659,7 @@ class AgentOrchestrator:
                         "pdf_fill_form": "_terisi",
                         "pdf_add_page": "_plus_hal",
                         "pdf_read_page": "",
+                        "pdf_ocr": "",
                     }[act_name]
                     out_name = f"{stem}{suffix}.pdf"
                 # File OUTPUT belum ada di disk, jadi pakai _safe_path (validasi path saja)
@@ -1706,6 +1707,31 @@ class AgentOrchestrator:
                         entries=action.get("texts") or None,
                     )
                     msg = f"✅ Halaman baru ditambahkan -> '{res['file']}' ({res['pages']} hal)."
+                elif act_name == "pdf_ocr":
+                    status = _pdfe.ocr_available()
+                    if not status["ready"]:
+                        return f"⚠️ OCR belum siap: {status['reason']}"
+                    ocr_res = _pdfe.ocr_document(
+                        src_path,
+                        pages=str(action.get("pages") or "") or None,
+                        langs=str(action.get("langs") or _pdfe.OCR_LANGS_DEFAULT),
+                        dpi=int(action.get("dpi", 200)),
+                    )
+                    if not ocr_res["total_chars"]:
+                        return (
+                            f"⚠️ OCR jalan tapi tidak menemukan teks di '{src_name}' "
+                            f"({ocr_res['pages_processed']} halaman). Kualitas gambar mungkin terlalu rendah."
+                        )
+                    self.memory_notes[f"ocr_{src_name}"] = ocr_res["text"][:8000]
+                    _conf = next((pg.get("confidence") for pg in ocr_res["pages"] if pg.get("confidence")), None)
+                    _hdr = (
+                        f"✅ OCR selesai pada '{src_name}': {ocr_res['pages_processed']} halaman, "
+                        f"{ocr_res['total_chars']} karakter"
+                        + (f", akurasi ~{_conf}%" if _conf else "")
+                        + ". Isi teks sudah masuk memori — pakai ini untuk menjawab, JANGAN mengarang."
+                    )
+                    return _hdr + "\n\n" + ocr_res["text"][:5000]
+
                 else:  # pdf_read_page
                     r = _pdfe.read_page_text(src_path, int(action.get("page", 1)))
                     if r["is_scanned"]:

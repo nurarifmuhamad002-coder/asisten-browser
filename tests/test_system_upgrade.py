@@ -3277,6 +3277,129 @@ async def run_all_11_validation_suites() -> Dict[str, Any]:
         except Exception as exc:
             record(37, "Tahap 25: PDF Editor — Potong Halaman & Menulis di File (Anti-Ngarang)", False, f"ERROR: {exc}")
 
+        # ============ SUITE 38: OCR — baca PDF scan/gambar ============
+        print("\n>>> Tahap 26: OCR — Membaca PDF Hasil Scan")
+        try:
+            import os as _os38, tempfile as _tf38
+            from PIL import Image as _Img38, ImageDraw as _Dr38, ImageFont as _Fn38
+            from reportlab.pdfgen import canvas as _cv38
+
+            from reportlab.lib.pagesizes import A4 as _A4_38
+            from reportlab.lib.utils import ImageReader as _IR38
+            from agent import pdf_editor as _pdfe38
+
+            _st38 = _pdfe38.ocr_available()
+            assert _st38["ready"], f"OCR tidak siap: {_st38['reason']}"
+            assert "ind" in _st38["langs"], f"bahasa Indonesia tidak terpasang: {_st38['langs']}"
+
+            _d38 = _tf38.mkdtemp()
+            _png38 = _os38.path.join(_d38, "scan.png")
+            _im38 = _Img38.new("RGB", (1654, 2339), "white")
+            _dr38 = _Dr38.Draw(_im38)
+            _fb38 = _Fn38.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 64)
+            _f38 = _Fn38.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 42)
+            _dr38.text((120, 150), "SURAT PERNYATAAN JUAL BELI VALAS", fill="black", font=_fb38)
+            _dr38.text((120, 300), "Nama       : ARIF MUHAMAD", fill="black", font=_f38)
+            _dr38.text((120, 380), "Perusahaan : PT MAJU BERSAMA", fill="black", font=_f38)
+            _dr38.text((120, 460), "Nilai      : IDR 250.000.000", fill="black", font=_f38)
+            _im38.save(_png38)
+
+            _scan38 = _os38.path.join(_d38, "Surat Valas Scan.pdf")
+            _c38 = _cv38.Canvas(_scan38, pagesize=_A4_38)
+            _c38.drawImage(_IR38(_png38), 0, 0, width=595, height=842)
+            _c38.showPage(); _c38.save()
+
+            # --- A. Baca biasa HARUS jujur bilang tidak ada lapisan teks ---
+            _nat38 = _pdfe38.read_page_text(_scan38, 1)
+            assert _nat38["is_scanned"] is True, "PDF gambar harus terdeteksi scan"
+            assert _nat38["text"] == "", "PDF gambar tidak boleh menghasilkan teks tanpa OCR"
+
+            # --- B. OCR membaca isi yang beneran ---
+            _ocr38 = _pdfe38.ocr_page(_scan38, 1)
+            assert _ocr38["source"] == "ocr", _ocr38
+            assert _ocr38["chars"] > 50, f"OCR terlalu sedikit: {_ocr38['chars']} char"
+            _t38 = _ocr38["text"].upper()
+            for _kunci38 in ("ARIF MUHAMAD", "PT MAJU BERSAMA", "250.000.000"):
+                assert _kunci38 in _t38, f"OCR gagal membaca '{_kunci38}' -> {_ocr38['text'][:200]!r}"
+            assert _ocr38["confidence"] is None or _ocr38["confidence"] > 60, (
+                f"akurasi OCR rendah: {_ocr38['confidence']}"
+            )
+
+            # --- C. Halaman yang SUDAH punya teks tidak perlu OCR ---
+            _c3_38 = _cv38.Canvas(_os38.path.join(_d38, "teks.pdf"), pagesize=_A4_38)
+            _c3_38.setFont("Helvetica", 14); _c3_38.drawString(80, 700, "TEKS ASLI PDF")
+            _c3_38.showPage(); _c3_38.save()
+            _auto38 = _pdfe38.ocr_page(_os38.path.join(_d38, "teks.pdf"), 1)
+            assert _auto38["source"] == "text-layer", (
+                f"halaman ber-teks harus pakai lapisan teks, bukan OCR -> {_auto38['source']}"
+            )
+            assert "TEKS ASLI" in _auto38["text"]
+
+            # --- D. Orchestrator menjalankan pdf_ocr & menyimpan ke memori ---
+            from agent.orchestrator import AgentOrchestrator as _AO38
+            from agent.file_manager import WorkspaceFileManager as _WFM38
+            import shutil as _sh38
+            _sh38.copy(_scan38, _os38.path.join(_d38, "Uji OCR.pdf"))
+
+            async def _run38():
+                _o = _AO38.__new__(_AO38)
+                _o.file_manager = _WFM38(base_dir=_d38)
+                _o._created_files_this_run = []
+                _o._created_top_dirs = []
+                _o.memory_notes = {}
+                _o.telegram = None
+
+                async def _push(r, t, m=None):
+                    return None
+
+                async def _bc(p):
+                    return None
+
+                _o._push_chat = _push
+                _o.broadcast = _bc
+                _res = await _o._execute_with_guardrails(
+                    1, {"name": "pdf_ocr", "filename": "Uji OCR.pdf"}, {"elements": []})
+                return _res, dict(_o.memory_notes)
+
+            _res38, _mem38 = await _run38()
+            assert _res38.startswith("✅"), _res38
+            assert "OCR selesai" in _res38
+            _memo38 = _mem38.get("ocr_Uji OCR.pdf", "")
+            assert "ARIF MUHAMAD" in _memo38, "hasil OCR wajib masuk memori supaya AI bisa menjawab"
+            assert "PT MAJU BERSAMA" in _memo38
+
+            # --- E. Prompt AI mengenal pdf_ocr ---
+            import agent.llm_providers as _lp38, inspect as _ins38
+            assert "pdf_ocr" in _ins38.getsource(_lp38), "aksi pdf_ocr tidak dikenalkan ke AI"
+
+            # --- F. Dockerfile memasang tesseract (kalau tidak, OCR mati di Railway) ---
+            _dock38 = open(_os38.path.join(_os38.path.dirname(_os38.path.dirname(
+                _os38.path.abspath(__file__))), "Dockerfile"), encoding="utf-8").read()
+            assert "tesseract-ocr" in _dock38, "Dockerfile belum memasang tesseract"
+            assert "tesseract-ocr-ind" in _dock38, "bahasa Indonesia belum dipasang di Dockerfile"
+
+            record(
+                38,
+                "Tahap 26: OCR — Membaca PDF Hasil Scan (Tesseract + Bahasa Indonesia)",
+                True,
+                "MASALAH: surat valas user adalah PDF hasil SCAN (188 KB, isinya gambar). "
+                "pypdf hanya bisa extract_text dari lapisan teks, jadi hasilnya SELALU KOSONG — "
+                "bot lalu mengarang isinya. Perbaikan: OCR sungguhan. Halaman dirender jadi PNG "
+                "via PyMuPDF (tanpa binary poppler), lalu dibaca pytesseract dengan bahasa "
+                "ind+eng. Kalau halaman SUDAH punya lapisan teks, OCR dilewati supaya tidak "
+                "boros CPU. Aksi baru pdf_ocr terhubung ke orchestrator, hasilnya masuk memori "
+                "agent, dan prompt AI diwajibkan memakainya saat pdf_read_page melaporkan scan. "
+                "Dockerfile memasang tesseract-ocr + tesseract-ocr-ind + libgl1 (tanpa ini OCR "
+                "mati total di Railway). Terbukti: OCR membaca 'ARIF MUHAMAD', 'PT MAJU "
+                "BERSAMA', 'IDR 250.000.000' dengan akurasi ~93%, halaman ber-teks tidak di-OCR "
+                "ulang, dan hasilnya benar-benar masuk memori agent.",
+            )
+        except AssertionError as exc:
+            record(38, "Tahap 26: OCR — Membaca PDF Hasil Scan (Tesseract + Bahasa Indonesia)", False, str(exc))
+        except Exception as exc:
+            record(38, "Tahap 26: OCR — Membaca PDF Hasil Scan (Tesseract + Bahasa Indonesia)", False, f"ERROR: {exc}")
+
+
 
 
 

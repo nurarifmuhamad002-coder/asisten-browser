@@ -350,3 +350,158 @@ def read_page_text(source: str | Path, page: int = 1) -> Dict[str, Any]:
             else ""
         ),
     }
+
+
+# ====================================================================== #
+# OCR — membaca PDF hasil scan (halaman gambar tanpa lapisan teks)
+# ====================================================================== #
+OCR_LANGS_DEFAULT = "ind+eng"
+
+
+class OcrUnavailableError(PdfEditError):
+    """Dipakai kalau tesseract/poppler belum terpasang di server."""
+
+
+def ocr_available() -> Dict[str, Any]:
+    """Cek apakah OCR siap dipakai, tanpa melempar error."""
+    info: Dict[str, Any] = {"ready": False, "engine": "", "langs": [], "reason": ""}
+    try:
+        import pytesseract  # noqa: WPS433
+    except Exception:
+        info["reason"] = "pytesseract belum terpasang (pip install pytesseract)."
+        return info
+    try:
+        ver = pytesseract.get_tesseract_version()
+        langs = list(pytesseract.get_languages(config="") or [])
+    except Exception as exc:
+        info["reason"] = f"tesseract tidak bisa dijalankan: {str(exc)[:120]}"
+        return info
+    info.update({"ready": True, "engine": f"tesseract {ver}", "langs": langs})
+    if not ({"ind", "eng"} & set(langs)):
+        info["ready"] = False
+        info["reason"] = f"bahasa ind/eng tidak tersedia (ada: {', '.join(langs[:8])})"
+    return info
+
+
+def _render_pdf_page_png(source: str | Path, page: int, dpi: int = 200) -> bytes:
+    """Render satu halaman PDF jadi PNG memakai PyMuPDF (tanpa binary poppler)."""
+    try:
+        import pymupdf  # noqa: WPS433
+    except Exception:
+        try:
+            import fitz as pymupdf  # type: ignore # noqa: WPS433
+        except Exception as exc:
+            raise OcrUnavailableError(
+                "pymupdf belum terpasang, tidak bisa mengubah halaman PDF jadi gambar."
+            ) from exc
+    doc = pymupdf.open(str(source))
+    try:
+        if page < 1 or page > doc.page_count:
+            raise PdfEditError(f"Halaman {page} tidak ada. PDF ini punya {doc.page_count} halaman.")
+        zoom = dpi / 72.0
+        pix = doc.load_page(page - 1).get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+def ocr_page(
+    source: str | Path,
+    page: int = 1,
+    langs: str = OCR_LANGS_DEFAULT,
+    dpi: int = 200,
+) -> Dict[str, Any]:
+    """Baca teks satu halaman lewat OCR. Selalu jujur soal sumber teksnya."""
+    _require_pypdf()
+    status = ocr_available()
+    if not status["ready"]:
+        raise OcrUnavailableError(status["reason"])
+
+    import pytesseract  # noqa: WPS433
+    import io as _io
+
+    total = page_count(source)
+    if page < 1 or page > total:
+        raise PdfEditError(f"Halaman {page} tidak ada. PDF ini punya {total} halaman.")
+
+    # Kalau halaman SUDAH punya lapisan teks, jangan buang waktu OCR — pakai itu.
+    native = read_page_text(source, page)
+    if not native["is_scanned"]:
+        return {
+            "page": page, "total_pages": total, "text": native["text"],
+            "chars": native["chars"], "source": "text-layer", "engine": "",
+            "confidence": None, "dpi": None,
+        }
+
+    png = _render_pdf_page_png(source, page, dpi=dpi)
+    try:
+        from PIL import Image  # noqa: WPS433
+        img = Image.open(_io.BytesIO(png))
+    except Exception as exc:
+        raise OcrUnavailableError(f"Pillow gagal membuka gambar hasil render: {exc}") from exc
+
+    try:
+        text = pytesseract.image_to_string(img, lang=langs) or ""
+    except Exception as exc:
+        raise OcrUnavailableError(f"OCR gagal dijalankan: {str(exc)[:140]}") from exc
+
+    text = text.strip()
+    confidence = None
+    try:
+        data = pytesseract.image_to_data(img, lang=langs, output_type=pytesseract.Output.DICT)
+        vals = [int(c) for c in data.get("conf", []) if str(c).lstrip("-").isdigit() and int(c) >= 0]
+        if vals:
+            confidence = round(sum(vals) / len(vals), 1)
+    except Exception:
+        pass
+
+    return {
+        "page": page,
+        "total_pages": total,
+        "text": text,
+        "chars": len(text),
+        "source": "ocr",
+        "engine": status["engine"],
+        "langs": langs,
+        "confidence": confidence,
+        "dpi": dpi,
+    }
+
+
+def ocr_document(
+    source: str | Path,
+    pages: Optional[str] = None,
+    langs: str = OCR_LANGS_DEFAULT,
+    dpi: int = 200,
+    max_pages: int = 30,
+) -> Dict[str, Any]:
+    """OCR beberapa halaman sekaligus.
+
+    ``pages`` kosong = semua halaman (dibatasi ``max_pages`` supaya tidak
+    menggantung lama di server kecil). Spesifikasi sama dengan extract_pages.
+    """
+    _require_pypdf()
+    total = page_count(source)
+    if pages:
+        idxs = [i + 1 for i in parse_page_selection(pages, total)]
+    else:
+        idxs = list(range(1, min(total, max_pages) + 1))
+
+    results = []
+    for p in idxs:
+        try:
+            results.append(ocr_page(source, p, langs=langs, dpi=dpi))
+        except PdfEditError as exc:
+            results.append({"page": p, "text": "", "chars": 0, "source": "error", "error": str(exc)})
+
+    combined = "\n\n".join(
+        f"--- Halaman {r['page']} ---\n{r['text']}" for r in results if r.get("text")
+    )
+    return {
+        "file": Path(source).name,
+        "total_pages": total,
+        "pages_processed": len(results),
+        "total_chars": sum(r.get("chars", 0) for r in results),
+        "pages": results,
+        "text": combined,
+    }
